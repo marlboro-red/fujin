@@ -24,7 +24,6 @@ stages:
     system_prompt: "You are a test assistant."
     user_prompt: "Do something useful."
     max_turns: 5
-    timeout_secs: 30
 "#
     .to_string()
 }
@@ -39,14 +38,12 @@ stages:
     system_prompt: "You are a test assistant."
     user_prompt: "Do the first thing."
     max_turns: 5
-    timeout_secs: 30
   - id: stage-2
     name: Second Stage
     model: mock-model
     system_prompt: "You are a test assistant."
     user_prompt: "Do the second thing."
     max_turns: 5
-    timeout_secs: 30
 "#
     .to_string()
 }

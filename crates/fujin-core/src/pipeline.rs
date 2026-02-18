@@ -214,8 +214,7 @@ impl PipelineRunner {
                 }
             });
 
-            // 5. Execute agent with timeout
-            let timeout_duration = std::time::Duration::from_secs(stage_config.timeout_secs);
+            // 5. Execute agent (with optional timeout)
             let agent_future = self.runtime.execute(
                 stage_config,
                 &context,
@@ -224,14 +223,19 @@ impl PipelineRunner {
                 self.cancel_flag.clone(),
             );
 
-            let agent_result = match tokio::time::timeout(timeout_duration, agent_future).await {
-                Ok(result) => result,
-                Err(_) => Err(CoreError::AgentError {
-                    message: format!(
-                        "Stage '{}' timed out after {}s",
-                        stage_config.id, stage_config.timeout_secs
-                    ),
-                }),
+            let agent_result = if let Some(timeout_secs) = stage_config.timeout_secs {
+                let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+                match tokio::time::timeout(timeout_duration, agent_future).await {
+                    Ok(result) => result,
+                    Err(_) => Err(CoreError::AgentError {
+                        message: format!(
+                            "Stage '{}' timed out after {}s",
+                            stage_config.id, timeout_secs
+                        ),
+                    }),
+                }
+            } else {
+                agent_future.await
             };
 
             // Stop tick task

@@ -4,7 +4,7 @@ use crate::screens::browser::{BrowserAction, BrowserState};
 use crate::screens::execution::{ExecutionAction, ExecutionState};
 use crate::widgets::help::render_help_overlay;
 use anyhow::Result;
-use crossterm::event::Event as CrosstermEvent;
+use crossterm::event::{Event as CrosstermEvent, KeyEventKind};
 use fujin_core::event::PipelineEvent;
 use fujin_core::{PipelineRunner, RunOptions};
 use ratatui::Frame;
@@ -104,7 +104,9 @@ impl App {
         match event {
             AppEvent::Tick => {} // Just triggers a redraw
 
-            AppEvent::Terminal(CrosstermEvent::Key(key)) => {
+            AppEvent::Terminal(CrosstermEvent::Key(key))
+                if key.kind == KeyEventKind::Press =>
+            {
                 // Help overlay intercepts all keys
                 if self.show_help {
                     self.show_help = false;

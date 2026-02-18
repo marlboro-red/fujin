@@ -67,9 +67,9 @@ pub struct StageConfig {
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
 
-    /// Stage timeout in seconds.
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
+    /// Optional stage timeout in seconds. If `None`, stages run without a time limit.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 
     /// Which tools Claude Code can use in this stage.
     #[serde(default = "default_allowed_tools")]
@@ -94,10 +94,6 @@ fn default_stage_model() -> String {
 
 fn default_max_turns() -> u32 {
     10
-}
-
-fn default_timeout_secs() -> u64 {
-    300
 }
 
 fn default_allowed_tools() -> Vec<String> {

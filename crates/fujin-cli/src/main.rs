@@ -449,13 +449,16 @@ fn print_dry_run(config: &PipelineConfig) {
 
     for (i, stage) in config.stages.iter().enumerate() {
         println!(
-            "  {} Stage {}: {} [model={}, max_turns={}, timeout={}s]",
+            "  {} Stage {}: {} [model={}, max_turns={}{}]",
             style("○ pending").dim(),
             i + 1,
             style(&stage.name).bold(),
             stage.model,
             stage.max_turns,
-            stage.timeout_secs,
+            stage
+                .timeout_secs
+                .map(|t| format!(", timeout={t}s"))
+                .unwrap_or_default(),
         );
 
         if !stage.allowed_tools.is_empty() {

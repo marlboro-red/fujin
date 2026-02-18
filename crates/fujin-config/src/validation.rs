@@ -70,7 +70,7 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
                 .push(format!("{prefix}: max_turns must be greater than 0"));
         }
 
-        if stage.timeout_secs == 0 {
+        if stage.timeout_secs == Some(0) {
             result
                 .errors
                 .push(format!("{prefix}: timeout_secs must be greater than 0"));
