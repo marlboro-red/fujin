@@ -1,0 +1,21 @@
+[package]
+name = "fujin-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fujin"
+path = "src/main.rs"
+
+[dependencies]
+fujin-core = { workspace = true }
+fujin-config = { workspace = true }
+fujin-tui = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+console = { workspace = true }
+indicatif = { workspace = true }
+dotenvy = { workspace = true }

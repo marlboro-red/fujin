@@ -1,0 +1,20 @@
+pub mod agent;
+pub mod artifact;
+pub mod checkpoint;
+pub mod context;
+pub mod error;
+pub mod event;
+pub mod paths;
+pub mod pipeline;
+pub mod stage;
+pub mod workspace;
+
+pub use agent::{AgentOutput, AgentRuntime, ClaudeCodeRuntime};
+pub use artifact::{ArtifactSet, FileChange, FileChangeKind};
+pub use checkpoint::{Checkpoint, CheckpointManager, CheckpointSummary};
+pub use context::{ContextBuilder, StageContext};
+pub use error::{CoreError, CoreResult};
+pub use event::PipelineEvent;
+pub use pipeline::{PipelineRunner, RunOptions};
+pub use stage::{StageResult, TokenUsage};
+pub use workspace::Workspace;

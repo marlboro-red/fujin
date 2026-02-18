@@ -1,0 +1,69 @@
+# Multi-stage pipeline: Architecture → Code → Documentation
+# Usage: fujin run -c pipeline.yaml
+
+name: "Code and Documentation Generator"
+version: "1.0"
+
+variables:
+  project_name: "my-api"
+  language: "rust"
+  description: "A REST API for managing a todo list"
+
+summarizer:
+  model: "claude-haiku-4-5-20251001"
+  max_tokens: 1024
+
+stages:
+  - id: "architecture"
+    name: "Design Architecture"
+    model: "claude-sonnet-4-6"
+    system_prompt: |
+      You are a senior software architect. Design the architecture
+      for the requested project. Create docs/architecture.md with
+      the full design and a directory structure listing.
+    user_prompt: |
+      Design the architecture for: {{description}}
+      Project name: {{project_name}}
+      Language: {{language}}
+
+    allowed_tools:
+      - "write"
+      - "read"
+
+
+  - id: "codegen"
+    name: "Generate Code"
+    model: "claude-sonnet-4-6"
+    system_prompt: |
+      You are an expert {{language}} developer. Implement the project
+      based on the architecture document. Write complete, working code.
+    user_prompt: |
+      Previous stage summary: {{prior_summary}}
+
+      The architecture document is at docs/architecture.md.
+      Read it and implement the full project.
+
+    allowed_tools:
+      - "write"
+      - "read"
+      - "bash"
+
+
+  - id: "documentation"
+    name: "Write Documentation"
+    model: "claude-sonnet-4-6"
+    system_prompt: |
+      You are a technical writer. Review the codebase and produce
+      comprehensive Markdown documentation.
+    user_prompt: |
+      Previous stage summary: {{prior_summary}}
+
+      Review all code in the project and create:
+      - README.md with project overview, setup, and usage
+      - docs/API.md with API endpoint documentation
+      - docs/DEVELOPMENT.md with development guide
+
+    allowed_tools:
+      - "write"
+      - "read"
+

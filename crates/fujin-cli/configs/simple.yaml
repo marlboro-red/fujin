@@ -1,0 +1,35 @@
+# Simple single-stage pipeline example
+# Usage: fujin run -c pipeline.yaml
+
+name: "Simple Code Generator"
+version: "1.0"
+
+variables:
+  project_name: "my-project"
+  language: "rust"
+  description: "A simple CLI tool that converts CSV files to JSON"
+
+stages:
+  - id: "codegen"
+    name: "Generate Code"
+    model: "claude-sonnet-4-6"
+    system_prompt: |
+      You are an expert {{language}} developer. Write clean, idiomatic,
+      well-structured code. Include error handling and comments where
+      appropriate.
+    user_prompt: |
+      Create a {{language}} project called "{{project_name}}" that does
+      the following:
+
+      {{description}}
+
+      Requirements:
+      - Set up proper project structure
+      - Include a README.md with usage instructions
+      - Write complete, working code
+
+    allowed_tools:
+      - "write"
+      - "read"
+      - "bash"
+
