@@ -26,7 +26,7 @@ Requires [Rust](https://rustup.rs/) and the [Claude Code CLI](https://docs.anthr
 
 ```bash
 # Clone and build
-git clone <repo-url> && cd wtg-pipeline
+git clone <repo-url> && cd fujin
 cargo build --release
 
 # The binary is at target/release/fujin
@@ -278,7 +278,7 @@ fujin run -c pipeline.yaml
 ## Project Structure
 
 ```
-wtg-pipeline/
+fujin/
 ├── Cargo.toml                    # Workspace root
 ├── crates/
 │   ├── fujin-cli/                # Binary (fujin) — CLI entry point
