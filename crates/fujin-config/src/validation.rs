@@ -52,22 +52,46 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
                 .push(format!("{prefix}: name must not be empty"));
         }
 
-        if stage.system_prompt.trim().is_empty() {
-            result
-                .errors
-                .push(format!("{prefix}: system_prompt must not be empty"));
-        }
+        if stage.is_command_stage() {
+            // Command stage validation
+            let commands = stage.commands.as_ref().unwrap();
+            for (ci, cmd) in commands.iter().enumerate() {
+                if cmd.trim().is_empty() {
+                    result.errors.push(format!(
+                        "{prefix}: command[{ci}] must not be empty"
+                    ));
+                }
+            }
+        } else {
+            // Agent stage validation
+            if stage.system_prompt.trim().is_empty() {
+                result
+                    .errors
+                    .push(format!("{prefix}: system_prompt must not be empty"));
+            }
 
-        if stage.user_prompt.trim().is_empty() {
-            result
-                .errors
-                .push(format!("{prefix}: user_prompt must not be empty"));
-        }
+            if stage.user_prompt.trim().is_empty() {
+                result
+                    .errors
+                    .push(format!("{prefix}: user_prompt must not be empty"));
+            }
 
-        if stage.max_turns == 0 {
-            result
-                .errors
-                .push(format!("{prefix}: max_turns must be greater than 0"));
+            if stage.max_turns == 0 {
+                result
+                    .errors
+                    .push(format!("{prefix}: max_turns must be greater than 0"));
+            }
+
+            // Validate allowed tools
+            let valid_tools = ["read", "write", "bash", "edit", "glob", "grep", "notebook"];
+            for tool in &stage.allowed_tools {
+                if !valid_tools.contains(&tool.as_str()) {
+                    result.warnings.push(format!(
+                        "{prefix}: unknown tool '{tool}' (valid: {})",
+                        valid_tools.join(", ")
+                    ));
+                }
+            }
         }
 
         if stage.timeout_secs == Some(0) {

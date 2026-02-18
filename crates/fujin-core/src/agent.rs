@@ -121,7 +121,7 @@ impl ClaudeCodeRuntime {
             .collect();
 
         vec![
-            "--allowedTools".to_string(),
+            "--tools".to_string(),
             tool_names.join(","),
         ]
     }
@@ -295,7 +295,8 @@ impl AgentRuntime for ClaudeCodeRuntime {
             .arg(&config.model)
             .arg("--max-turns")
             .arg(config.max_turns.to_string())
-            .arg("--system-prompt")
+            .arg("--dangerously-skip-permissions")
+            .arg("--append-system-prompt")
             .arg(&config.system_prompt);
 
         // Add allowed tools
@@ -584,7 +585,7 @@ mod tests {
         let tools = vec!["read".to_string(), "write".to_string(), "bash".to_string()];
         let flags = ClaudeCodeRuntime::build_tools_flag(&tools);
         assert_eq!(flags.len(), 2);
-        assert_eq!(flags[0], "--allowedTools");
+        assert_eq!(flags[0], "--tools");
         assert_eq!(flags[1], "Read,Write,Bash");
     }
 

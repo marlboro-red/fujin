@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::info;
-use fujin_config::PipelineConfig;
+use fujin_config::{PipelineConfig, StageConfig};
 
 /// Options for running a pipeline.
 #[derive(Debug, Clone, Default)]
@@ -153,7 +153,11 @@ impl PipelineRunner {
                 stage_index: stage_idx,
                 stage_id: stage_config.id.clone(),
                 stage_name: stage_config.name.clone(),
-                model: stage_config.model.clone(),
+                model: if stage_config.is_command_stage() {
+                    "commands".to_string()
+                } else {
+                    stage_config.model.clone()
+                },
             });
 
             let stage_start = Instant::now();
@@ -161,90 +165,23 @@ impl PipelineRunner {
             // 1. Snapshot workspace
             let before_snapshot = self.workspace.snapshot()?;
 
-            // 2. Build context
-            self.emit(PipelineEvent::ContextBuilding {
-                stage_index: stage_idx,
-            });
-            let prior_result = checkpoint.completed_stages.last();
-            let context = self
-                .context_builder
-                .build(&self.config, stage_config, prior_result, &self.workspace)
-                .await?;
-
-            self.emit(PipelineEvent::AgentRunning {
-                stage_index: stage_idx,
-                stage_id: stage_config.id.clone(),
-            });
-
-            // 3. Set up tick task for elapsed time tracking
-            let tick_tx = self.event_tx.clone();
-            let tick_idx = stage_idx;
-            let tick_start = stage_start;
-            let tick_handle = tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-                loop {
-                    interval.tick().await;
-                    if tick_tx
-                        .send(PipelineEvent::AgentTick {
-                            stage_index: tick_idx,
-                            elapsed: tick_start.elapsed(),
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-
-            // 4. Create a progress channel that bridges agent activity to PipelineEvent
-            let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
-            let activity_tx = self.event_tx.clone();
-            let activity_idx = stage_idx;
-            tokio::spawn(async move {
-                while let Some(activity) = prx.recv().await {
-                    if activity_tx
-                        .send(PipelineEvent::AgentActivity {
-                            stage_index: activity_idx,
-                            activity,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-
-            // 5. Execute agent (with optional timeout)
-            let agent_future = self.runtime.execute(
-                stage_config,
-                &context,
-                self.workspace.root(),
-                Some(ptx),
-                self.cancel_flag.clone(),
-            );
-
-            let agent_result = if let Some(timeout_secs) = stage_config.timeout_secs {
-                let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-                match tokio::time::timeout(timeout_duration, agent_future).await {
-                    Ok(result) => result,
-                    Err(_) => Err(CoreError::AgentError {
-                        message: format!(
-                            "Stage '{}' timed out after {}s",
-                            stage_config.id, timeout_secs
-                        ),
-                    }),
-                }
+            // 2. Execute stage (command or agent)
+            let stage_exec_result = if stage_config.is_command_stage() {
+                self.run_command_stage(stage_idx, stage_config, &stage_start)
+                    .await
             } else {
-                agent_future.await
+                self.run_agent_stage(
+                    stage_idx,
+                    stage_config,
+                    &checkpoint,
+                    &stage_start,
+                )
+                .await
             };
 
-            // Stop tick task
-            tick_handle.abort();
-
-            let agent_output = match agent_result {
+            let (response_text, token_usage) = match stage_exec_result {
                 Ok(output) => output,
                 Err(CoreError::Cancelled { ref stage_id }) => {
-                    // Save checkpoint so user can resume later
                     checkpoint.next_stage_index = stage_idx;
                     checkpoint.updated_at = Utc::now();
                     let _ = self.checkpoint_manager.save(&checkpoint);
@@ -256,7 +193,6 @@ impl PipelineRunner {
                     });
                 }
                 Err(e) => {
-                    // Save checkpoint before failing so user can resume
                     checkpoint.next_stage_index = stage_idx;
                     checkpoint.updated_at = Utc::now();
                     let checkpoint_saved = self.checkpoint_manager.save(&checkpoint).is_ok();
@@ -273,7 +209,7 @@ impl PipelineRunner {
                 }
             };
 
-            // 6. Diff workspace
+            // 3. Diff workspace
             let after_snapshot = self.workspace.snapshot()?;
             let artifacts = Workspace::diff(&before_snapshot, &after_snapshot);
 
@@ -284,25 +220,25 @@ impl PipelineRunner {
                 stage_id: stage_config.id.clone(),
                 duration,
                 artifacts: artifacts.clone(),
-                token_usage: agent_output.token_usage.clone(),
+                token_usage: token_usage.clone(),
             });
 
-            // 7. Build stage result
+            // 4. Build stage result
             let stage_result = StageResult {
                 stage_id: stage_config.id.clone(),
-                response_text: agent_output.response_text,
+                response_text,
                 artifacts,
                 summary: None, // Will be populated by context builder for next stage
                 duration,
                 completed_at: Utc::now(),
-                token_usage: agent_output.token_usage,
+                token_usage,
             };
 
             checkpoint.completed_stages.push(stage_result);
             checkpoint.next_stage_index = stage_idx + 1;
             checkpoint.updated_at = Utc::now();
 
-            // 8. Save checkpoint
+            // 5. Save checkpoint
             self.checkpoint_manager.save(&checkpoint)?;
 
             info!(
@@ -321,4 +257,258 @@ impl PipelineRunner {
 
         Ok(checkpoint.completed_stages)
     }
+
+    /// Execute an agent-based stage.
+    ///
+    /// Returns `(response_text, token_usage)` on success.
+    async fn run_agent_stage(
+        &self,
+        stage_idx: usize,
+        stage_config: &StageConfig,
+        checkpoint: &crate::checkpoint::Checkpoint,
+        stage_start: &Instant,
+    ) -> CoreResult<(String, Option<crate::stage::TokenUsage>)> {
+        // Build context
+        self.emit(PipelineEvent::ContextBuilding {
+            stage_index: stage_idx,
+        });
+        let prior_result = checkpoint.completed_stages.last();
+        let context = self
+            .context_builder
+            .build(&self.config, stage_config, prior_result, &self.workspace)
+            .await?;
+
+        self.emit(PipelineEvent::AgentRunning {
+            stage_index: stage_idx,
+            stage_id: stage_config.id.clone(),
+        });
+
+        // Set up tick task for elapsed time tracking
+        let tick_tx = self.event_tx.clone();
+        let tick_idx = stage_idx;
+        let tick_start = *stage_start;
+        let tick_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if tick_tx
+                    .send(PipelineEvent::AgentTick {
+                        stage_index: tick_idx,
+                        elapsed: tick_start.elapsed(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // Create a progress channel that bridges agent activity to PipelineEvent
+        let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
+        let activity_tx = self.event_tx.clone();
+        let activity_idx = stage_idx;
+        tokio::spawn(async move {
+            while let Some(activity) = prx.recv().await {
+                if activity_tx
+                    .send(PipelineEvent::AgentActivity {
+                        stage_index: activity_idx,
+                        activity,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // Execute agent (with optional timeout)
+        let agent_future = self.runtime.execute(
+            stage_config,
+            &context,
+            self.workspace.root(),
+            Some(ptx),
+            self.cancel_flag.clone(),
+        );
+
+        let agent_result = if let Some(timeout_secs) = stage_config.timeout_secs {
+            let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+            match tokio::time::timeout(timeout_duration, agent_future).await {
+                Ok(result) => result,
+                Err(_) => Err(CoreError::AgentError {
+                    message: format!(
+                        "Stage '{}' timed out after {}s",
+                        stage_config.id, timeout_secs
+                    ),
+                }),
+            }
+        } else {
+            agent_future.await
+        };
+
+        tick_handle.abort();
+
+        let agent_output = agent_result?;
+        Ok((agent_output.response_text, agent_output.token_usage))
+    }
+
+    /// Execute a command-based stage by running CLI commands sequentially.
+    ///
+    /// Returns `(combined_output, None)` on success (no token usage for commands).
+    async fn run_command_stage(
+        &self,
+        stage_idx: usize,
+        stage_config: &StageConfig,
+        stage_start: &Instant,
+    ) -> CoreResult<(String, Option<crate::stage::TokenUsage>)> {
+        let commands = stage_config.commands.as_ref().unwrap();
+        let total_commands = commands.len();
+
+        // Set up tick task
+        let tick_tx = self.event_tx.clone();
+        let tick_idx = stage_idx;
+        let tick_start = *stage_start;
+        let tick_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if tick_tx
+                    .send(PipelineEvent::AgentTick {
+                        stage_index: tick_idx,
+                        elapsed: tick_start.elapsed(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // Render command templates with pipeline variables
+        let mut vars = self.config.variables.clone();
+        vars.insert("stage_id".to_string(), stage_config.id.clone());
+        vars.insert("stage_name".to_string(), stage_config.name.clone());
+
+        let mut combined_output = String::new();
+
+        for (cmd_idx, cmd_template) in commands.iter().enumerate() {
+            // Check cancellation
+            if let Some(ref flag) = self.cancel_flag {
+                if flag.load(Ordering::Relaxed) {
+                    tick_handle.abort();
+                    return Err(CoreError::Cancelled {
+                        stage_id: stage_config.id.clone(),
+                    });
+                }
+            }
+
+            // Render template variables in the command
+            let cmd = render_command_template(cmd_template, &vars)?;
+
+            self.emit(PipelineEvent::CommandRunning {
+                stage_index: stage_idx,
+                command_index: cmd_idx,
+                command: cmd.clone(),
+                total_commands,
+            });
+
+            let output = self
+                .execute_command(&cmd, stage_idx, &stage_config.id)
+                .await?;
+
+            if !combined_output.is_empty() {
+                combined_output.push_str("\n\n");
+            }
+            combined_output.push_str(&format!("$ {cmd}\n{output}"));
+        }
+
+        tick_handle.abort();
+
+        Ok((combined_output, None))
+    }
+
+    /// Execute a single shell command and return its output.
+    async fn execute_command(
+        &self,
+        command: &str,
+        stage_idx: usize,
+        stage_id: &str,
+    ) -> CoreResult<String> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
+        use std::process::Stdio;
+
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.args(["/C", command]);
+            c
+        };
+
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.args(["-c", command]);
+            c
+        };
+
+        cmd.current_dir(self.workspace.root())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| CoreError::AgentError {
+            message: format!("Failed to spawn command '{command}': {e}"),
+        })?;
+
+        // Stream stdout lines as CommandOutput events
+        let mut output_lines = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                self.emit(PipelineEvent::CommandOutput {
+                    stage_index: stage_idx,
+                    line: line.clone(),
+                });
+                output_lines.push(line);
+            }
+        }
+
+        let status = child.wait().await.map_err(|e| CoreError::AgentError {
+            message: format!("Failed to wait for command '{command}': {e}"),
+        })?;
+
+        let stdout_text = output_lines.join("\n");
+
+        if !status.success() {
+            // Capture stderr for the error message
+            let mut stderr_text = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                use tokio::io::AsyncReadExt;
+                let _ = stderr.read_to_string(&mut stderr_text).await;
+            }
+            return Err(CoreError::AgentError {
+                message: format!(
+                    "Command failed in stage '{}' (exit {}): {}\n{}",
+                    stage_id,
+                    status.code().unwrap_or(-1),
+                    command,
+                    if stderr_text.is_empty() { &stdout_text } else { &stderr_text }
+                ),
+            });
+        }
+
+        Ok(stdout_text)
+    }
+}
+
+/// Render `{{variable}}` placeholders in a command string.
+fn render_command_template(
+    template: &str,
+    vars: &std::collections::HashMap<String, String>,
+) -> CoreResult<String> {
+    let mut hbs = handlebars::Handlebars::new();
+    hbs.register_escape_fn(handlebars::no_escape);
+    hbs.register_template_string("cmd", template)
+        .map_err(|e| CoreError::TemplateError(format!("Invalid command template: {e}")))?;
+    hbs.render("cmd", vars)
+        .map_err(|e| CoreError::TemplateError(format!("Command template rendering failed: {e}")))
 }

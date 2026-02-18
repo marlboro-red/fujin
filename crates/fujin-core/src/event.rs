@@ -42,6 +42,20 @@ pub enum PipelineEvent {
         stage_id: String,
     },
 
+    /// A CLI command is running in a command stage.
+    CommandRunning {
+        stage_index: usize,
+        command_index: usize,
+        command: String,
+        total_commands: usize,
+    },
+
+    /// Output line from a CLI command.
+    CommandOutput {
+        stage_index: usize,
+        line: String,
+    },
+
     /// Periodic tick while the agent is running (sent every second).
     AgentTick {
         stage_index: usize,

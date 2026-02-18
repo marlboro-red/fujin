@@ -45,6 +45,11 @@ impl Default for SummarizerConfig {
 }
 
 /// Configuration for a single pipeline stage.
+///
+/// A stage is either an **agent stage** (uses Claude Code with prompts) or a
+/// **command stage** (runs a series of CLI commands). When `commands` is set,
+/// the stage is treated as a command stage and agent-specific fields
+/// (`system_prompt`, `user_prompt`, `model`, etc.) are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageConfig {
     /// Unique identifier for this stage.
@@ -53,17 +58,19 @@ pub struct StageConfig {
     /// Human-readable stage name.
     pub name: String,
 
-    /// Model to use for this stage.
+    /// Model to use for this stage (agent stages only).
     #[serde(default = "default_stage_model")]
     pub model: String,
 
-    /// System prompt for the agent.
+    /// System prompt for the agent (agent stages only).
+    #[serde(default)]
     pub system_prompt: String,
 
-    /// User prompt template (supports {{variables}}).
+    /// User prompt template (supports {{variables}}) (agent stages only).
+    #[serde(default)]
     pub user_prompt: String,
 
-    /// Maximum agentic turns for the Claude Code agent.
+    /// Maximum agentic turns for the Claude Code agent (agent stages only).
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
 
@@ -71,9 +78,23 @@ pub struct StageConfig {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 
-    /// Which tools Claude Code can use in this stage.
+    /// Which tools Claude Code can use in this stage (agent stages only).
     #[serde(default = "default_allowed_tools")]
     pub allowed_tools: Vec<String>,
+
+    /// CLI commands to run sequentially (command stages only).
+    /// When set, this stage runs these commands instead of an agent.
+    /// Each command is executed as a shell command in the workspace directory.
+    /// Commands support `{{variable}}` template syntax.
+    #[serde(default)]
+    pub commands: Option<Vec<String>>,
+}
+
+impl StageConfig {
+    /// Returns `true` if this is a command stage (runs CLI commands, not an agent).
+    pub fn is_command_stage(&self) -> bool {
+        self.commands.as_ref().is_some_and(|c| !c.is_empty())
+    }
 }
 
 fn default_version() -> String {
