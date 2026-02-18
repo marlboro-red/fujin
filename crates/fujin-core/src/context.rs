@@ -1,5 +1,6 @@
 use crate::error::{CoreError, CoreResult};
 use crate::stage::StageResult;
+use crate::util::truncate_chars;
 use crate::workspace::Workspace;
 use handlebars::Handlebars;
 use std::collections::HashMap;
@@ -178,16 +179,6 @@ impl ContextBuilder {
 impl Default for ContextBuilder {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_chars).collect();
-        format!("{truncated}...")
     }
 }
 

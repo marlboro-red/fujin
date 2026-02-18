@@ -49,31 +49,7 @@ impl Workspace {
     pub fn snapshot(&self) -> CoreResult<WorkspaceSnapshot> {
         let mut files = HashMap::new();
 
-        if !self.root.exists() {
-            return Ok(WorkspaceSnapshot { files });
-        }
-
-        for entry in WalkDir::new(&self.root)
-            .into_iter()
-            .filter_entry(|e| e.depth() == 0 || !is_hidden(e))
-        {
-            let entry = entry.map_err(|e| CoreError::WorkspaceError {
-                path: self.root.clone(),
-                message: format!("Failed to walk workspace: {e}"),
-            })?;
-
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            let abs_path = entry.path();
-            let rel_path = abs_path.strip_prefix(&self.root).map_err(|e| {
-                CoreError::WorkspaceError {
-                    path: abs_path.to_path_buf(),
-                    message: format!("Failed to compute relative path: {e}"),
-                }
-            })?;
-
+        self.walk_files(|rel_path, abs_path| {
             let content =
                 std::fs::read(abs_path).map_err(|e| CoreError::WorkspaceError {
                     path: abs_path.to_path_buf(),
@@ -84,7 +60,8 @@ impl Workspace {
             let size = content.len() as u64;
 
             files.insert(rel_path.to_path_buf(), FileEntry { hash, size });
-        }
+            Ok(())
+        })?;
 
         Ok(WorkspaceSnapshot { files })
     }
@@ -138,8 +115,23 @@ impl Workspace {
     pub fn list_files(&self) -> CoreResult<Vec<PathBuf>> {
         let mut files = Vec::new();
 
+        self.walk_files(|rel_path, _abs_path| {
+            files.push(rel_path.to_path_buf());
+            Ok(())
+        })?;
+
+        files.sort();
+        Ok(files)
+    }
+
+    /// Walk all non-hidden files in the workspace, calling `f` with
+    /// the relative and absolute path for each file found.
+    fn walk_files<F>(&self, mut f: F) -> CoreResult<()>
+    where
+        F: FnMut(&Path, &Path) -> CoreResult<()>,
+    {
         if !self.root.exists() {
-            return Ok(files);
+            return Ok(());
         }
 
         for entry in WalkDir::new(&self.root)
@@ -151,19 +143,22 @@ impl Workspace {
                 message: format!("Failed to walk workspace: {e}"),
             })?;
 
-            if entry.file_type().is_file() {
-                let rel_path = entry.path().strip_prefix(&self.root).map_err(|e| {
-                    CoreError::WorkspaceError {
-                        path: entry.path().to_path_buf(),
-                        message: format!("Failed to compute relative path: {e}"),
-                    }
-                })?;
-                files.push(rel_path.to_path_buf());
+            if !entry.file_type().is_file() {
+                continue;
             }
+
+            let abs_path = entry.path();
+            let rel_path = abs_path.strip_prefix(&self.root).map_err(|e| {
+                CoreError::WorkspaceError {
+                    path: abs_path.to_path_buf(),
+                    message: format!("Failed to compute relative path: {e}"),
+                }
+            })?;
+
+            f(rel_path, abs_path)?;
         }
 
-        files.sort();
-        Ok(files)
+        Ok(())
     }
 
     /// Read a file from the workspace.

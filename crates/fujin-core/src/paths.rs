@@ -1,6 +1,5 @@
+use crate::error::{CoreError, CoreResult};
 use std::path::PathBuf;
-
-use anyhow::{Context, Result};
 
 const APP_NAME: &str = "fujin";
 
@@ -32,11 +31,13 @@ pub fn configs_dir() -> PathBuf {
 }
 
 /// Creates the data directory structure if it doesn't exist.
-pub fn ensure_dirs() -> Result<()> {
+pub fn ensure_dirs() -> CoreResult<()> {
     let dirs = [templates_dir(), configs_dir()];
     for dir in &dirs {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| CoreError::WorkspaceError {
+            path: dir.clone(),
+            message: format!("Failed to create directory: {e}"),
+        })?;
     }
     Ok(())
 }

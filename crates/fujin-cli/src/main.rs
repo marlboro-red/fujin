@@ -10,6 +10,7 @@ use fujin_core::{
     paths,
     event::PipelineEvent,
     artifact::FileChangeKind,
+    util::truncate_chars,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::mpsc;
@@ -197,16 +198,6 @@ fn resolve_config(value: &str) -> Result<PathBuf> {
         "Config not found: '{value}'\n  Searched:\n    ./{value}.yaml\n    {}",
         global.display()
     );
-}
-
-/// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_chars).collect();
-        format!("{truncated}...")
-    }
 }
 
 /// Spawn a task that listens for PipelineEvents and renders CLI output.
