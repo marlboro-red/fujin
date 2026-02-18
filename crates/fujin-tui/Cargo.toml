@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 fujin-core = { workspace = true }
 fujin-config = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 anyhow = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }

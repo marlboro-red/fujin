@@ -356,6 +356,39 @@ fn spawn_cli_display(mut rx: mpsc::UnboundedReceiver<PipelineEvent>) {
                     );
                 }
 
+                PipelineEvent::CommandRunning {
+                    command_index,
+                    command,
+                    total_commands,
+                    ..
+                } => {
+                    if let Some(ref s) = spinner {
+                        s.set_message(format!(
+                            "Running command [{}/{}]: {}",
+                            command_index + 1,
+                            total_commands,
+                            truncate_chars(&command, 60)
+                        ));
+                    } else {
+                        let s = ProgressBar::new_spinner();
+                        s.set_style(
+                            ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+                                .unwrap()
+                                .tick_strings(&[
+                                    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+                                ]),
+                        );
+                        s.set_message(format!(
+                            "Running command [{}/{}]: {}",
+                            command_index + 1,
+                            total_commands,
+                            truncate_chars(&command, 60)
+                        ));
+                        s.enable_steady_tick(std::time::Duration::from_millis(100));
+                        spinner = Some(s);
+                    }
+                }
+
                 PipelineEvent::PipelineCancelled { stage_index } => {
                     if let Some(ref s) = spinner {
                         s.finish_and_clear();

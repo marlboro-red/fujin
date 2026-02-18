@@ -151,6 +151,44 @@ impl ExecutionState {
                 }
             }
 
+            PipelineEvent::CommandRunning {
+                stage_index,
+                command_index,
+                command,
+                total_commands,
+            } => {
+                if let Some(stage) = self.stages.get_mut(stage_index) {
+                    let activity = format!(
+                        "Running command [{}/{}]: {}",
+                        command_index + 1,
+                        total_commands,
+                        command
+                    );
+                    match &mut stage.status {
+                        StageStatus::Running { activity_log, .. } => {
+                            activity_log.push(activity);
+                        }
+                        _ => {
+                            stage.status = StageStatus::Running {
+                                elapsed: Duration::ZERO,
+                                activity_log: vec![activity],
+                            };
+                        }
+                    }
+                }
+            }
+
+            PipelineEvent::CommandOutput {
+                stage_index,
+                line,
+            } => {
+                if let Some(stage) = self.stages.get_mut(stage_index) {
+                    if let StageStatus::Running { activity_log, .. } = &mut stage.status {
+                        activity_log.push(line);
+                    }
+                }
+            }
+
             PipelineEvent::AgentTick {
                 stage_index,
                 elapsed,

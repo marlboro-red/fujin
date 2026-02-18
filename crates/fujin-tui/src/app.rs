@@ -2,6 +2,7 @@ use crate::discovery::{discover_pipelines, DiscoveredPipeline};
 use crate::event::TerminalEventReader;
 use crate::screens::browser::{BrowserAction, BrowserState};
 use crate::screens::execution::{ExecutionAction, ExecutionState};
+use crate::screens::variables::{VariableInputAction, VariableInputState};
 use crate::widgets::help::render_help_overlay;
 use anyhow::Result;
 use crossterm::event::{Event as CrosstermEvent, KeyEventKind};
@@ -25,6 +26,7 @@ pub enum AppEvent {
 /// Which screen is currently displayed.
 enum Screen {
     Browser(BrowserState),
+    VariableInput(VariableInputState),
     Execution(ExecutionState),
 }
 
@@ -118,6 +120,10 @@ impl App {
                         let action = state.handle_key(key);
                         self.handle_browser_action(action).await?;
                     }
+                    Screen::VariableInput(state) => {
+                        let action = state.handle_key(key);
+                        self.handle_variable_input_action(action)?;
+                    }
                     Screen::Execution(state) => {
                         let action = state.handle_key(key);
                         self.handle_execution_action(action);
@@ -155,8 +161,36 @@ impl App {
             BrowserAction::RunPipeline(idx) => {
                 if let Screen::Browser(ref state) = self.screen {
                     if let Some(pipeline) = state.pipelines.get(idx) {
-                        self.start_pipeline(pipeline.clone())?;
+                        let pipeline = pipeline.clone();
+                        if pipeline.config.variables.is_empty() {
+                            // No variables — run immediately
+                            self.start_pipeline(pipeline, std::collections::HashMap::new())?;
+                        } else {
+                            // Show variable input screen
+                            self.screen =
+                                Screen::VariableInput(VariableInputState::new(pipeline));
+                        }
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_variable_input_action(&mut self, action: VariableInputAction) -> Result<()> {
+        match action {
+            VariableInputAction::None => {}
+            VariableInputAction::Cancel => {
+                let pipelines = discover_pipelines();
+                self.screen = Screen::Browser(BrowserState::new(pipelines));
+            }
+            VariableInputAction::ToggleHelp => self.show_help = !self.show_help,
+            VariableInputAction::Confirm => {
+                // Extract state before transitioning
+                if let Screen::VariableInput(state) = &self.screen {
+                    let overrides = state.overrides();
+                    let pipeline = state.pipeline.clone();
+                    self.start_pipeline(pipeline, overrides)?;
                 }
             }
         }
@@ -182,9 +216,14 @@ impl App {
         }
     }
 
-    /// Start executing a pipeline.
-    fn start_pipeline(&mut self, pipeline: DiscoveredPipeline) -> Result<()> {
-        let config = pipeline.config.clone();
+    /// Start executing a pipeline with optional variable overrides.
+    fn start_pipeline(
+        &mut self,
+        pipeline: DiscoveredPipeline,
+        overrides: std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let mut config = pipeline.config.clone();
+        config.apply_overrides(&overrides);
         let raw_yaml = pipeline.raw_yaml.clone();
         let total_stages = config.stages.len();
 
@@ -231,6 +270,7 @@ impl App {
 
         match &mut self.screen {
             Screen::Browser(state) => state.render(frame, area),
+            Screen::VariableInput(state) => state.render(frame, area),
             Screen::Execution(state) => state.render(frame, area),
         }
 

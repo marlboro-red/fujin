@@ -9,7 +9,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1" }
 async-trait = "0.1"
 
 # Serialization
