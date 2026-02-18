@@ -70,7 +70,7 @@ impl ClaudeCodeRuntime {
     }
 
     /// Build the rendered prompt combining system context and user prompt.
-    fn build_prompt(config: &StageConfig, context: &StageContext) -> String {
+    fn build_prompt(context: &StageContext) -> String {
         let mut prompt = context.rendered_prompt.clone();
 
         // If there's prior context, prepend it
@@ -97,7 +97,6 @@ impl ClaudeCodeRuntime {
             );
         }
 
-        let _ = config; // config already used during template rendering
         prompt
     }
 
@@ -168,16 +167,7 @@ struct ClaudeUsage {
     output_tokens: u64,
 }
 
-/// Truncate a string to at most `max_len` characters (not bytes),
-/// appending "..." if truncated. Safe for all UTF-8 content.
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_len).collect();
-        format!("{truncated}...")
-    }
-}
+use crate::util::truncate_chars;
 
 /// Extract a human-readable activity description from a stream-json line.
 fn extract_activity(line: &StreamLine) -> Option<String> {
@@ -206,7 +196,7 @@ fn extract_activity(line: &StreamLine) -> Option<String> {
                                             .or_else(|| input.get("pattern"))
                                             .or_else(|| input.get("command"))
                                             .and_then(|v| v.as_str())
-                                            .map(|s| truncate_str(s, 60))
+                                            .map(|s| truncate_chars(s, 60))
                                     })
                                     .unwrap_or_default();
                                 if summary.is_empty() {
@@ -216,7 +206,7 @@ fn extract_activity(line: &StreamLine) -> Option<String> {
                             }
                             Some("text") => {
                                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                    return Some(truncate_str(text, 80));
+                                    return Some(truncate_chars(text, 80));
                                 }
                             }
                             _ => {}
@@ -252,12 +242,14 @@ fn extract_activity(line: &StreamLine) -> Option<String> {
 }
 
 /// Poll a cancel flag until it becomes true. Used with `tokio::select!`.
-async fn cancel_poll(flag: Option<&Arc<AtomicBool>>) {
+///
+/// When no flag is provided, this future never resolves (equivalent to
+/// `std::future::pending()`), which is the correct behavior for a
+/// `select!` branch that should never win.
+async fn cancel_poll(flag: &Arc<AtomicBool>) {
     loop {
-        if let Some(f) = flag {
-            if f.load(Ordering::Relaxed) {
-                return;
-            }
+        if flag.load(Ordering::Relaxed) {
+            return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -277,7 +269,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
         progress_tx: Option<mpsc::UnboundedSender<String>>,
         cancel_flag: Option<Arc<AtomicBool>>,
     ) -> CoreResult<AgentOutput> {
-        let prompt = Self::build_prompt(config, context);
+        let prompt = Self::build_prompt(context);
 
         info!(
             stage_id = %config.id,
@@ -345,22 +337,12 @@ impl AgentRuntime for ClaudeCodeRuntime {
             let mut token_usage = None;
 
             loop {
-                // Check cancel flag before each line read
-                if let Some(ref flag) = cancel_flag {
-                    if flag.load(Ordering::Relaxed) {
-                        info!(stage_id = %config.id, "Cancellation requested, killing agent process");
-                        let _ = child.kill().await;
-                        return Err(CoreError::Cancelled {
-                            stage_id: config.id.clone(),
-                        });
-                    }
-                }
-
-                // Use select! to race between reading next line and cancel polling
-                let line_result = if cancel_flag.is_some() {
+                // Race between reading next line and cancel polling
+                let line_result = if let Some(ref flag) = cancel_flag {
                     tokio::select! {
                         result = reader.next_line() => result,
-                        _ = cancel_poll(cancel_flag.as_ref()) => {
+                        _ = cancel_poll(flag) => {
+                            info!(stage_id = %config.id, "Cancellation requested, killing agent process");
                             let _ = child.kill().await;
                             return Err(CoreError::Cancelled {
                                 stage_id: config.id.clone(),
@@ -438,7 +420,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
             let wait_result = if let Some(ref flag) = cancel_flag {
                 tokio::select! {
                     result = child.wait() => Some(result),
-                    _ = cancel_poll(Some(flag)) => {
+                    _ = cancel_poll(flag) => {
                         let _ = child.kill().await;
                         return Err(CoreError::Cancelled {
                             stage_id: config.id.clone(),

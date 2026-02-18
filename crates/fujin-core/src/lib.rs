@@ -7,6 +7,7 @@ pub mod event;
 pub mod paths;
 pub mod pipeline;
 pub mod stage;
+pub mod util;
 pub mod workspace;
 
 pub use agent::{AgentOutput, AgentRuntime, ClaudeCodeRuntime};

@@ -1,5 +1,6 @@
 use crate::discovery::DiscoveredPipeline;
 use crossterm::event::{KeyCode, KeyEvent};
+use fujin_core::util::truncate_chars;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -229,12 +230,7 @@ impl BrowserState {
                 Style::default().fg(Color::DarkGray),
             )));
             for (key, value) in &config.variables {
-                let display_val = if value.chars().count() > 40 {
-                    let truncated: String = value.chars().take(40).collect();
-                    format!("{truncated}...")
-                } else {
-                    value.clone()
-                };
+                let display_val = truncate_chars(value, 40);
                 lines.push(Line::from(format!(
                     "    {key} = \"{display_val}\""
                 )));

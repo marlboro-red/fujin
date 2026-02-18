@@ -66,14 +66,14 @@ impl CheckpointManager {
     pub fn save(&self, checkpoint: &Checkpoint) -> CoreResult<()> {
         self.ensure_dir()?;
 
-        let path = self.checkpoint_path(&checkpoint.run_id);
         let json = serde_json::to_string_pretty(checkpoint)?;
-        std::fs::write(&path, json)?;
 
-        // Also save as "latest" symlink/copy for easy resume
+        let path = self.checkpoint_path(&checkpoint.run_id);
+        std::fs::write(&path, &json)?;
+
+        // Also save as "latest" copy for easy resume
         let latest_path = self.checkpoint_dir.join("latest.json");
-        let json = serde_json::to_string_pretty(checkpoint)?;
-        std::fs::write(&latest_path, json)?;
+        std::fs::write(&latest_path, &json)?;
 
         debug!(
             run_id = %checkpoint.run_id,
