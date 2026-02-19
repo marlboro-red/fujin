@@ -93,17 +93,6 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
                 .errors
                 .push(format!("{prefix}: timeout_secs must be greater than 0"));
         }
-
-        // Validate allowed tools
-        let valid_tools = ["read", "write", "bash", "edit", "glob", "grep", "notebook"];
-        for tool in &stage.allowed_tools {
-            if !valid_tools.contains(&tool.as_str()) {
-                result.warnings.push(format!(
-                    "{prefix}: unknown tool '{tool}' (valid: {})",
-                    valid_tools.join(", ")
-                ));
-            }
-        }
     }
 
     // Check for {{prior_summary}} usage in first stage
@@ -170,6 +159,25 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
                 "Retry group '{}' is defined but not referenced by any stage",
                 group_name
             ));
+        }
+    }
+
+    // Warn about command stages in retry groups with verify agents
+    for (i, stage) in config.stages.iter().enumerate() {
+        if let Some(ref group) = stage.retry_group {
+            if stage.is_command_stage() {
+                let has_verify = config
+                    .retry_groups
+                    .get(group.as_str())
+                    .is_some_and(|g| g.verify.is_some());
+                if has_verify {
+                    result.warnings.push(format!(
+                        "Stage {} ('{}'): command stage in retry group '{}' with verify agent; \
+                         {{{{verify_feedback}}}} is not available in command stages",
+                        i, stage.id, group
+                    ));
+                }
+            }
         }
     }
 

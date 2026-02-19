@@ -29,6 +29,7 @@ pub enum PipelineEvent {
         stage_id: String,
         stage_name: String,
         model: String,
+        retry_group: Option<String>,
     },
 
     /// Context is being built for a stage (summarization, template rendering).

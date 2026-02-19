@@ -240,10 +240,10 @@ impl App {
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
         // Create execution screen
-        let stage_names: Vec<(String, String)> = config
+        let stage_names: Vec<(String, String, Option<String>)> = config
             .stages
             .iter()
-            .map(|s| (s.id.clone(), s.name.clone()))
+            .map(|s| (s.id.clone(), s.name.clone(), s.retry_group.clone()))
             .collect();
         let exec_state = ExecutionState::new(
             config.name.clone(),

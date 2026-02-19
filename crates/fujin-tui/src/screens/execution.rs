@@ -29,6 +29,26 @@ pub enum StageStatus {
     Failed { error: String },
 }
 
+/// What the user has selected in the stage list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionTarget {
+    /// A pipeline stage (by index).
+    Stage(usize),
+    /// A retry group's verification step (by group name).
+    Verify(String),
+}
+#[derive(Debug, Clone)]
+pub enum VerifyStatus {
+    /// Waiting (group stages still running, or verify not yet triggered).
+    Pending,
+    /// Verification agent is running.
+    Running { activity_log: Vec<String> },
+    /// Verification passed.
+    Passed,
+    /// Verification failed.
+    Failed { response: String },
+}
+
 /// Info for a stage displayed in the execution view.
 #[derive(Debug, Clone)]
 pub struct StageInfo {
@@ -41,6 +61,8 @@ pub struct StageInfo {
     pub prior_summary: Option<String>,
     /// Whether a retry-group verification is currently running for this stage.
     pub verifying: bool,
+    /// Retry group this stage belongs to (if any).
+    pub retry_group: Option<String>,
 }
 
 /// State for the pipeline execution screen.
@@ -55,8 +77,8 @@ pub struct ExecutionState {
     pub stages: Vec<StageInfo>,
     /// Currently active stage index.
     pub active_stage: Option<usize>,
-    /// Which stage is selected for detail viewing (after completion).
-    pub selected_stage: usize,
+    /// Which item is selected for detail viewing.
+    pub selection: SelectionTarget,
     /// Pipeline start time.
     pub start_time: Instant,
     /// Frozen elapsed time (set when pipeline finishes).
@@ -78,6 +100,12 @@ pub struct ExecutionState {
     detail_content_height: usize,
     /// Whether the detail panel is showing the prompt/context view.
     pub show_prompt: bool,
+    /// Whether the detail panel is focused (maximized).
+    pub detail_focused: bool,
+    /// Current retry attempt per group name.
+    pub retry_attempts: std::collections::HashMap<String, (u32, u32)>,
+    /// Verification status per retry group name.
+    pub verify_states: std::collections::HashMap<String, VerifyStatus>,
 }
 
 /// Actions the execution screen can request.
@@ -96,12 +124,12 @@ impl ExecutionState {
         pipeline_name: String,
         run_id: String,
         total_stages: usize,
-        stage_names: Vec<(String, String)>,
+        stage_names: Vec<(String, String, Option<String>)>,
     ) -> Self {
         let stages = stage_names
             .into_iter()
             .enumerate()
-            .map(|(i, (id, name))| StageInfo {
+            .map(|(i, (id, name, retry_group))| StageInfo {
                 index: i,
                 id,
                 name,
@@ -110,14 +138,16 @@ impl ExecutionState {
                 rendered_prompt: None,
                 prior_summary: None,
                 verifying: false,
-            })            .collect();
+                retry_group,
+            })
+            .collect();
         Self {
             pipeline_name,
             run_id,
             total_stages,
             stages,
             active_stage: None,
-            selected_stage: 0,
+            selection: SelectionTarget::Stage(0),
             start_time: Instant::now(),
             final_elapsed: None,
             total_input_tokens: 0,
@@ -129,7 +159,52 @@ impl ExecutionState {
             detail_scroll_pinned: false,
             detail_content_height: 0,
             show_prompt: false,
+            detail_focused: false,
+            retry_attempts: std::collections::HashMap::new(),
+            verify_states: std::collections::HashMap::new(),
         }
+    }
+
+    /// Build the ordered flat list of selectable items (stages + verify entries).
+    fn selectable_items(&self) -> Vec<SelectionTarget> {
+        let mut items = Vec::new();
+        let mut seen_groups: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+        // Pre-compute last stage index per group
+        let mut group_last: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (i, stage) in self.stages.iter().enumerate() {
+            if let Some(ref g) = stage.retry_group {
+                group_last.insert(g.as_str(), i);
+            }
+        }
+
+        for (i, stage) in self.stages.iter().enumerate() {
+            items.push(SelectionTarget::Stage(i));
+            // After the last stage of a retry group, insert a Verify entry
+            if let Some(ref g) = stage.retry_group {
+                if group_last.get(g.as_str()) == Some(&i) && !seen_groups.contains(g.as_str()) {
+                    seen_groups.insert(g.as_str());
+                    items.push(SelectionTarget::Verify(g.clone()));
+                }
+            }
+        }
+        items
+    }
+
+    /// Navigate selection by delta (-1 = up, +1 = down).
+    fn move_selection(&mut self, delta: i32) {
+        let items = self.selectable_items();
+        if items.is_empty() {
+            return;
+        }
+        let cur_pos = items.iter().position(|t| *t == self.selection).unwrap_or(0);
+        let new_pos = if delta < 0 {
+            cur_pos.saturating_sub((-delta) as usize)
+        } else {
+            (cur_pos + delta as usize).min(items.len() - 1)
+        };
+        self.selection = items[new_pos].clone();
     }
 
     /// Handle an incoming pipeline event.
@@ -142,6 +217,7 @@ impl ExecutionState {
                 stage_id,
                 stage_name,
                 model,
+                retry_group,
             } => {
                 // Ensure stages vec is large enough
                 while self.stages.len() <= stage_index {
@@ -154,12 +230,14 @@ impl ExecutionState {
                         rendered_prompt: None,
                         prior_summary: None,
                         verifying: false,
+                        retry_group: None,
                     });
                 }
                 let stage = &mut self.stages[stage_index];
                 stage.id = stage_id;
                 stage.name = stage_name;
                 stage.model = model.clone();
+                stage.retry_group = retry_group;
                 // Immediately transition to Running so the TUI shows progress
                 stage.status = StageStatus::Running {
                     elapsed: Duration::ZERO,
@@ -170,7 +248,7 @@ impl ExecutionState {
                     },
                 };
                 self.active_stage = Some(stage_index);
-                self.selected_stage = stage_index;
+                self.selection = SelectionTarget::Stage(stage_index);
             }
 
             PipelineEvent::ContextBuilding { stage_index } => {
@@ -367,7 +445,8 @@ impl ExecutionState {
                         stage.status = StageStatus::Pending;
                     }
                 }
-                let _ = &group_name;
+                self.retry_attempts.insert(group_name.clone(), (attempt, max_retries));
+                self.verify_states.insert(group_name, VerifyStatus::Pending);
                 self.active_stage = None;
             }
 
@@ -382,34 +461,36 @@ impl ExecutionState {
             PipelineEvent::VerifyRunning { group_name, stage_index } => {
                 if let Some(stage) = self.stages.get_mut(stage_index) {
                     stage.verifying = true;
-                    if let StageStatus::Completed { activity_log, .. } = &mut stage.status {
-                        activity_log.push(format!("Verifying retry group '{group_name}'…"));
-                    }
                 }
+                self.verify_states.insert(
+                    group_name,
+                    VerifyStatus::Running { activity_log: Vec::new() },
+                );
             }
 
             PipelineEvent::VerifyPassed { group_name, stage_index } => {
                 if let Some(stage) = self.stages.get_mut(stage_index) {
                     stage.verifying = false;
-                    if let StageStatus::Completed { activity_log, .. } = &mut stage.status {
-                        activity_log.push(format!("Retry group '{group_name}' verification passed ✓"));
-                    }
                 }
+                self.verify_states.insert(group_name, VerifyStatus::Passed);
             }
 
             PipelineEvent::VerifyFailed { group_name, stage_index, response } => {
                 if let Some(stage) = self.stages.get_mut(stage_index) {
                     stage.verifying = false;
-                    if let StageStatus::Completed { activity_log, .. } = &mut stage.status {
-                        activity_log.push(format!("Retry group '{group_name}' verification failed: {response}"));
-                    }
                 }
+                self.verify_states.insert(
+                    group_name,
+                    VerifyStatus::Failed { response },
+                );
             }
 
-            PipelineEvent::VerifyActivity { stage_index, activity } => {
-                if let Some(stage) = self.stages.get_mut(stage_index) {
-                    if let StageStatus::Completed { activity_log, .. } = &mut stage.status {
+            PipelineEvent::VerifyActivity { stage_index: _, activity } => {
+                // Find the verify state that's currently running and append activity
+                for state in self.verify_states.values_mut() {
+                    if let VerifyStatus::Running { activity_log } = state {
                         activity_log.push(activity);
+                        break;
                     }
                 }
             }
@@ -428,15 +509,23 @@ impl ExecutionState {
                 }
             }
             KeyCode::Char('q') | KeyCode::Esc => {
-                if self.finished {
+                if self.detail_focused {
+                    self.detail_focused = false;
+                    ExecutionAction::None
+                } else if self.finished {
                     ExecutionAction::Quit
                 } else {
-                    // Esc/q also cancels during execution
                     ExecutionAction::CancelPipeline
                 }
             }
-            KeyCode::Char('b') if self.finished => ExecutionAction::BackToBrowser,
+            KeyCode::Char('b') if self.finished && !self.detail_focused => {
+                ExecutionAction::BackToBrowser
+            }
             KeyCode::Char('?') => ExecutionAction::ToggleHelp,
+            KeyCode::Char('f') | KeyCode::Enter => {
+                self.detail_focused = !self.detail_focused;
+                ExecutionAction::None
+            }
             KeyCode::Char('p') => {
                 self.show_prompt = !self.show_prompt;
                 self.detail_scroll = 0;
@@ -445,19 +534,15 @@ impl ExecutionState {
             }
             // Stage navigation
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.selected_stage > 0 {
-                    self.selected_stage -= 1;
-                    self.detail_scroll = 0;
-                    self.detail_scroll_pinned = false;
-                }
+                self.move_selection(-1);
+                self.detail_scroll = 0;
+                self.detail_scroll_pinned = false;
                 ExecutionAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected_stage + 1 < self.stages.len() {
-                    self.selected_stage += 1;
-                    self.detail_scroll = 0;
-                    self.detail_scroll_pinned = false;
-                }
+                self.move_selection(1);
+                self.detail_scroll = 0;
+                self.detail_scroll_pinned = false;
                 ExecutionAction::None
             }
             // Log scrolling (always available)
@@ -532,13 +617,17 @@ impl ExecutionState {
     }
 
     fn render_body(&mut self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(area);
+        if self.detail_focused {
+            self.render_stage_detail(frame, area);
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .split(area);
 
-        self.render_stage_list(frame, chunks[0]);
-        self.render_stage_detail(frame, chunks[1]);
+            self.render_stage_list(frame, chunks[0]);
+            self.render_stage_detail(frame, chunks[1]);
+        }
     }
 
     fn render_stage_list(&self, frame: &mut Frame, area: Rect) {
@@ -548,9 +637,54 @@ impl ExecutionState {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        // Pre-compute retry group ranges: group_name -> (first_idx, last_idx)
+        let mut group_ranges: std::collections::HashMap<&str, (usize, usize)> =
+            std::collections::HashMap::new();
+        for (i, stage) in self.stages.iter().enumerate() {
+            if let Some(ref g) = stage.retry_group {
+                group_ranges
+                    .entry(g.as_str())
+                    .and_modify(|(first, last)| {
+                        if i < *first { *first = i; }
+                        if i > *last { *last = i; }
+                    })
+                    .or_insert((i, i));
+            }
+        }
+
         let mut lines: Vec<Line> = Vec::new();
+        let mut prev_group: Option<&str> = None;
 
         for (i, stage) in self.stages.iter().enumerate() {
+            let cur_group = stage.retry_group.as_deref();
+
+            // Emit group header when entering a new retry group
+            if cur_group.is_some() && cur_group != prev_group {
+                // Close previous group if transitioning between different groups
+                if prev_group.is_some() {
+                    lines.push(Line::from(Span::styled(
+                        "  ╰─",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                let gname = cur_group.unwrap();
+                let attempt_str = if let Some(&(attempt, max)) = self.retry_attempts.get(gname) {
+                    format!(" (attempt {}/{})", attempt + 1, max)
+                } else {
+                    String::new()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  ╭─ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{gname}{attempt_str}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+
+            let in_group = cur_group.is_some();
+            let gutter = if in_group { "  │ " } else { "  " };
+
             let (icon, icon_color, detail) = match &stage.status {
                 StageStatus::Pending => ("·", Color::DarkGray, "pending".to_string()),
                 StageStatus::Building => ("·", Color::Yellow, "building context...".to_string()),
@@ -595,7 +729,7 @@ impl ExecutionState {
                 StageStatus::Failed { .. } => ("✗", Color::Red, "failed".to_string()),
             };
 
-            let is_selected = i == self.selected_stage;
+            let is_selected = self.selection == SelectionTarget::Stage(i);
             let name_style = if is_selected {
                 Style::default()
                     .fg(Color::Cyan)
@@ -603,17 +737,82 @@ impl ExecutionState {
             } else {
                 Style::default().add_modifier(Modifier::BOLD)
             };
+            let select_indicator = if is_selected { "▸" } else { " " };
+
+            let detail_gutter = if in_group { "  │   " } else { "    " };
 
             lines.push(Line::from(vec![
-                Span::raw("  "),
+                Span::styled(gutter, Style::default().fg(Color::DarkGray)),
+                Span::styled(select_indicator, Style::default().fg(Color::Cyan)),
                 Span::styled(icon, Style::default().fg(icon_color)),
                 Span::raw(format!(" {}. ", i + 1)),
                 Span::styled(&stage.name, name_style),
             ]));
             lines.push(Line::from(vec![
-                Span::raw("      "),
-                Span::styled(detail, Style::default().fg(Color::DarkGray)),
+                Span::styled(detail_gutter, Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("  {detail}"), Style::default().fg(Color::DarkGray)),
             ]));
+
+            // Emit verify step + group footer after the last stage in a group
+            if let Some(gname) = cur_group {
+                let is_last_in_group = group_ranges
+                    .get(gname)
+                    .is_some_and(|&(_, last)| i == last);
+                if is_last_in_group {
+                    // Render verify entry for this group
+                    let v_selected = self.selection == SelectionTarget::Verify(gname.to_string());
+                    let v_select_indicator = if v_selected { "▸" } else { " " };
+
+                    let (v_icon, v_color, v_detail) = if let Some(vs) = self.verify_states.get(gname) {
+                        match vs {
+                            VerifyStatus::Pending => ("·", Color::DarkGray, "pending".to_string()),
+                            VerifyStatus::Running { activity_log } => {
+                                let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
+                                let detail = if let Some(act) = activity_log.last() {
+                                    act.clone()
+                                } else {
+                                    "running…".to_string()
+                                };
+                                (spinner, Color::Yellow, detail)
+                            }
+                            VerifyStatus::Passed => ("✓", Color::Green, "passed".to_string()),
+                            VerifyStatus::Failed { response } => {
+                                let short = if response.len() > 60 {
+                                    format!("{}…", &response[..60])
+                                } else {
+                                    response.clone()
+                                };
+                                ("✗", Color::Red, format!("failed — {short}"))
+                            }
+                        }
+                    } else {
+                        ("·", Color::DarkGray, "pending".to_string())
+                    };
+
+                    let v_name_style = if v_selected {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(v_color).add_modifier(Modifier::BOLD)
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(v_select_indicator, Style::default().fg(Color::Cyan)),
+                        Span::styled(v_icon, Style::default().fg(v_color)),
+                        Span::styled(" Verify", v_name_style),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("  │     ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("  {v_detail}"), Style::default().fg(Color::DarkGray)),
+                    ]));
+                    lines.push(Line::from(Span::styled(
+                        "  ╰─",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+
+            prev_group = cur_group;
         }
 
         let paragraph = Paragraph::new(lines);
@@ -621,7 +820,96 @@ impl ExecutionState {
     }
 
     fn render_stage_detail(&mut self, frame: &mut Frame, area: Rect) {
-        let detail_idx = self.selected_stage;
+        match &self.selection {
+            SelectionTarget::Stage(idx) => {
+                let detail_idx = *idx;
+                self.render_stage_detail_for_stage(frame, area, detail_idx);
+            }
+            SelectionTarget::Verify(gname) => {
+                let gname = gname.clone();
+                self.render_verify_detail(frame, area, &gname);
+            }
+        }
+    }
+
+    fn render_verify_detail(&mut self, frame: &mut Frame, area: Rect, group_name: &str) {
+        let title = format!(" Verify: {group_name} ");
+        let block = Block::default().borders(Borders::ALL).title(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines: Vec<Line> = Vec::new();
+
+        let vs = self.verify_states.get(group_name);
+        let (label, label_color) = match vs {
+            Some(VerifyStatus::Pending) | None => ("  Status: pending", Color::DarkGray),
+            Some(VerifyStatus::Running { .. }) => ("  Status: running…", Color::Yellow),
+            Some(VerifyStatus::Passed) => ("  Status: passed ✓", Color::Green),
+            Some(VerifyStatus::Failed { .. }) => ("  Status: failed ✗", Color::Red),
+        };
+        lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(label_color).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+
+        if let Some(VerifyStatus::Running { activity_log }) = vs {
+            if !activity_log.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  Activity:",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for entry in activity_log {
+                    let style = if entry.starts_with("$ ") {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("  {entry}"),
+                        style,
+                    )));
+                }
+            }
+        }
+
+        if let Some(VerifyStatus::Failed { response }) = vs {
+            lines.push(Line::from(Span::styled(
+                "  Output:",
+                Style::default().fg(Color::DarkGray),
+            )));
+            for line in response.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+
+        let visible_height = inner.height as usize;
+        let total_lines = lines.len();
+        self.detail_content_height = total_lines;
+
+        let scroll = if self.detail_scroll_pinned {
+            let max_scroll = total_lines.saturating_sub(visible_height) as u16;
+            self.detail_scroll.min(max_scroll)
+        } else {
+            let auto = if total_lines > visible_height {
+                (total_lines - visible_height) as u16
+            } else {
+                0
+            };
+            self.detail_scroll = auto;
+            auto
+        };
+
+        let paragraph = Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((scroll, 0));
+        frame.render_widget(paragraph, inner);
+    }
+
+    fn render_stage_detail_for_stage(&mut self, frame: &mut Frame, area: Rect, detail_idx: usize) {
 
         let Some(stage) = self.stages.get(detail_idx) else {
             let block = Block::default()
@@ -859,26 +1147,41 @@ impl ExecutionState {
             )),
         ];
 
-        if self.finished {
-            spans.push(Span::raw("    "));
+        spans.push(Span::raw("    "));
+
+        if self.detail_focused {
+            spans.push(Span::styled("[Esc]", Style::default().fg(Color::Cyan)));
+            spans.push(Span::raw(" Back  "));
+            spans.push(Span::styled("[j/k]", Style::default().fg(Color::Cyan)));
+            spans.push(Span::raw(" Stages  "));
+            spans.push(Span::styled("[PgUp/Dn]", Style::default().fg(Color::Cyan)));
+            spans.push(Span::raw(" Scroll  "));
+            if self.detail_content_height > 0 {
+                let pos = self.detail_scroll as usize + 1;
+                let total = self.detail_content_height;
+                spans.push(Span::styled(
+                    format!(" {pos}/{total}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        } else if self.finished {
             spans.push(Span::styled("[b]", Style::default().fg(Color::Cyan)));
             spans.push(Span::raw(" Back  "));
             spans.push(Span::styled("[j/k]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Browse stages  "));
+            spans.push(Span::raw(" Stages  "));
+            spans.push(Span::styled("[f]", Style::default().fg(Color::Cyan)));
+            spans.push(Span::raw(" Focus  "));
             spans.push(Span::styled("[p]", Style::default().fg(Color::Cyan)));
             spans.push(Span::raw(" Prompt  "));
-            spans.push(Span::styled("[PgUp/Dn]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Scroll  "));
             spans.push(Span::styled("[q]", Style::default().fg(Color::Cyan)));
             spans.push(Span::raw(" Quit"));
         } else {
-            spans.push(Span::raw("    "));
             spans.push(Span::styled("[j/k]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Browse stages  "));
+            spans.push(Span::raw(" Stages  "));
+            spans.push(Span::styled("[f]", Style::default().fg(Color::Cyan)));
+            spans.push(Span::raw(" Focus  "));
             spans.push(Span::styled("[p]", Style::default().fg(Color::Cyan)));
             spans.push(Span::raw(" Prompt  "));
-            spans.push(Span::styled("[PgUp/Dn]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Scroll  "));
             spans.push(Span::styled("[Ctrl+C]", Style::default().fg(Color::Yellow)));
             spans.push(Span::raw(" Stop"));
         }
@@ -943,9 +1246,9 @@ mod tests {
             String::new(),
             3,
             vec![
-                ("s0".into(), "Stage 0".into()),
-                ("s1".into(), "Stage 1".into()),
-                ("s2".into(), "Stage 2".into()),
+                ("s0".into(), "Stage 0".into(), None),
+                ("s1".into(), "Stage 1".into(), None),
+                ("s2".into(), "Stage 2".into(), None),
             ],
         )
     }
@@ -1023,27 +1326,27 @@ mod tests {
                 activity_log: vec![],
             };
         }
-        state.selected_stage = 0;
+        state.selection = SelectionTarget::Stage(0);
 
         state.handle_key(make_key(KeyCode::Char('j')));
-        assert_eq!(state.selected_stage, 1);
+        assert_eq!(state.selection, SelectionTarget::Stage(1));
 
         state.handle_key(make_key(KeyCode::Down));
-        assert_eq!(state.selected_stage, 2);
+        assert_eq!(state.selection, SelectionTarget::Stage(2));
 
         // Can't go past end
         state.handle_key(make_key(KeyCode::Char('j')));
-        assert_eq!(state.selected_stage, 2);
+        assert_eq!(state.selection, SelectionTarget::Stage(2));
 
         state.handle_key(make_key(KeyCode::Char('k')));
-        assert_eq!(state.selected_stage, 1);
+        assert_eq!(state.selection, SelectionTarget::Stage(1));
 
         state.handle_key(make_key(KeyCode::Up));
-        assert_eq!(state.selected_stage, 0);
+        assert_eq!(state.selection, SelectionTarget::Stage(0));
 
         // Can't go before start
         state.handle_key(make_key(KeyCode::Char('k')));
-        assert_eq!(state.selected_stage, 0);
+        assert_eq!(state.selection, SelectionTarget::Stage(0));
     }
 
     // --- Pipeline event handling tests ---
@@ -1056,6 +1359,7 @@ mod tests {
             stage_id: "build".into(),
             stage_name: "Build Code".into(),
             model: "sonnet".into(),
+            retry_group: None,
         });
 
         assert_eq!(state.stages.len(), 3); // pre-populated by new_state()
@@ -1072,6 +1376,7 @@ mod tests {
             stage_id: "s0".into(),
             stage_name: "S0".into(),
             model: "m".into(),
+            retry_group: None,
         });
         state.stages[0].status = StageStatus::Running {
             elapsed: Duration::ZERO,
@@ -1103,6 +1408,7 @@ mod tests {
             stage_id: "s0".into(),
             stage_name: "S0".into(),
             model: "m".into(),
+            retry_group: None,
         });
 
         state.handle_pipeline_event(PipelineEvent::StageFailed {
@@ -1137,6 +1443,7 @@ mod tests {
             stage_id: "s1".into(),
             stage_name: "S1".into(),
             model: "m".into(),
+            retry_group: None,
         });
 
         state.handle_pipeline_event(PipelineEvent::PipelineCancelled { stage_index: 1 });
@@ -1153,6 +1460,7 @@ mod tests {
             stage_id: "s0".into(),
             stage_name: "S0".into(),
             model: "m".into(),
+            retry_group: None,
         });
         state.handle_pipeline_event(PipelineEvent::AgentRunning {
             stage_index: 0,
@@ -1184,6 +1492,7 @@ mod tests {
             stage_id: "s0".into(),
             stage_name: "S0".into(),
             model: "m".into(),
+            retry_group: None,
         });
         state.handle_pipeline_event(PipelineEvent::AgentRunning {
             stage_index: 0,
