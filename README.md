@@ -128,6 +128,59 @@ stages:
       Review all code and write comprehensive docs.
 ```
 
+### Command Stages
+
+Not every stage needs an AI agent. **Command stages** run shell commands directly, without spawning Claude. Use them for build steps, tests, linting, or any CLI task in your pipeline.
+
+A command stage uses the `commands` field instead of `system_prompt` / `user_prompt`:
+
+```yaml
+stages:
+  - id: "build"
+    name: "Build Project"
+    commands:
+      - "cargo build --release"
+      - "cargo test"
+```
+
+Commands run sequentially. If any command exits with a non-zero status, the stage fails and the pipeline stops (with a checkpoint saved so you can `--resume`).
+
+Commands support template variables, just like prompts:
+
+```yaml
+variables:
+  target: "x86_64-unknown-linux-gnu"
+
+stages:
+  - id: "cross-build"
+    name: "Cross Compile"
+    commands:
+      - "cargo build --release --target {{target}}"
+```
+
+The built-in variables `{{stage_id}}` and `{{stage_name}}` are also available in commands.
+
+You can mix command stages and agent stages in the same pipeline:
+
+```yaml
+stages:
+  - id: "codegen"
+    name: "Generate Code"
+    system_prompt: |
+      You are an expert developer.
+    user_prompt: |
+      Implement the feature described in SPEC.md.
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: "test"
+    name: "Run Tests"
+    commands:
+      - "cargo test"
+      - "cargo clippy -- -D warnings"
+```
+
+When a stage has `commands`, the agent-specific fields (`system_prompt`, `user_prompt`, `model`, `max_turns`, `allowed_tools`) are ignored. Only `id`, `name`, `timeout_secs`, and `commands` apply.
+
 Run `fujin init --list` to see all available templates, or `fujin setup` to install them locally where you can customize them.
 
 ### Config Reference
@@ -149,24 +202,30 @@ Run `fujin init --list` to see all available templates, or `fujin setup` to inst
 | `model` | string | `"claude-haiku-4-5-20251001"` | Model for summarization |
 | `max_tokens` | integer | `1024` | Max tokens for summaries |
 
-**Stage fields:**
+**Stage fields (common):**
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `id` | string | *required* | Unique stage identifier |
 | `name` | string | *required* | Human-readable name |
+| `timeout_secs` | integer | `300` | Stage timeout in seconds |
+| `commands` | list | — | Shell commands to run (makes this a command stage) |
+
+**Agent stage fields** (ignored when `commands` is set):
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
 | `model` | string | `"claude-sonnet-4-6"` | Claude model to use |
 | `system_prompt` | string | *required* | System prompt for the agent |
 | `user_prompt` | string | *required* | User prompt template |
 | `max_turns` | integer | `10` | Max agentic turns for Claude Code |
 | `allowed_tools` | list | `["read", "write"]` | Tools Claude Code can use |
-| `timeout_secs` | integer | `300` | Stage timeout in seconds |
 
 **Allowed tools:** `read`, `write`, `edit`, `bash`, `glob`, `grep`, `notebook`
 
 ### Template Variables
 
-Prompts use [Handlebars](https://handlebarsjs.com/) syntax. Available variables:
+Prompts and commands use [Handlebars](https://handlebarsjs.com/) syntax. Available variables:
 
 | Variable | Description |
 |----------|-------------|
