@@ -1,12 +1,13 @@
+use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use fujin_core::event::PipelineEvent;
 use fujin_core::artifact::ArtifactSet;
 use fujin_core::stage::TokenUsage;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, LineGauge, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 use std::time::{Duration, Instant};
@@ -106,6 +107,8 @@ pub struct ExecutionState {
     pub retry_attempts: std::collections::HashMap<String, (u32, u32)>,
     /// Verification status per retry group name.
     pub verify_states: std::collections::HashMap<String, VerifyStatus>,
+    /// Whether the user has pressed q once (confirm cancel).
+    pub confirm_cancel: bool,
 }
 
 /// Actions the execution screen can request.
@@ -117,23 +120,23 @@ pub enum ExecutionAction {
     CancelPipeline,
 }
 
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_FRAMES: &[&str] = &["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"];
 
 impl ExecutionState {
     pub fn new(
         pipeline_name: String,
         run_id: String,
         total_stages: usize,
-        stage_names: Vec<(String, String, Option<String>)>,
+        stage_names: Vec<(String, String, String, Option<String>)>,
     ) -> Self {
         let stages = stage_names
             .into_iter()
             .enumerate()
-            .map(|(i, (id, name, retry_group))| StageInfo {
+            .map(|(i, (id, name, model, retry_group))| StageInfo {
                 index: i,
                 id,
                 name,
-                model: String::new(),
+                model,
                 status: StageStatus::Pending,
                 rendered_prompt: None,
                 prior_summary: None,
@@ -162,7 +165,16 @@ impl ExecutionState {
             detail_focused: false,
             retry_attempts: std::collections::HashMap::new(),
             verify_states: std::collections::HashMap::new(),
+            confirm_cancel: false,
         }
+    }
+
+    /// Count how many stages are completed.
+    fn completed_stages(&self) -> usize {
+        self.stages
+            .iter()
+            .filter(|s| matches!(s.status, StageStatus::Completed { .. }))
+            .count()
     }
 
     /// Build the ordered flat list of selectable items (stages + verify entries).
@@ -205,6 +217,22 @@ impl ExecutionState {
             (cur_pos + delta as usize).min(items.len() - 1)
         };
         self.selection = items[new_pos].clone();
+    }
+
+    /// Jump selection to first item.
+    fn jump_to_first(&mut self) {
+        let items = self.selectable_items();
+        if let Some(first) = items.into_iter().next() {
+            self.selection = first;
+        }
+    }
+
+    /// Jump selection to last item.
+    fn jump_to_last(&mut self) {
+        let items = self.selectable_items();
+        if let Some(last) = items.into_iter().last() {
+            self.selection = last;
+        }
     }
 
     /// Handle an incoming pipeline event.
@@ -396,7 +424,7 @@ impl ExecutionState {
                 self.finished = true;
                 self.final_elapsed = Some(self.start_time.elapsed());
                 self.final_message = Some(format!(
-                    "Pipeline complete in {:.1}s — {} stages executed",
+                    "Pipeline complete in {:.1}s \u{2014} {} stages executed",
                     total_duration.as_secs_f64(),
                     stages_completed
                 ));
@@ -434,7 +462,7 @@ impl ExecutionState {
                 if let Some(stage) = self.stages.iter_mut().find(|s| s.id == failed_stage_id) {
                     stage.status = StageStatus::Failed {
                         error: format!(
-                            "Retrying ({}/{}) — {}",
+                            "Retrying ({}/{}) \u{2014} {}",
                             attempt, max_retries, error
                         ),
                     };
@@ -499,8 +527,23 @@ impl ExecutionState {
 
     /// Handle a key event. Returns the resulting action.
     pub fn handle_key(&mut self, key: KeyEvent) -> ExecutionAction {
+        // Any key dismisses the confirm-cancel prompt (except a second q/Esc)
+        if self.confirm_cancel {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('y') => {
+                    self.confirm_cancel = false;
+                    return ExecutionAction::CancelPipeline;
+                }
+                _ => {
+                    // Dismiss the warning
+                    self.confirm_cancel = false;
+                    return ExecutionAction::None;
+                }
+            }
+        }
+
         match key.code {
-            // Ctrl+C cancels a running pipeline
+            // Ctrl+C force-cancels a running pipeline
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if !self.finished {
                     ExecutionAction::CancelPipeline
@@ -515,7 +558,9 @@ impl ExecutionState {
                 } else if self.finished {
                     ExecutionAction::Quit
                 } else {
-                    ExecutionAction::CancelPipeline
+                    // First press: show confirm warning
+                    self.confirm_cancel = true;
+                    ExecutionAction::None
                 }
             }
             KeyCode::Char('b') if self.finished && !self.detail_focused => {
@@ -523,6 +568,10 @@ impl ExecutionState {
             }
             KeyCode::Char('?') => ExecutionAction::ToggleHelp,
             KeyCode::Char('f') | KeyCode::Enter => {
+                self.detail_focused = !self.detail_focused;
+                ExecutionAction::None
+            }
+            KeyCode::Tab => {
                 self.detail_focused = !self.detail_focused;
                 ExecutionAction::None
             }
@@ -541,6 +590,18 @@ impl ExecutionState {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_selection(1);
+                self.detail_scroll = 0;
+                self.detail_scroll_pinned = false;
+                ExecutionAction::None
+            }
+            KeyCode::Char('G') => {
+                self.jump_to_last();
+                self.detail_scroll = 0;
+                self.detail_scroll_pinned = false;
+                ExecutionAction::None
+            }
+            KeyCode::Char('g') => {
+                self.jump_to_first();
                 self.detail_scroll = 0;
                 self.detail_scroll_pinned = false;
                 ExecutionAction::None
@@ -580,15 +641,17 @@ impl ExecutionState {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // header
+                Constraint::Length(2), // header
+                Constraint::Length(1), // progress bar
                 Constraint::Min(0),    // main content
-                Constraint::Length(1), // footer
+                Constraint::Length(2), // footer
             ])
             .split(area);
 
         self.render_header(frame, chunks[0]);
-        self.render_body(frame, chunks[1]);
-        self.render_footer(frame, chunks[2]);
+        self.render_progress_bar(frame, chunks[1]);
+        self.render_body(frame, chunks[2]);
+        self.render_footer(frame, chunks[3]);
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -596,24 +659,72 @@ impl ExecutionState {
         let elapsed_str = format_duration(elapsed);
         let run_short: String = self.run_id.chars().take(8).collect();
 
-        let status = if self.finished { "Finished" } else { "Running" };
+        let (status, status_color) = if self.finished {
+            if self.final_message.as_ref().is_some_and(|m| m.contains("failed") || m.contains("cancelled")) {
+                ("Failed", theme::ERROR)
+            } else {
+                ("Finished", theme::SUCCESS)
+            }
+        } else {
+            ("Running", theme::WARNING)
+        };
 
         let header = Line::from(vec![
             Span::styled(
                 "  fujin",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!("  {status}: ")),
+            Span::styled(" \u{2502} ", Style::default().fg(theme::BORDER)),
+            Span::styled(status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::styled(": ", Style::default().fg(theme::TEXT_SECONDARY)),
             Span::styled(
                 &self.pipeline_name,
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("  run: {run_short}  {elapsed_str}"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::TEXT_MUTED),
             ),
         ]);
-        frame.render_widget(Paragraph::new(header), area);
+        let sub = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(area);
+        frame.render_widget(Paragraph::new(header), sub[0]);
+        let sep = Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(theme::BORDER));
+        frame.render_widget(sep, sub[1]);
+    }
+
+    fn render_progress_bar(&self, frame: &mut Frame, area: Rect) {
+        let completed = self.completed_stages();
+        let total = self.total_stages.max(1);
+        let ratio = (completed as f64 / total as f64).min(1.0);
+
+        let color = if self.finished {
+            if self.final_message.as_ref().is_some_and(|m| m.contains("failed") || m.contains("cancelled")) {
+                theme::ERROR
+            } else {
+                theme::SUCCESS
+            }
+        } else {
+            theme::ACCENT
+        };
+
+        let label = format!(" {completed}/{total} ");
+        let gauge = LineGauge::default()
+            .ratio(ratio)
+            .label(Span::styled(label, Style::default().fg(theme::TEXT_SECONDARY)))
+            .filled_style(Style::default().fg(color))
+            .unfilled_style(Style::default().fg(theme::BORDER))
+            .line_set(ratatui::symbols::line::THICK);
+
+        frame.render_widget(gauge, area);
     }
 
     fn render_body(&mut self, frame: &mut Frame, area: Rect) {
@@ -631,9 +742,7 @@ impl ExecutionState {
     }
 
     fn render_stage_list(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Stages ");
+        let block = theme::styled_block("Stages", false);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -652,6 +761,9 @@ impl ExecutionState {
             }
         }
 
+        // Compute the width needed for stage numbers
+        let num_width = self.total_stages.to_string().len();
+
         let mut lines: Vec<Line> = Vec::new();
         let mut prev_group: Option<&str> = None;
 
@@ -663,8 +775,8 @@ impl ExecutionState {
                 // Close previous group if transitioning between different groups
                 if prev_group.is_some() {
                     lines.push(Line::from(Span::styled(
-                        "  ╰─",
-                        Style::default().fg(Color::DarkGray),
+                        "  \u{2570}\u{2500}",
+                        Style::default().fg(theme::TEXT_MUTED),
                     )));
                 }
                 let gname = cur_group.unwrap();
@@ -674,31 +786,31 @@ impl ExecutionState {
                     String::new()
                 };
                 lines.push(Line::from(vec![
-                    Span::styled("  ╭─ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("  \u{256d}\u{2500} ", Style::default().fg(theme::TEXT_MUTED)),
                     Span::styled(
                         format!("{gname}{attempt_str}"),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme::TEXT_MUTED),
                     ),
                 ]));
             }
 
             let in_group = cur_group.is_some();
-            let gutter = if in_group { "  │ " } else { "  " };
+            let gutter = if in_group { "  \u{2502} " } else { "  " };
 
             let (icon, icon_color, detail) = match &stage.status {
-                StageStatus::Pending => ("·", Color::DarkGray, "pending".to_string()),
-                StageStatus::Building => ("·", Color::Yellow, "building context...".to_string()),
+                StageStatus::Pending => ("\u{00b7}", theme::TEXT_MUTED, "pending".to_string()),
+                StageStatus::Building => ("\u{00b7}", theme::WARNING, "building context...".to_string()),
                 StageStatus::Running {
                     elapsed,
                     activity_log,
                 } => {
                     let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
                     let detail = if let Some(act) = activity_log.last() {
-                        format!("{} · {act}", format_duration(*elapsed))
+                        format!("{} \u{00b7} {act}", format_duration(*elapsed))
                     } else {
                         format!("{} elapsed...", format_duration(*elapsed))
                     };
-                    (spinner, Color::Cyan, detail)
+                    (spinner, theme::ACCENT, detail)
                 }
                 StageStatus::Completed {
                     duration,
@@ -709,48 +821,61 @@ impl ExecutionState {
                     if stage.verifying {
                         let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
                         let detail = if let Some(act) = activity_log.last() {
-                            format!("{:.1}s · verifying · {act}", duration.as_secs_f64())
+                            format!("{} \u{00b7} verifying \u{00b7} {act}", format_duration_precise(*duration))
                         } else {
-                            format!("{:.1}s · verifying…", duration.as_secs_f64())
+                            format!("{} \u{00b7} verifying\u{2026}", format_duration_precise(*duration))
                         };
-                        (spinner, Color::Yellow, detail)
+                        (spinner, theme::WARNING, detail)
                     } else {
                         (
-                            "✓",
-                            Color::Green,
+                            "\u{2713}",
+                            theme::SUCCESS,
                             format!(
-                                "{:.1}s · {}",
-                                duration.as_secs_f64(),
+                                "{} \u{00b7} {}",
+                                format_duration_precise(*duration),
                                 artifacts.summary()
                             ),
                         )
                     }
                 }
-                StageStatus::Failed { .. } => ("✗", Color::Red, "failed".to_string()),
+                StageStatus::Failed { .. } => ("\u{2717}", theme::ERROR, "failed".to_string()),
             };
 
             let is_selected = self.selection == SelectionTarget::Stage(i);
+            let bg = if is_selected { theme::SURFACE_HIGHLIGHT } else { ratatui::style::Color::Reset };
             let name_style = if is_selected {
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD)
+                    .bg(bg)
             } else {
-                Style::default().add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme::TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(bg)
             };
-            let select_indicator = if is_selected { "▸" } else { " " };
+            let select_indicator = if is_selected { "\u{25b8}" } else { " " };
 
-            let detail_gutter = if in_group { "  │   " } else { "    " };
+            let detail_gutter = if in_group { "  \u{2502}   " } else { "    " };
+
+            // Model label for the detail line
+            let model_short = if !stage.model.is_empty() && stage.model != "commands" {
+                format!(" [{}]", theme::shorten_model(&stage.model))
+            } else {
+                String::new()
+            };
 
             lines.push(Line::from(vec![
-                Span::styled(gutter, Style::default().fg(Color::DarkGray)),
-                Span::styled(select_indicator, Style::default().fg(Color::Cyan)),
-                Span::styled(icon, Style::default().fg(icon_color)),
-                Span::raw(format!(" {}. ", i + 1)),
+                Span::styled(gutter, Style::default().fg(theme::TEXT_MUTED).bg(bg)),
+                Span::styled(select_indicator, Style::default().fg(theme::ACCENT).bg(bg)),
+                Span::styled(icon, Style::default().fg(icon_color).bg(bg)),
+                Span::styled(format!(" {:>num_width$}. ", i + 1), Style::default().fg(theme::TEXT_SECONDARY).bg(bg)),
                 Span::styled(&stage.name, name_style),
             ]));
             lines.push(Line::from(vec![
-                Span::styled(detail_gutter, Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("  {detail}"), Style::default().fg(Color::DarkGray)),
+                Span::styled(detail_gutter, Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(format!("  {detail}"), Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(model_short, Style::default().fg(theme::TOKEN_LABEL)),
             ]));
 
             // Emit verify step + group footer after the last stage in a group
@@ -761,53 +886,54 @@ impl ExecutionState {
                 if is_last_in_group {
                     // Render verify entry for this group
                     let v_selected = self.selection == SelectionTarget::Verify(gname.to_string());
-                    let v_select_indicator = if v_selected { "▸" } else { " " };
+                    let v_bg = if v_selected { theme::SURFACE_HIGHLIGHT } else { ratatui::style::Color::Reset };
+                    let v_select_indicator = if v_selected { "\u{25b8}" } else { " " };
 
                     let (v_icon, v_color, v_detail) = if let Some(vs) = self.verify_states.get(gname) {
                         match vs {
-                            VerifyStatus::Pending => ("·", Color::DarkGray, "pending".to_string()),
+                            VerifyStatus::Pending => ("\u{00b7}", theme::TEXT_MUTED, "pending".to_string()),
                             VerifyStatus::Running { activity_log } => {
                                 let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
                                 let detail = if let Some(act) = activity_log.last() {
                                     act.clone()
                                 } else {
-                                    "running…".to_string()
+                                    "running\u{2026}".to_string()
                                 };
-                                (spinner, Color::Yellow, detail)
+                                (spinner, theme::WARNING, detail)
                             }
-                            VerifyStatus::Passed => ("✓", Color::Green, "passed".to_string()),
+                            VerifyStatus::Passed => ("\u{2713}", theme::SUCCESS, "passed".to_string()),
                             VerifyStatus::Failed { response } => {
                                 let short = if response.len() > 60 {
-                                    format!("{}…", &response[..60])
+                                    format!("{}\u{2026}", &response[..60])
                                 } else {
                                     response.clone()
                                 };
-                                ("✗", Color::Red, format!("failed — {short}"))
+                                ("\u{2717}", theme::ERROR, format!("failed \u{2014} {short}"))
                             }
                         }
                     } else {
-                        ("·", Color::DarkGray, "pending".to_string())
+                        ("\u{00b7}", theme::TEXT_MUTED, "pending".to_string())
                     };
 
                     let v_name_style = if v_selected {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD).bg(v_bg)
                     } else {
-                        Style::default().fg(v_color).add_modifier(Modifier::BOLD)
+                        Style::default().fg(v_color).add_modifier(Modifier::BOLD).bg(v_bg)
                     };
 
                     lines.push(Line::from(vec![
-                        Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(v_select_indicator, Style::default().fg(Color::Cyan)),
-                        Span::styled(v_icon, Style::default().fg(v_color)),
+                        Span::styled("  \u{2502} ", Style::default().fg(theme::TEXT_MUTED).bg(v_bg)),
+                        Span::styled(v_select_indicator, Style::default().fg(theme::ACCENT).bg(v_bg)),
+                        Span::styled(v_icon, Style::default().fg(v_color).bg(v_bg)),
                         Span::styled(" Verify", v_name_style),
                     ]));
                     lines.push(Line::from(vec![
-                        Span::styled("  │     ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(format!("  {v_detail}"), Style::default().fg(Color::DarkGray)),
+                        Span::styled("  \u{2502}     ", Style::default().fg(theme::TEXT_MUTED)),
+                        Span::styled(format!("  {v_detail}"), Style::default().fg(theme::TEXT_MUTED)),
                     ]));
                     lines.push(Line::from(Span::styled(
-                        "  ╰─",
-                        Style::default().fg(Color::DarkGray),
+                        "  \u{2570}\u{2500}",
+                        Style::default().fg(theme::TEXT_MUTED),
                     )));
                 }
             }
@@ -833,8 +959,8 @@ impl ExecutionState {
     }
 
     fn render_verify_detail(&mut self, frame: &mut Frame, area: Rect, group_name: &str) {
-        let title = format!(" Verify: {group_name} ");
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let title = format!("Verify: {group_name}");
+        let block = theme::styled_block(&title, self.detail_focused);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -842,10 +968,10 @@ impl ExecutionState {
 
         let vs = self.verify_states.get(group_name);
         let (label, label_color) = match vs {
-            Some(VerifyStatus::Pending) | None => ("  Status: pending", Color::DarkGray),
-            Some(VerifyStatus::Running { .. }) => ("  Status: running…", Color::Yellow),
-            Some(VerifyStatus::Passed) => ("  Status: passed ✓", Color::Green),
-            Some(VerifyStatus::Failed { .. }) => ("  Status: failed ✗", Color::Red),
+            Some(VerifyStatus::Pending) | None => ("  Status: pending", theme::TEXT_MUTED),
+            Some(VerifyStatus::Running { .. }) => ("  Status: running\u{2026}", theme::WARNING),
+            Some(VerifyStatus::Passed) => ("  Status: passed \u{2713}", theme::SUCCESS),
+            Some(VerifyStatus::Failed { .. }) => ("  Status: failed \u{2717}", theme::ERROR),
         };
         lines.push(Line::from(Span::styled(
             label,
@@ -857,13 +983,13 @@ impl ExecutionState {
             if !activity_log.is_empty() {
                 lines.push(Line::from(Span::styled(
                     "  Activity:",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::TEXT_MUTED),
                 )));
                 for entry in activity_log {
                     let style = if entry.starts_with("$ ") {
-                        Style::default().fg(Color::Yellow)
+                        Style::default().fg(theme::WARNING)
                     } else {
-                        Style::default().fg(Color::Cyan)
+                        Style::default().fg(theme::ACCENT)
                     };
                     lines.push(Line::from(Span::styled(
                         format!("  {entry}"),
@@ -876,12 +1002,12 @@ impl ExecutionState {
         if let Some(VerifyStatus::Failed { response }) = vs {
             lines.push(Line::from(Span::styled(
                 "  Output:",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::TEXT_MUTED),
             )));
             for line in response.lines() {
                 lines.push(Line::from(Span::styled(
                     format!("  {line}"),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(theme::ERROR),
                 )));
             }
         }
@@ -907,30 +1033,43 @@ impl ExecutionState {
             .wrap(ratatui::widgets::Wrap { trim: false })
             .scroll((scroll, 0));
         frame.render_widget(paragraph, inner);
+
+        // Scrollbar
+        if total_lines > visible_height {
+            let mut scrollbar_state = ScrollbarState::new(total_lines)
+                .position(scroll as usize);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .style(Style::default().fg(theme::TEXT_MUTED)),
+                area,
+                &mut scrollbar_state,
+            );
+        }
     }
 
     fn render_stage_detail_for_stage(&mut self, frame: &mut Frame, area: Rect, detail_idx: usize) {
 
         let Some(stage) = self.stages.get(detail_idx) else {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(" Stage Detail ");
+            let block = theme::styled_block("Stage Detail", self.detail_focused);
             let inner = block.inner(area);
             frame.render_widget(block, area);
-            let waiting = Paragraph::new("  Waiting for pipeline to start...");
+            let waiting = Paragraph::new(Span::styled(
+                "  Waiting for pipeline to start...",
+                Style::default().fg(theme::TEXT_SECONDARY),
+            ));
             frame.render_widget(waiting, inner);
             return;
         };
 
         let title_suffix = if self.show_prompt { " [Prompt]" } else { "" };
         let title = format!(
-            " Stage {}/{}: {}{} ",
+            "Stage {}/{}: {}{}",
             stage.index + 1,
             self.total_stages,
             stage.name,
             title_suffix,
         );
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = theme::styled_block(&title, self.detail_focused);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -941,12 +1080,12 @@ impl ExecutionState {
             if let Some(ref summary) = stage.prior_summary {
                 lines.push(Line::from(Span::styled(
                     "  Prior Summary:",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD),
                 )));
                 for l in summary.lines() {
                     lines.push(Line::from(Span::styled(
                         format!("  {l}"),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme::TEXT_MUTED),
                     )));
                 }
                 lines.push(Line::from(""));
@@ -955,15 +1094,18 @@ impl ExecutionState {
             if let Some(ref prompt) = stage.rendered_prompt {
                 lines.push(Line::from(Span::styled(
                     "  Rendered Prompt:",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD),
                 )));
                 for l in prompt.lines() {
-                    lines.push(Line::from(format!("  {l}")));
+                    lines.push(Line::from(Span::styled(
+                        format!("  {l}"),
+                        Style::default().fg(theme::TEXT_PRIMARY),
+                    )));
                 }
             } else {
                 lines.push(Line::from(Span::styled(
                     "  No prompt available (command stage or not yet built)",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::TEXT_MUTED),
                 )));
             }
 
@@ -980,6 +1122,18 @@ impl ExecutionState {
 
             let paragraph = Paragraph::new(lines).scroll((scroll, 0));
             frame.render_widget(paragraph, inner);
+
+            // Scrollbar
+            if total_lines > visible_height {
+                let mut scrollbar_state = ScrollbarState::new(total_lines)
+                    .position(scroll as usize);
+                frame.render_stateful_widget(
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .style(Style::default().fg(theme::TEXT_MUTED)),
+                    area,
+                    &mut scrollbar_state,
+                );
+            }
             return;
         }
 
@@ -992,27 +1146,33 @@ impl ExecutionState {
             .split(inner);
 
         // Stage info header
-        let info_label = if stage.model == "commands" {
-            "  type: commands".to_string()
+        let model_display = if stage.model == "commands" {
+            "type: commands".to_string()
         } else {
-            format!("  model: {}", stage.model)
+            format!("model: {}", theme::shorten_model(&stage.model))
         };
-        let mut info_lines = vec![Line::from(info_label)];
+        let mut info_lines = vec![Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(model_display, Style::default().fg(theme::TOKEN_LABEL)),
+        ])];
 
         match &stage.status {
             StageStatus::Running { elapsed, .. } => {
-                info_lines.push(Line::from(format!(
-                    "  Elapsed: {}",
-                    format_duration(*elapsed)
-                )));
+                info_lines.push(Line::from(vec![
+                    Span::styled("  Elapsed: ", Style::default().fg(theme::TEXT_MUTED)),
+                    Span::styled(
+                        format_duration(*elapsed),
+                        Style::default().fg(theme::WARNING),
+                    ),
+                ]));
             }
             StageStatus::Completed { duration, .. } => {
                 info_lines.push(Line::from(vec![
-                    Span::styled("  Completed in ", Style::default().fg(Color::Green)),
+                    Span::styled("  Completed in ", Style::default().fg(theme::SUCCESS)),
                     Span::styled(
-                        format!("{:.1}s", duration.as_secs_f64()),
+                        format_duration_precise(*duration),
                         Style::default()
-                            .fg(Color::Green)
+                            .fg(theme::SUCCESS)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -1025,7 +1185,7 @@ impl ExecutionState {
         // Error detail
         if let StageStatus::Failed { error } = &stage.status {
             let error_paragraph = Paragraph::new(format!("  Error:\n  {error}"))
-                .style(Style::default().fg(Color::Red))
+                .style(Style::default().fg(theme::ERROR))
                 .wrap(ratatui::widgets::Wrap { trim: false });
             frame.render_widget(error_paragraph, detail_chunks[1]);
             return;
@@ -1046,13 +1206,13 @@ impl ExecutionState {
                 let label = if stage.model == "commands" { "  Output:" } else { "  Activity:" };
                 detail_lines.push(Line::from(Span::styled(
                     label,
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::TEXT_MUTED),
                 )));
                 for entry in log {
                     let style = if entry.starts_with("$ ") {
-                        Style::default().fg(Color::Yellow)
+                        Style::default().fg(theme::WARNING)
                     } else {
-                        Style::default().fg(Color::Cyan)
+                        Style::default().fg(theme::ACCENT)
                     };
                     detail_lines.push(Line::from(Span::styled(
                         format!("  {entry}"),
@@ -1073,33 +1233,43 @@ impl ExecutionState {
                 detail_lines.push(Line::from(""));
                 detail_lines.push(Line::from(Span::styled(
                     "  Files changed:",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::TEXT_MUTED),
                 )));
                 for change in &artifacts.changes {
                     let (prefix, color) = match change.kind {
-                        fujin_core::artifact::FileChangeKind::Created => ("+", Color::Green),
-                        fujin_core::artifact::FileChangeKind::Modified => ("~", Color::Yellow),
-                        fujin_core::artifact::FileChangeKind::Deleted => ("-", Color::Red),
+                        fujin_core::artifact::FileChangeKind::Created => ("+", theme::SUCCESS),
+                        fujin_core::artifact::FileChangeKind::Modified => ("~", theme::WARNING),
+                        fujin_core::artifact::FileChangeKind::Deleted => ("-", theme::ERROR),
                     };
                     let size_str = change.size.map(format_size).unwrap_or_default();
                     detail_lines.push(Line::from(vec![
                         Span::raw("  "),
                         Span::styled(prefix, Style::default().fg(color)),
-                        Span::raw(format!(" {}", change.path.display())),
+                        Span::styled(
+                            format!(" {}", change.path.display()),
+                            Style::default().fg(theme::TEXT_PRIMARY),
+                        ),
                         Span::styled(
                             format!("  {size_str}"),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme::TEXT_MUTED),
                         ),
                     ]));
                 }
             }
             if let Some(usage) = token_usage {
                 detail_lines.push(Line::from(""));
-                detail_lines.push(Line::from(format!(
-                    "  Tokens: {} in / {} out",
-                    format_number(usage.input_tokens),
-                    format_number(usage.output_tokens)
-                )));
+                detail_lines.push(Line::from(vec![
+                    Span::styled("  Tokens: ", Style::default().fg(theme::TEXT_MUTED)),
+                    Span::styled(
+                        format!("{} in", format_number(usage.input_tokens)),
+                        Style::default().fg(theme::TOKEN_LABEL),
+                    ),
+                    Span::styled(" / ", Style::default().fg(theme::TEXT_MUTED)),
+                    Span::styled(
+                        format!("{} out", format_number(usage.output_tokens)),
+                        Style::default().fg(theme::TOKEN_LABEL),
+                    ),
+                ]));
             }
         }
 
@@ -1107,13 +1277,9 @@ impl ExecutionState {
             let visible_height = detail_chunks[1].height as usize;
             let total_lines = detail_lines.len();
 
-            // Store content height so scroll_detail_down can clamp properly.
-            // This is an approximation (doesn't account for line wrapping),
-            // but is good enough for scroll bounds.
             self.detail_content_height = total_lines;
 
             let scroll = if self.detail_scroll_pinned {
-                // User has manually scrolled — respect their position
                 let max_scroll = total_lines.saturating_sub(visible_height) as u16;
                 self.detail_scroll.min(max_scroll)
             } else {
@@ -1131,68 +1297,105 @@ impl ExecutionState {
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .scroll((scroll, 0));
             frame.render_widget(paragraph, detail_chunks[1]);
+
+            // Scrollbar
+            if total_lines > visible_height {
+                let mut scrollbar_state = ScrollbarState::new(total_lines)
+                    .position(scroll as usize);
+                frame.render_stateful_widget(
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .style(Style::default().fg(theme::TEXT_MUTED)),
+                    area,
+                    &mut scrollbar_state,
+                );
+            }
         }
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        let sub = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(area);
+        let sep = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(theme::BORDER));
+        frame.render_widget(sep, sub[0]);
+
         let elapsed = self.final_elapsed.unwrap_or_else(|| self.start_time.elapsed());
+
+        // Show cancel confirmation warning
+        if self.confirm_cancel {
+            let footer = Line::from(vec![
+                Span::styled("  \u{26a0} ", Style::default().fg(theme::WARNING)),
+                Span::styled(
+                    "Press q/y again to cancel pipeline, any other key to dismiss",
+                    Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(footer), sub[1]);
+            return;
+        }
 
         let mut spans = vec![
             Span::raw("  "),
-            Span::styled("Tokens: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!(
-                "{} in / {} out",
-                format_number(self.total_input_tokens),
-                format_number(self.total_output_tokens)
-            )),
+            Span::styled("Tokens: ", Style::default().fg(theme::TEXT_MUTED)),
+            Span::styled(
+                format!(
+                    "{} in / {} out",
+                    format_number(self.total_input_tokens),
+                    format_number(self.total_output_tokens)
+                ),
+                Style::default().fg(theme::TOKEN_LABEL),
+            ),
         ];
 
         spans.push(Span::raw("    "));
 
         if self.detail_focused {
-            spans.push(Span::styled("[Esc]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Back  "));
-            spans.push(Span::styled("[j/k]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Stages  "));
-            spans.push(Span::styled("[PgUp/Dn]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Scroll  "));
+            spans.push(Span::styled("[Esc]", Style::default().fg(theme::ACCENT)));
+            spans.push(Span::styled(" Back  ", Style::default().fg(theme::TEXT_SECONDARY)));
+            spans.push(Span::styled("[j/k]", Style::default().fg(theme::ACCENT)));
+            spans.push(Span::styled(" Stages  ", Style::default().fg(theme::TEXT_SECONDARY)));
+            spans.push(Span::styled("[PgUp/Dn]", Style::default().fg(theme::ACCENT)));
+            spans.push(Span::styled(" Scroll  ", Style::default().fg(theme::TEXT_SECONDARY)));
             if self.detail_content_height > 0 {
                 let pos = self.detail_scroll as usize + 1;
                 let total = self.detail_content_height;
                 spans.push(Span::styled(
                     format!(" {pos}/{total}"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::TEXT_MUTED),
                 ));
             }
         } else if self.finished {
-            spans.push(Span::styled("[b]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Back  "));
-            spans.push(Span::styled("[j/k]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Stages  "));
-            spans.push(Span::styled("[f]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Focus  "));
-            spans.push(Span::styled("[p]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Prompt  "));
-            spans.push(Span::styled("[q]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Quit"));
+            spans.push(Span::styled("[b]", Style::default().fg(theme::ACCENT)));
+            spans.push(Span::styled(" Back  ", Style::default().fg(theme::TEXT_SECONDARY)));
+            spans.push(Span::styled("[j/k]", Style::default().fg(theme::ACCENT)));
+            spans.push(Span::styled(" Stages  ", Style::default().fg(theme::TEXT_SECONDARY)));
+            spans.push(Span::styled("[f]", Style::default().fg(theme::ACCENT)));
+            spans.push(Span::styled(" Focus  ", Style::default().fg(theme::TEXT_SECONDARY)));
+            spans.push(Span::styled("[p]", Style::default().fg(theme::ACCENT)));
+            spans.push(Span::styled(" Prompt  ", Style::default().fg(theme::TEXT_SECONDARY)));
+            spans.push(Span::styled("[q]", Style::default().fg(theme::ACCENT)));
+            spans.push(Span::styled(" Quit", Style::default().fg(theme::TEXT_SECONDARY)));
         } else {
-            spans.push(Span::styled("[j/k]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Stages  "));
-            spans.push(Span::styled("[f]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Focus  "));
-            spans.push(Span::styled("[p]", Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" Prompt  "));
-            spans.push(Span::styled("[Ctrl+C]", Style::default().fg(Color::Yellow)));
-            spans.push(Span::raw(" Stop"));
+            spans.push(Span::styled("[j/k]", Style::default().fg(theme::ACCENT)));
+            spans.push(Span::styled(" Stages  ", Style::default().fg(theme::TEXT_SECONDARY)));
+            spans.push(Span::styled("[f]", Style::default().fg(theme::ACCENT)));
+            spans.push(Span::styled(" Focus  ", Style::default().fg(theme::TEXT_SECONDARY)));
+            spans.push(Span::styled("[p]", Style::default().fg(theme::ACCENT)));
+            spans.push(Span::styled(" Prompt  ", Style::default().fg(theme::TEXT_SECONDARY)));
+            spans.push(Span::styled("[q]", Style::default().fg(theme::WARNING)));
+            spans.push(Span::styled(" Stop", Style::default().fg(theme::TEXT_SECONDARY)));
         }
 
         spans.push(Span::styled(
             format!("  Total: {}", format_duration(elapsed)),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::TEXT_MUTED),
         ));
 
         let footer = Line::from(spans);
-        frame.render_widget(Paragraph::new(footer), area);
+        frame.render_widget(Paragraph::new(footer), sub[1]);
     }
 }
 
@@ -1202,8 +1405,28 @@ fn format_duration(d: Duration) -> String {
     let secs = total_secs % 60;
     if mins > 0 {
         format!("{mins}m{secs:02}s")
+    } else if total_secs == 0 {
+        // Sub-second: show fractional
+        let ms = d.as_millis();
+        if ms > 0 {
+            format!("{:.1}s", d.as_secs_f64())
+        } else {
+            "0s".to_string()
+        }
     } else {
         format!("{secs}s")
+    }
+}
+
+/// Format duration always showing one decimal place (for completed stage times).
+fn format_duration_precise(d: Duration) -> String {
+    let total_secs = d.as_secs();
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    if mins > 0 {
+        format!("{mins}m{secs:02}s")
+    } else {
+        format!("{:.1}s", d.as_secs_f64())
     }
 }
 
@@ -1246,9 +1469,9 @@ mod tests {
             String::new(),
             3,
             vec![
-                ("s0".into(), "Stage 0".into(), None),
-                ("s1".into(), "Stage 1".into(), None),
-                ("s2".into(), "Stage 2".into(), None),
+                ("s0".into(), "Stage 0".into(), String::new(), None),
+                ("s1".into(), "Stage 1".into(), String::new(), None),
+                ("s2".into(), "Stage 2".into(), String::new(), None),
             ],
         )
     }
@@ -1275,12 +1498,30 @@ mod tests {
     }
 
     #[test]
-    fn test_q_cancels_while_running() {
+    fn test_q_shows_confirm_then_cancels() {
         let mut state = new_state();
+        // First q shows confirm
+        assert!(matches!(
+            state.handle_key(make_key(KeyCode::Char('q'))),
+            ExecutionAction::None
+        ));
+        assert!(state.confirm_cancel);
+        // Second q cancels
         assert!(matches!(
             state.handle_key(make_key(KeyCode::Char('q'))),
             ExecutionAction::CancelPipeline
         ));
+        assert!(!state.confirm_cancel);
+    }
+
+    #[test]
+    fn test_q_confirm_dismissed_by_other_key() {
+        let mut state = new_state();
+        state.handle_key(make_key(KeyCode::Char('q')));
+        assert!(state.confirm_cancel);
+        // Any other key dismisses
+        state.handle_key(make_key(KeyCode::Char('j')));
+        assert!(!state.confirm_cancel);
     }
 
     #[test]
@@ -1313,11 +1554,19 @@ mod tests {
     }
 
     #[test]
+    fn test_tab_toggles_detail_focus() {
+        let mut state = new_state();
+        assert!(!state.detail_focused);
+        state.handle_key(make_key(KeyCode::Tab));
+        assert!(state.detail_focused);
+        state.handle_key(make_key(KeyCode::Tab));
+        assert!(!state.detail_focused);
+    }
+
+    #[test]
     fn test_jk_navigation_when_finished() {
         let mut state = new_state();
         state.finished = true;
-        // Stages are already pre-populated by new_state() with 3 stages;
-        // mark them as completed for the navigation test.
         for stage in &mut state.stages {
             stage.status = StageStatus::Completed {
                 duration: Duration::from_secs(1),
@@ -1347,6 +1596,22 @@ mod tests {
         // Can't go before start
         state.handle_key(make_key(KeyCode::Char('k')));
         assert_eq!(state.selection, SelectionTarget::Stage(0));
+    }
+
+    #[test]
+    fn test_g_jumps_to_first() {
+        let mut state = new_state();
+        state.selection = SelectionTarget::Stage(2);
+        state.handle_key(make_key(KeyCode::Char('g')));
+        assert_eq!(state.selection, SelectionTarget::Stage(0));
+    }
+
+    #[test]
+    fn test_big_g_jumps_to_last() {
+        let mut state = new_state();
+        state.selection = SelectionTarget::Stage(0);
+        state.handle_key(make_key(KeyCode::Char('G')));
+        assert_eq!(state.selection, SelectionTarget::Stage(2));
     }
 
     // --- Pipeline event handling tests ---
@@ -1469,16 +1734,16 @@ mod tests {
 
         state.handle_pipeline_event(PipelineEvent::AgentActivity {
             stage_index: 0,
-            activity: "Tool: Read — src/main.rs".into(),
+            activity: "Tool: Read \u{2014} src/main.rs".into(),
         });
         state.handle_pipeline_event(PipelineEvent::AgentActivity {
             stage_index: 0,
-            activity: "Tool: Write — output.txt".into(),
+            activity: "Tool: Write \u{2014} output.txt".into(),
         });
 
         if let StageStatus::Running { activity_log, .. } = &state.stages[0].status {
             assert_eq!(activity_log.len(), 2);
-            assert_eq!(activity_log[0], "Tool: Read — src/main.rs");
+            assert_eq!(activity_log[0], "Tool: Read \u{2014} src/main.rs");
         } else {
             panic!("Expected Running status");
         }
@@ -1526,6 +1791,19 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(5)), "5s");
         assert_eq!(format_duration(Duration::from_secs(65)), "1m05s");
         assert_eq!(format_duration(Duration::from_secs(3661)), "61m01s");
+    }
+
+    #[test]
+    fn test_format_duration_subsecond() {
+        assert_eq!(format_duration(Duration::from_millis(300)), "0.3s");
+        assert_eq!(format_duration(Duration::from_millis(0)), "0s");
+    }
+
+    #[test]
+    fn test_format_duration_precise() {
+        assert_eq!(format_duration_precise(Duration::from_millis(300)), "0.3s");
+        assert_eq!(format_duration_precise(Duration::from_secs(5)), "5.0s");
+        assert_eq!(format_duration_precise(Duration::from_secs(65)), "1m05s");
     }
 
     #[test]

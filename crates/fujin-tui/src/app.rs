@@ -3,7 +3,7 @@ use crate::event::TerminalEventReader;
 use crate::screens::browser::{BrowserAction, BrowserState};
 use crate::screens::execution::{ExecutionAction, ExecutionState};
 use crate::screens::variables::{VariableInputAction, VariableInputState};
-use crate::widgets::help::render_help_overlay;
+use crate::widgets::help::{render_help_overlay, HelpMode};
 use anyhow::Result;
 use crossterm::event::{Event as CrosstermEvent, KeyEventKind};
 use fujin_core::event::PipelineEvent;
@@ -239,11 +239,11 @@ impl App {
         let workspace_root = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
-        // Create execution screen
-        let stage_names: Vec<(String, String, Option<String>)> = config
+        // Create execution screen — pass model from config so it's visible immediately
+        let stage_names: Vec<(String, String, String, Option<String>)> = config
             .stages
             .iter()
-            .map(|s| (s.id.clone(), s.name.clone(), s.retry_group.clone()))
+            .map(|s| (s.id.clone(), s.name.clone(), s.model.clone(), s.retry_group.clone()))
             .collect();
         let exec_state = ExecutionState::new(
             config.name.clone(),
@@ -281,8 +281,12 @@ impl App {
         }
 
         if self.show_help {
-            let is_execution = matches!(self.screen, Screen::Execution(_));
-            render_help_overlay(frame, area, is_execution);
+            let mode = match &self.screen {
+                Screen::Browser(_) => HelpMode::Browser,
+                Screen::VariableInput(_) => HelpMode::Variables,
+                Screen::Execution(_) => HelpMode::Execution,
+            };
+            render_help_overlay(frame, area, mode);
         }
     }
 }

@@ -1,11 +1,12 @@
 use crate::discovery::DiscoveredPipeline;
+use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use fujin_core::util::truncate_chars;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
@@ -15,6 +16,10 @@ pub struct BrowserState {
     pub pipelines: Vec<DiscoveredPipeline>,
     /// Selection state for the list widget.
     pub list_state: ListState,
+    /// Scroll offset for the details panel.
+    pub detail_scroll: u16,
+    /// Total content height of the details panel.
+    detail_content_height: usize,
 }
 
 /// Actions the browser can request from the app.
@@ -41,6 +46,8 @@ impl BrowserState {
         Self {
             pipelines,
             list_state,
+            detail_scroll: 0,
+            detail_content_height: 0,
         }
     }
 
@@ -64,10 +71,35 @@ impl BrowserState {
             KeyCode::Char('r') => BrowserAction::Refresh,
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(-1);
+                self.detail_scroll = 0;
                 BrowserAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_selection(1);
+                self.detail_scroll = 0;
+                BrowserAction::None
+            }
+            KeyCode::Char('G') => {
+                // Jump to last
+                if !self.pipelines.is_empty() {
+                    self.list_state.select(Some(self.pipelines.len() - 1));
+                    self.detail_scroll = 0;
+                }
+                BrowserAction::None
+            }
+            KeyCode::Char('g') => {
+                // Jump to first (gg emulation: single g goes to top)
+                self.list_state.select(Some(0));
+                self.detail_scroll = 0;
+                BrowserAction::None
+            }
+            KeyCode::PageUp => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(10);
+                BrowserAction::None
+            }
+            KeyCode::PageDown => {
+                let max = self.detail_content_height.saturating_sub(1) as u16;
+                self.detail_scroll = (self.detail_scroll + 10).min(max);
                 BrowserAction::None
             }
             KeyCode::Enter => {
@@ -103,9 +135,9 @@ impl BrowserState {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // header
+                Constraint::Length(2), // header
                 Constraint::Min(0),    // main content
-                Constraint::Length(1), // footer
+                Constraint::Length(2), // footer
             ])
             .split(area);
 
@@ -116,14 +148,25 @@ impl BrowserState {
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let header = Line::from(vec![
-            Span::styled("  fujin", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
             Span::styled(
-                "Pipeline Browser",
-                Style::default().fg(Color::DarkGray),
+                "  fujin",
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(" \u{2502} ", Style::default().fg(theme::BORDER)),
+            Span::styled("Pipeline Browser", Style::default().fg(theme::TEXT_SECONDARY)),
         ]);
-        frame.render_widget(Paragraph::new(header), area);
+        // Use 2-line area: line 1 = content, line 2 = separator
+        let sub = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(area);
+        frame.render_widget(Paragraph::new(header), sub[0]);
+        let sep = Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(theme::BORDER));
+        frame.render_widget(sep, sub[1]);
     }
 
     fn render_body(&mut self, frame: &mut Frame, area: Rect) {
@@ -137,25 +180,67 @@ impl BrowserState {
     }
 
     fn render_pipeline_list(&mut self, frame: &mut Frame, area: Rect) {
+        let selected_idx = self.list_state.selected();
         let items: Vec<ListItem> = self
             .pipelines
             .iter()
-            .map(|p| {
+            .enumerate()
+            .map(|(i, p)| {
                 let stage_count = p.config.stages.len();
-                let label = format!("  {}  {}s", p.config.name, stage_count);
-                ListItem::new(Line::from(label))
+                let stage_label = if stage_count == 1 { "stage" } else { "stages" };
+
+                // Collect unique models across stages
+                let models: Vec<String> = {
+                    let mut seen = std::collections::HashSet::new();
+                    p.config
+                        .stages
+                        .iter()
+                        .filter(|s| !s.model.is_empty() && s.model != "commands")
+                        .filter(|s| seen.insert(s.model.clone()))
+                        .map(|s| theme::shorten_model(&s.model))
+                        .collect()
+                };
+                let model_summary = if models.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", models.join(", "))
+                };
+
+                let is_selected = selected_idx == Some(i);
+                let bg = if is_selected {
+                    theme::SURFACE_HIGHLIGHT
+                } else {
+                    ratatui::style::Color::Reset
+                };
+
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {} ", p.config.name),
+                            Style::default()
+                                .add_modifier(Modifier::BOLD)
+                                .bg(bg),
+                        ),
+                        Span::styled(
+                            format!("{stage_count} {stage_label}"),
+                            Style::default().fg(theme::TEXT_MUTED).bg(bg),
+                        ),
+                    ]),
+                    Line::from(Span::styled(
+                        format!("  {model_summary}"),
+                        Style::default().fg(theme::TOKEN_LABEL).bg(bg),
+                    )),
+                ])
             })
             .collect();
 
+        let block = theme::styled_block("Pipelines", false);
+
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Pipelines "),
-            )
+            .block(block)
             .highlight_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("> ");
@@ -163,96 +248,172 @@ impl BrowserState {
         frame.render_stateful_widget(list, area, &mut self.list_state);
     }
 
-    fn render_details(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Details ");
+    fn render_details(&mut self, frame: &mut Frame, area: Rect) {
+        let block = theme::styled_block("Details", false);
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let Some(pipeline) = self.selected() else {
+        let selected_idx = self.list_state.selected();
+        let Some(pipeline) = selected_idx.and_then(|i| self.pipelines.get(i)) else {
             let configs_dir = fujin_core::paths::configs_dir();
-            let empty = Paragraph::new(format!(
-                "  No pipelines found.\n\n  Place .yaml configs in:\n    {}\n\n  Or run `fujin setup` to initialize.",
-                configs_dir.display()
-            ));
+            let empty = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "No pipelines found.",
+                    Style::default().fg(theme::TEXT_SECONDARY),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Place .yaml configs in:",
+                    Style::default().fg(theme::TEXT_MUTED),
+                )),
+                Line::from(Span::styled(
+                    format!("  {}", configs_dir.display()),
+                    Style::default().fg(theme::TEXT_PRIMARY),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Or run `fujin setup` to initialize.",
+                    Style::default().fg(theme::TEXT_MUTED),
+                )),
+            ]);
             frame.render_widget(empty, inner);
             return;
         };
 
+        // Build all lines using owned strings so the pipeline borrow is released
         let config = &pipeline.config;
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled("  Name: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    &config.name,
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  Source: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("{}", pipeline.source.display())),
-            ]),
-            Line::from(vec![
-                Span::styled("  Stages: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("{}", config.stages.len())),
-            ]),
-            Line::from(""),
-        ];
+        let lines = {
+            let mut lines: Vec<Line<'static>> = vec![
+                Line::from(vec![
+                    Span::styled("Name: ", Style::default().fg(theme::TEXT_MUTED)),
+                    Span::styled(
+                        config.name.clone(),
+                        Style::default()
+                            .fg(theme::TEXT_PRIMARY)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Source: ", Style::default().fg(theme::TEXT_MUTED)),
+                    Span::styled(
+                        format!("{}", pipeline.source.display()),
+                        Style::default().fg(theme::TEXT_SECONDARY),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Stages: ", Style::default().fg(theme::TEXT_MUTED)),
+                    Span::styled(
+                        format!("{}", config.stages.len()),
+                        Style::default().fg(theme::TEXT_PRIMARY),
+                    ),
+                ]),
+                Line::from(""),
+            ];
 
-        // Stage details
-        for (i, stage) in config.stages.iter().enumerate() {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {}. ", i + 1),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(&stage.name, Style::default().add_modifier(Modifier::BOLD)),
-            ]));
-            lines.push(Line::from(format!(
-                "     model: {}",
-                stage.model
-            )));
-            if !stage.allowed_tools.is_empty() {
-                lines.push(Line::from(format!(
-                    "     tools: {}",
-                    stage.allowed_tools.join(", ")
-                )));
+            // Stage details
+            let width = config.stages.len().to_string().len();
+            for (i, stage) in config.stages.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:>width$}. ", i + 1),
+                        Style::default().fg(theme::ACCENT),
+                    ),
+                    Span::styled(
+                        stage.name.clone(),
+                        Style::default()
+                            .fg(theme::TEXT_PRIMARY)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:width$}  model: ", ""),
+                        Style::default().fg(theme::TEXT_MUTED),
+                    ),
+                    Span::styled(
+                        theme::shorten_model(&stage.model),
+                        Style::default().fg(theme::TOKEN_LABEL),
+                    ),
+                ]));
+                if !stage.allowed_tools.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("{:width$}  tools: {}", "", stage.allowed_tools.join(", ")),
+                        Style::default().fg(theme::TEXT_MUTED),
+                    )));
+                }
+                lines.push(Line::from(""));
             }
-            lines.push(Line::from(""));
-        }
 
-        // Variables
-        if !config.variables.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  Variables:",
-                Style::default().fg(Color::DarkGray),
-            )));
-            for (key, value) in &config.variables {
-                let display_val = truncate_chars(value, 40);
-                lines.push(Line::from(format!(
-                    "    {key} = \"{display_val}\""
+            // Variables
+            if !config.variables.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "Variables:".to_string(),
+                    Style::default().fg(theme::TEXT_MUTED),
                 )));
+                for (key, value) in &config.variables {
+                    let display_val = truncate_chars(value, 40);
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("  {key}"),
+                            Style::default().fg(theme::TEXT_SECONDARY),
+                        ),
+                        Span::styled(" = ".to_string(), Style::default().fg(theme::TEXT_MUTED)),
+                        Span::styled(
+                            format!("\"{display_val}\""),
+                            Style::default().fg(theme::TEXT_PRIMARY),
+                        ),
+                    ]));
+                }
             }
-        }
+            lines
+        };
+        // Pipeline borrow is now dropped
 
-        let paragraph = Paragraph::new(lines);
+        let total_lines = lines.len();
+        self.detail_content_height = total_lines;
+        let visible_height = inner.height as usize;
+        let max_scroll = total_lines.saturating_sub(visible_height) as u16;
+        let scroll = self.detail_scroll.min(max_scroll);
+
+        let paragraph = Paragraph::new(lines).scroll((scroll, 0));
         frame.render_widget(paragraph, inner);
+
+        // Scrollbar if content overflows
+        if total_lines > visible_height {
+            let mut scrollbar_state = ScrollbarState::new(total_lines)
+                .position(scroll as usize);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .style(Style::default().fg(theme::TEXT_MUTED)),
+                area,
+                &mut scrollbar_state,
+            );
+        }
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        let sub = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(area);
+        let sep = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(theme::BORDER));
+        frame.render_widget(sep, sub[0]);
+
         let footer = Line::from(vec![
-            Span::styled("  [Enter]", Style::default().fg(Color::Cyan)),
-            Span::raw(" Run  "),
-            Span::styled("[r]", Style::default().fg(Color::Cyan)),
-            Span::raw(" Refresh  "),
-            Span::styled("[q]", Style::default().fg(Color::Cyan)),
-            Span::raw(" Quit  "),
-            Span::styled("[?]", Style::default().fg(Color::Cyan)),
-            Span::raw(" Help"),
+            Span::styled("  [Enter]", Style::default().fg(theme::ACCENT)),
+            Span::styled(" Run  ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled("[r]", Style::default().fg(theme::ACCENT)),
+            Span::styled(" Refresh  ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled("[q]", Style::default().fg(theme::ACCENT)),
+            Span::styled(" Quit  ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled("[?]", Style::default().fg(theme::ACCENT)),
+            Span::styled(" Help", Style::default().fg(theme::TEXT_SECONDARY)),
         ]);
-        frame.render_widget(Paragraph::new(footer), area);
+        frame.render_widget(Paragraph::new(footer), sub[1]);
     }
 }
 
@@ -383,5 +544,25 @@ mod tests {
             .collect();
         state.set_pipelines(smaller);
         assert_eq!(state.list_state.selected(), Some(1)); // clamped to last
+    }
+
+    #[test]
+    fn test_g_jumps_to_top() {
+        let mut state = browser_with_items(5);
+        state.handle_key(make_key(KeyCode::Down));
+        state.handle_key(make_key(KeyCode::Down));
+        assert_eq!(state.list_state.selected(), Some(2));
+
+        state.handle_key(make_key(KeyCode::Char('g')));
+        assert_eq!(state.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn test_big_g_jumps_to_bottom() {
+        let mut state = browser_with_items(5);
+        assert_eq!(state.list_state.selected(), Some(0));
+
+        state.handle_key(make_key(KeyCode::Char('G')));
+        assert_eq!(state.list_state.selected(), Some(4));
     }
 }

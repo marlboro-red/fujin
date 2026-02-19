@@ -2,6 +2,7 @@ mod app;
 pub mod discovery;
 mod event;
 pub mod screens;
+pub mod theme;
 pub mod widgets;
 
 use anyhow::Result;

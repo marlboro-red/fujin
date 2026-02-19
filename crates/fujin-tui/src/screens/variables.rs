@@ -1,8 +1,9 @@
 use crate::discovery::DiscoveredPipeline;
+use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -170,9 +171,9 @@ impl VariableInputState {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // header
+                Constraint::Length(2), // header
                 Constraint::Min(0),    // main content
-                Constraint::Length(1), // footer
+                Constraint::Length(2), // footer
             ])
             .split(area);
 
@@ -186,30 +187,44 @@ impl VariableInputState {
             Span::styled(
                 "  fujin",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
-            Span::styled("Configure Variables", Style::default().fg(Color::DarkGray)),
+            Span::styled(" \u{2502} ", Style::default().fg(theme::BORDER)),
+            Span::styled(
+                "Configure Variables",
+                Style::default().fg(theme::TEXT_SECONDARY),
+            ),
             Span::raw("  "),
             Span::styled(
                 &self.pipeline.config.name,
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]);
-        frame.render_widget(Paragraph::new(header), area);
+        let sub = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(area);
+        frame.render_widget(Paragraph::new(header), sub[0]);
+        let sep = Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(theme::BORDER));
+        frame.render_widget(sep, sub[1]);
     }
 
     fn render_body(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Variables ");
+        let block = theme::styled_block("Variables", false);
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
         if self.keys.is_empty() {
-            let msg = Paragraph::new("  No variables defined in this pipeline.");
+            let msg = Paragraph::new(Span::styled(
+                "No variables defined in this pipeline.",
+                Style::default().fg(theme::TEXT_SECONDARY),
+            ));
             frame.render_widget(msg, inner);
             return;
         }
@@ -221,17 +236,22 @@ impl VariableInputState {
             let is_selected = i == self.selected;
 
             let indicator = if is_selected { "> " } else { "  " };
+            let bg = if is_selected {
+                theme::SURFACE_HIGHLIGHT
+            } else {
+                ratatui::style::Color::Reset
+            };
             let key_style = if is_selected {
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD)
+                    .bg(bg)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme::TEXT_SECONDARY).bg(bg)
             };
 
             lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(indicator, Style::default().fg(Color::Cyan)),
+                Span::styled(indicator, Style::default().fg(theme::ACCENT).bg(bg)),
                 Span::styled(key, key_style),
             ]));
 
@@ -240,24 +260,24 @@ impl VariableInputState {
                 // Show value with cursor
                 let (before, after) = value.split_at(self.cursor.min(value.len()));
                 lines.push(Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled(before, Style::default().fg(Color::White)),
+                    Span::raw("    "),
+                    Span::styled(before, Style::default().fg(theme::TEXT_PRIMARY)),
                     Span::styled(
-                        "│",
+                        "\u{2502}",
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(theme::WARNING)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(after, Style::default().fg(Color::White)),
+                    Span::styled(after, Style::default().fg(theme::TEXT_PRIMARY)),
                 ]));
             } else {
                 let val_style = if is_selected {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(theme::TEXT_PRIMARY)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(theme::TEXT_MUTED)
                 };
                 lines.push(Line::from(vec![
-                    Span::raw("      "),
+                    Span::raw("    "),
                     Span::styled(value, val_style),
                 ]));
             }
@@ -270,28 +290,37 @@ impl VariableInputState {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        let sub = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(area);
+        let sep = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(theme::BORDER));
+        frame.render_widget(sep, sub[0]);
+
         let footer = if self.editing {
             Line::from(vec![
-                Span::styled("  [Enter]", Style::default().fg(Color::Cyan)),
-                Span::raw(" Done editing  "),
-                Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
-                Span::raw(" Cancel edit"),
+                Span::styled("  [Enter]", Style::default().fg(theme::ACCENT)),
+                Span::styled(" Done editing  ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled("[Esc]", Style::default().fg(theme::ACCENT)),
+                Span::styled(" Cancel edit", Style::default().fg(theme::TEXT_SECONDARY)),
             ])
         } else {
             Line::from(vec![
-                Span::styled("  [r]", Style::default().fg(Color::Cyan)),
-                Span::raw(" Run  "),
-                Span::styled("[Enter/e]", Style::default().fg(Color::Cyan)),
-                Span::raw(" Edit  "),
-                Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
-                Span::raw(" Navigate  "),
-                Span::styled("[q]", Style::default().fg(Color::Cyan)),
-                Span::raw(" Back  "),
-                Span::styled("[?]", Style::default().fg(Color::Cyan)),
-                Span::raw(" Help"),
+                Span::styled("  [r]", Style::default().fg(theme::ACCENT)),
+                Span::styled(" Run  ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled("[Enter/e]", Style::default().fg(theme::ACCENT)),
+                Span::styled(" Edit  ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled("[j/k]", Style::default().fg(theme::ACCENT)),
+                Span::styled(" Navigate  ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled("[q]", Style::default().fg(theme::ACCENT)),
+                Span::styled(" Back  ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled("[?]", Style::default().fg(theme::ACCENT)),
+                Span::styled(" Help", Style::default().fg(theme::TEXT_SECONDARY)),
             ])
         };
-        frame.render_widget(Paragraph::new(footer), area);
+        frame.render_widget(Paragraph::new(footer), sub[1]);
     }
 }
 
