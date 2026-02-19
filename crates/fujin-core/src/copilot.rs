@@ -50,20 +50,19 @@ impl CopilotCliRuntime {
             prompt.push_str("\n</system>\n\n");
         }
 
-        // Add verify feedback if present
-        if let Some(ref feedback) = context.verify_feedback {
-            if !feedback.is_empty() {
-                prompt.push_str("Previous verification feedback (address these issues):\n");
-                prompt.push_str(feedback);
-                prompt.push_str("\n\n---\n\n");
-            }
-        }
-
-        // Add prior context
+        // Add prior context then verify feedback (same order as ClaudeCodeRuntime)
         if let Some(ref prior) = context.prior_summary {
             if !prior.is_empty() && !context.rendered_prompt.contains(prior) {
                 prompt.push_str("Context from previous stage:\n");
                 prompt.push_str(prior);
+                prompt.push_str("\n\n---\n\n");
+            }
+        }
+
+        if let Some(ref feedback) = context.verify_feedback {
+            if !feedback.is_empty() {
+                prompt.push_str("Previous verification feedback (address these issues):\n");
+                prompt.push_str(feedback);
                 prompt.push_str("\n\n---\n\n");
             }
         }
@@ -164,6 +163,11 @@ impl AgentRuntime for CopilotCliRuntime {
 
         cmd.arg("--model").arg(&config.model);
 
+        // Skip interactive permission prompts (equivalent to Claude's
+        // --dangerously-skip-permissions). Without this, Copilot CLI may
+        // prompt for tool confirmation and hang on piped stdin.
+        cmd.arg("--yolo");
+
         // Add tool permissions
         let tools_flags = Self::build_tools_flags(&config.allowed_tools);
         for flag in &tools_flags {
@@ -196,7 +200,34 @@ impl AgentRuntime for CopilotCliRuntime {
             let _ = tx.send("Agent working...".to_string());
         }
 
-        // Wait for completion, with cancellation support
+        // Drain stdout/stderr via spawned tasks BEFORE waiting, to avoid pipe
+        // buffer deadlock. If the child produces more output than the OS pipe
+        // buffer (~64KB), it blocks writing. Calling wait() before draining
+        // the pipes would deadlock.
+        let stdout_handle = {
+            let mut out = child.stdout.take();
+            tokio::spawn(async move {
+                let mut buf = String::new();
+                if let Some(ref mut stream) = out {
+                    use tokio::io::AsyncReadExt;
+                    let _ = stream.read_to_string(&mut buf).await;
+                }
+                buf
+            })
+        };
+        let stderr_handle = {
+            let mut err = child.stderr.take();
+            tokio::spawn(async move {
+                let mut buf = String::new();
+                if let Some(ref mut stream) = err {
+                    use tokio::io::AsyncReadExt;
+                    let _ = stream.read_to_string(&mut buf).await;
+                }
+                buf
+            })
+        };
+
+        // Wait for process exit, with cancellation support
         let wait_result = if let Some(ref flag) = cancel_flag {
             tokio::select! {
                 result = child.wait() => Some(result),
@@ -217,17 +248,8 @@ impl AgentRuntime for CopilotCliRuntime {
                 message: format!("Failed to wait for copilot process: {e}"),
             })?;
 
-        // Read stdout and stderr after process exits
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        if let Some(mut out) = child.stdout.take() {
-            use tokio::io::AsyncReadExt;
-            let _ = out.read_to_string(&mut stdout).await;
-        }
-        if let Some(mut err) = child.stderr.take() {
-            use tokio::io::AsyncReadExt;
-            let _ = err.read_to_string(&mut stderr).await;
-        }
+        let stdout = stdout_handle.await.unwrap_or_default();
+        let stderr = stderr_handle.await.unwrap_or_default();
 
         if !status.success() {
             warn!(

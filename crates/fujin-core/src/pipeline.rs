@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 use fujin_config::{PipelineConfig, StageConfig};
 
 /// Options for running a pipeline.
@@ -63,16 +63,32 @@ impl PipelineRunner {
         let workspace = Workspace::new(workspace_root.clone());
         let checkpoint_manager = CheckpointManager::new(&workspace_root);
         let default_runtime_name = config.runtime.clone();
-        let runtime = create_runtime(&default_runtime_name)
-            .unwrap_or_else(|_| create_runtime("claude-code").unwrap());
+        let runtime = create_runtime(&default_runtime_name).unwrap_or_else(|e| {
+            warn!(
+                runtime = %default_runtime_name,
+                error = %e,
+                "Unknown pipeline runtime, falling back to claude-code"
+            );
+            create_runtime("claude-code").unwrap()
+        });
 
         // Pre-build any extra runtimes needed for per-stage overrides
         let mut extra_runtimes: HashMap<String, Box<dyn AgentRuntime>> = HashMap::new();
         for stage in &config.stages {
             if let Some(ref rt_name) = stage.runtime {
                 if rt_name != &default_runtime_name && !extra_runtimes.contains_key(rt_name) {
-                    if let Ok(rt) = create_runtime(rt_name) {
-                        extra_runtimes.insert(rt_name.clone(), rt);
+                    match create_runtime(rt_name) {
+                        Ok(rt) => {
+                            extra_runtimes.insert(rt_name.clone(), rt);
+                        }
+                        Err(e) => {
+                            warn!(
+                                stage_id = %stage.id,
+                                runtime = %rt_name,
+                                error = %e,
+                                "Unknown stage runtime override, will use pipeline default"
+                            );
+                        }
                     }
                 }
             }

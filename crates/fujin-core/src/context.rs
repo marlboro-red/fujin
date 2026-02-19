@@ -140,7 +140,6 @@ impl ContextBuilder {
                     .arg("-p").arg("-")
                     .arg("-s")
                     .arg("--model").arg(&config.model)
-                    .arg("--allow-all-tools")
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
