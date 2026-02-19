@@ -21,6 +21,10 @@ pub struct StageContext {
 
     /// Files changed in prior stages.
     pub changed_files: Vec<PathBuf>,
+
+    /// Feedback from a failed verification agent (retry groups only).
+    /// Present when the stage is being re-executed after a verify FAIL.
+    pub verify_feedback: Option<String>,
 }
 
 /// Builds context for each stage, including template rendering and summarization.
@@ -47,6 +51,7 @@ impl ContextBuilder {
         stage_config: &StageConfig,
         prior_result: Option<&StageResult>,
         workspace: &Workspace,
+        verify_feedback: Option<&str>,
     ) -> CoreResult<StageContext> {
         // Build template variables
         let mut vars: HashMap<String, String> = config.variables.clone();
@@ -84,6 +89,13 @@ impl ContextBuilder {
         let all_artifacts = self.build_all_artifacts_var(&changed_files, workspace)?;
         vars.insert("all_artifacts".to_string(), all_artifacts);
 
+        // Add verify feedback if present
+        let verify_feedback_owned = verify_feedback.map(|s| s.to_string());
+        vars.insert(
+            "verify_feedback".to_string(),
+            verify_feedback_owned.clone().unwrap_or_default(),
+        );
+
         // Render the user prompt template
         let rendered_prompt = render_template(&stage_config.user_prompt, &vars)?;
 
@@ -91,6 +103,7 @@ impl ContextBuilder {
             rendered_prompt,
             prior_summary,
             changed_files,
+            verify_feedback: verify_feedback_owned,
         })
     }
 

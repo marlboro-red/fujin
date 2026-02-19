@@ -1,5 +1,6 @@
 use crate::error::{CoreError, CoreResult};
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 const APP_NAME: &str = "fujin";
 
@@ -11,7 +12,7 @@ const APP_NAME: &str = "fujin";
 ///
 /// Falls back to `~/.fujin/` if the platform directory cannot be determined.
 pub fn data_dir() -> PathBuf {
-    dirs::data_dir()
+    dirs::data_local_dir()
         .unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -28,6 +29,20 @@ pub fn templates_dir() -> PathBuf {
 /// Returns the configs directory: `<data_dir>/configs/`
 pub fn configs_dir() -> PathBuf {
     data_dir().join("configs")
+}
+
+/// Returns the checkpoints directory for a specific workspace.
+///
+/// Checkpoints are stored under `<data_dir>/checkpoints/<hash>/` where
+/// `<hash>` is the hex-encoded SHA-256 of the workspace path. This keeps
+/// checkpoint data out of the repository.
+pub fn checkpoints_dir(workspace_root: &Path) -> PathBuf {
+    let canonical = workspace_root
+        .to_string_lossy()
+        .to_lowercase()
+        .replace('\\', "/");
+    let hash = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+    data_dir().join("checkpoints").join(hash)
 }
 
 /// Creates the data directory structure if it doesn't exist.

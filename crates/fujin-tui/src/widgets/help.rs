@@ -40,6 +40,7 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, is_execution: bool) {
             help_line("PgDn", "Scroll log down"),
             help_line("Home", "Scroll to top"),
             help_line("End", "Resume auto-scroll"),
+            help_line("p", "Toggle prompt/context view"),
             help_line("b", "Back to browser (after completion)"),
             help_line("q / Esc", "Quit / Stop"),
             help_line("?", "Toggle this help"),

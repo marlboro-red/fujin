@@ -29,18 +29,25 @@ pub struct Checkpoint {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Manages checkpoint persistence in the `.fujin/checkpoints/` directory.
+/// Manages checkpoint persistence in `<data_dir>/checkpoints/<hash>/`.
 pub struct CheckpointManager {
     checkpoint_dir: PathBuf,
 }
 
 impl CheckpointManager {
-    /// Create a new checkpoint manager. The checkpoint directory is
-    /// `<workspace>/.fujin/checkpoints/`.
+    /// Create a new checkpoint manager. Checkpoints are stored in the
+    /// platform-specific data directory under a hash of the workspace path
+    /// so they stay out of the repository.
     pub fn new(workspace_root: &Path) -> Self {
         Self {
-            checkpoint_dir: workspace_root.join(".fujin").join("checkpoints"),
+            checkpoint_dir: crate::paths::checkpoints_dir(workspace_root),
         }
+    }
+
+    /// Create a checkpoint manager with an explicit directory (for tests).
+    #[cfg(test)]
+    pub fn with_dir(checkpoint_dir: PathBuf) -> Self {
+        Self { checkpoint_dir }
     }
 
     /// Ensure the checkpoint directory exists.
@@ -250,7 +257,7 @@ mod tests {
     #[test]
     fn test_save_and_load_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = CheckpointManager::new(dir.path());
+        let manager = CheckpointManager::with_dir(dir.path().to_path_buf());
 
         let cp = CheckpointManager::create_new("test config");
         manager.save(&cp).unwrap();
@@ -263,7 +270,7 @@ mod tests {
     #[test]
     fn test_list_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = CheckpointManager::new(dir.path());
+        let manager = CheckpointManager::with_dir(dir.path().to_path_buf());
 
         let cp1 = CheckpointManager::create_new("config1");
         manager.save(&cp1).unwrap();
@@ -278,7 +285,7 @@ mod tests {
     #[test]
     fn test_clean_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = CheckpointManager::new(dir.path());
+        let manager = CheckpointManager::with_dir(dir.path().to_path_buf());
 
         let cp = CheckpointManager::create_new("config");
         manager.save(&cp).unwrap();

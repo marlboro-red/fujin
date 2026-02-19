@@ -76,12 +76,6 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
                     .push(format!("{prefix}: user_prompt must not be empty"));
             }
 
-            if stage.max_turns == 0 {
-                result
-                    .errors
-                    .push(format!("{prefix}: max_turns must be greater than 0"));
-            }
-
             // Validate allowed tools
             let valid_tools = ["read", "write", "bash", "edit", "glob", "grep", "notebook"];
             for tool in &stage.allowed_tools {
@@ -118,6 +112,88 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
             result.warnings.push(
                 "First stage references {{prior_summary}} which will be empty".to_string(),
             );
+        }
+    }
+
+    // Validate retry groups
+    // 1. All retry_group references must exist in retry_groups map
+    for (i, stage) in config.stages.iter().enumerate() {
+        if let Some(ref group) = stage.retry_group {
+            if !config.retry_groups.contains_key(group) {
+                result.errors.push(format!(
+                    "Stage {} ('{}'): retry_group '{}' is not defined in retry_groups",
+                    i, stage.id, group
+                ));
+            }
+        }
+    }
+
+    // 2. Stages in the same retry group must be consecutive
+    // 3. Each retry group must have at least 2 stages
+    let mut group_ranges: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, stage) in config.stages.iter().enumerate() {
+        if let Some(ref group) = stage.retry_group {
+            group_ranges.entry(group.as_str()).or_default().push(i);
+        }
+    }
+
+    for (group_name, indices) in &group_ranges {
+        if indices.len() < 2 {
+            // A single-stage group is valid when the group has a verify agent
+            let has_verify = config
+                .retry_groups
+                .get(*group_name)
+                .is_some_and(|g| g.verify.is_some());
+            if !has_verify {
+                result.errors.push(format!(
+                    "Retry group '{}' must contain at least 2 stages (or use a verify agent)",
+                    group_name
+                ));
+            }
+        }
+        // Check consecutiveness
+        for window in indices.windows(2) {
+            if window[1] != window[0] + 1 {
+                result.errors.push(format!(
+                    "Retry group '{}': stages must be consecutive (gap between index {} and {})",
+                    group_name, window[0], window[1]
+                ));
+            }
+        }
+    }
+
+    // Warn about retry groups defined but not used by any stage
+    for group_name in config.retry_groups.keys() {
+        if !group_ranges.contains_key(group_name.as_str()) {
+            result.warnings.push(format!(
+                "Retry group '{}' is defined but not referenced by any stage",
+                group_name
+            ));
+        }
+    }
+
+    // Validate retry group verify configs
+    for (group_name, group_config) in &config.retry_groups {
+        if let Some(ref verify) = group_config.verify {
+            if verify.system_prompt.trim().is_empty() {
+                result.errors.push(format!(
+                    "Retry group '{}': verify.system_prompt must not be empty",
+                    group_name
+                ));
+            }
+            if verify.user_prompt.trim().is_empty() {
+                result.errors.push(format!(
+                    "Retry group '{}': verify.user_prompt must not be empty",
+                    group_name
+                ));
+            }
+            if verify.timeout_secs == Some(0) {
+                result.errors.push(format!(
+                    "Retry group '{}': verify.timeout_secs must be greater than 0",
+                    group_name
+                ));
+            }
         }
     }
 

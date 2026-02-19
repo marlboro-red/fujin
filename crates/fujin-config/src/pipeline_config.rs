@@ -19,6 +19,10 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub summarizer: SummarizerConfig,
 
+    /// Retry group definitions. Stages referencing a group loop as a unit on failure.
+    #[serde(default)]
+    pub retry_groups: HashMap<String, RetryGroupConfig>,
+
     /// Ordered list of pipeline stages.
     pub stages: Vec<StageConfig>,
 }
@@ -42,6 +46,62 @@ impl Default for SummarizerConfig {
             max_tokens: default_summarizer_max_tokens(),
         }
     }
+}
+
+/// Configuration for a retry group.
+///
+/// Stages sharing a retry group are re-executed as a unit when any stage
+/// in the group fails. After `max_retries` consecutive failures the runner
+/// prompts the user to continue (granting another `max_retries` attempts).
+///
+/// An optional `verify` agent can be configured. After the last stage in the
+/// group succeeds, the verify agent runs and must output `PASS` or `FAIL` as
+/// its verdict. If the verdict is `FAIL`, the group loops back to its first
+/// stage (counting toward `max_retries`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryGroupConfig {
+    /// Maximum retries before prompting the user to continue.
+    #[serde(default = "default_retry_max_retries")]
+    pub max_retries: u32,
+
+    /// Optional verification agent that judges whether the group's work is correct.
+    #[serde(default)]
+    pub verify: Option<VerifyConfig>,
+}
+
+impl Default for RetryGroupConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_retry_max_retries(),
+            verify: None,
+        }
+    }
+}
+
+/// Configuration for a verification agent attached to a retry group.
+///
+/// The verify agent runs after the last stage in the group succeeds. It
+/// receives the configured prompts and must include either `PASS` or `FAIL`
+/// in its response to indicate whether the group's work is acceptable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyConfig {
+    /// Model to use for verification (defaults to a fast model).
+    #[serde(default = "default_verify_model")]
+    pub model: String,
+
+    /// System prompt for the verification agent.
+    pub system_prompt: String,
+
+    /// User prompt template (supports {{variables}}).
+    pub user_prompt: String,
+
+    /// Which tools the verification agent can use.
+    #[serde(default = "default_verify_tools")]
+    pub allowed_tools: Vec<String>,
+
+    /// Optional timeout in seconds for the verification agent.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Configuration for a single pipeline stage.
@@ -70,10 +130,6 @@ pub struct StageConfig {
     #[serde(default)]
     pub user_prompt: String,
 
-    /// Maximum agentic turns for the Claude Code agent (agent stages only).
-    #[serde(default = "default_max_turns")]
-    pub max_turns: u32,
-
     /// Optional stage timeout in seconds. If `None`, stages run without a time limit.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -88,6 +144,11 @@ pub struct StageConfig {
     /// Commands support `{{variable}}` template syntax.
     #[serde(default)]
     pub commands: Option<Vec<String>>,
+
+    /// Optional retry group name. Stages sharing the same retry group are
+    /// re-executed as a unit when any stage in the group fails.
+    #[serde(default)]
+    pub retry_group: Option<String>,
 }
 
 impl StageConfig {
@@ -113,12 +174,20 @@ fn default_stage_model() -> String {
     "claude-sonnet-4-6".to_string()
 }
 
-fn default_max_turns() -> u32 {
-    10
+fn default_retry_max_retries() -> u32 {
+    5
 }
 
 fn default_allowed_tools() -> Vec<String> {
     vec!["read".to_string(), "write".to_string()]
+}
+
+fn default_verify_model() -> String {
+    "claude-haiku-4-5-20251001".to_string()
+}
+
+fn default_verify_tools() -> Vec<String> {
+    vec!["read".to_string(), "bash".to_string()]
 }
 
 impl PipelineConfig {

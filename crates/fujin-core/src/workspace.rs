@@ -161,6 +161,56 @@ impl Workspace {
         Ok(())
     }
 
+    /// Detect file changes using `git status`, which is fast even on large repos.
+    /// Falls back to an empty ArtifactSet if git is unavailable or the workspace
+    /// is not a git repository.
+    pub fn git_diff(&self) -> ArtifactSet {
+        let output = match std::process::Command::new("git")
+            .args(["status", "--porcelain=v1", "-uall"])
+            .current_dir(&self.root)
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return ArtifactSet::new(),
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut changes = Vec::new();
+
+        for line in stdout.lines() {
+            if line.len() < 4 {
+                continue;
+            }
+            let status = &line[..2];
+            let path = PathBuf::from(line[3..].trim());
+
+            let kind = match status.trim() {
+                "??" | "A" | "AM" => FileChangeKind::Created,
+                "M" | "MM" | "UU" => FileChangeKind::Modified,
+                "D" => FileChangeKind::Deleted,
+                _ => FileChangeKind::Modified,
+            };
+
+            let (size, hash) = if kind != FileChangeKind::Deleted {
+                let abs = self.root.join(&path);
+                let size = std::fs::metadata(&abs).map(|m| m.len()).ok();
+                (size, None)
+            } else {
+                (None, None)
+            };
+
+            changes.push(FileChange {
+                path,
+                kind,
+                hash,
+                size,
+            });
+        }
+
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
+        ArtifactSet { changes }
+    }
+
     /// Read a file from the workspace.
     pub fn read_file(&self, rel_path: &Path) -> CoreResult<String> {
         let abs_path = self.root.join(rel_path);

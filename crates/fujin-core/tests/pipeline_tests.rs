@@ -568,6 +568,20 @@ stages:
 #[tokio::test]
 async fn test_workspace_artifact_tracking() {
     let dir = tempfile::tempdir().unwrap();
+
+    // Initialize a git repo so git-based diff can detect changes
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git init failed");
+    // Create an initial commit so new files show as untracked/created
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git commit failed");
+
     let yaml = single_stage_yaml();
     let config = parse_config(&yaml);
 
@@ -632,4 +646,317 @@ async fn test_workspace_artifact_tracking() {
             "Artifacts should contain main.rs, got: {paths:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Retry group verification tests
+// ---------------------------------------------------------------------------
+
+fn retry_verify_pass_yaml() -> String {
+    r#"
+name: verify-pass-pipeline
+retry_groups:
+  fix:
+    max_retries: 3
+    verify:
+      system_prompt: "You are a verifier."
+      user_prompt: "Check the code."
+stages:
+  - id: code
+    name: Write Code
+    model: mock-model
+    system_prompt: "You are helpful."
+    user_prompt: "Write code."
+    retry_group: fix
+  - id: test
+    name: Run Tests
+    model: mock-model
+    system_prompt: "You are helpful."
+    user_prompt: "Test code."
+    retry_group: fix
+"#
+    .to_string()
+}
+
+fn retry_verify_fail_yaml() -> String {
+    r#"
+name: verify-fail-pipeline
+retry_groups:
+  fix:
+    max_retries: 2
+    verify:
+      system_prompt: "You are a verifier."
+      user_prompt: "Check the code."
+stages:
+  - id: code
+    name: Write Code
+    model: mock-model
+    system_prompt: "You are helpful."
+    user_prompt: "Write code."
+    retry_group: fix
+  - id: test
+    name: Run Tests
+    model: mock-model
+    system_prompt: "You are helpful."
+    user_prompt: "Test code."
+    retry_group: fix
+"#
+    .to_string()
+}
+
+#[tokio::test]
+async fn test_retry_group_verify_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = retry_verify_pass_yaml();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // Mock returns "PASS" — the verify agent will parse this as a passing verdict
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("Everything looks good. PASS")));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed when verify passes");
+    assert_eq!(results.len(), 2);
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    let has_verify_running = events
+        .iter()
+        .any(|e| matches!(e, PipelineEvent::VerifyRunning { .. }));
+    assert!(has_verify_running, "Expected VerifyRunning event");
+
+    let has_verify_passed = events
+        .iter()
+        .any(|e| matches!(e, PipelineEvent::VerifyPassed { .. }));
+    assert!(has_verify_passed, "Expected VerifyPassed event");
+
+    let has_verify_failed = events
+        .iter()
+        .any(|e| matches!(e, PipelineEvent::VerifyFailed { .. }));
+    assert!(!has_verify_failed, "Should not have VerifyFailed event");
+}
+
+#[tokio::test]
+async fn test_retry_group_verify_fail_loops() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = retry_verify_fail_yaml();
+    let config = parse_config(&yaml);
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    // Mock returns "FAIL" — the verify agent will parse this as a failing verdict
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("The code is wrong. FAIL")));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    // Drain events in a background task, declining retry when limit is reached
+    let event_handle = tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let PipelineEvent::RetryLimitReached { response_tx, .. } = event {
+                let _ = response_tx.send(false);
+                continue;
+            }
+            events.push(event);
+        }
+        events
+    });
+
+    let result = runner.run(&options).await;
+    assert!(result.is_err(), "Pipeline should fail when verify always fails");
+
+    drop(runner);
+    let events = event_handle.await.unwrap();
+
+    let verify_failed_count = events
+        .iter()
+        .filter(|e| matches!(e, PipelineEvent::VerifyFailed { .. }))
+        .count();
+    assert!(verify_failed_count >= 1, "Expected at least one VerifyFailed event, got {verify_failed_count}");
+
+    let retry_attempt_count = events
+        .iter()
+        .filter(|e| matches!(e, PipelineEvent::RetryGroupAttempt { .. }))
+        .count();
+    assert!(retry_attempt_count >= 1, "Expected RetryGroupAttempt events from verify failures, got {retry_attempt_count}");
+}
+
+// ---------------------------------------------------------------------------
+// Verify feedback injection test
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex;
+
+/// A stateful mock runtime that tracks call count and captures contexts.
+/// - Returns "FAIL" on the first verify call, "PASS" on the second.
+/// - Captures the rendered prompt from each call for inspection.
+struct FeedbackCaptureMock {
+    call_count: Mutex<u32>,
+    captured_prompts: Arc<Mutex<Vec<String>>>,
+}
+
+impl FeedbackCaptureMock {
+    fn new(captured_prompts: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            call_count: Mutex::new(0),
+            captured_prompts,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for FeedbackCaptureMock {
+    fn name(&self) -> &str {
+        "feedback-capture-mock"
+    }
+
+    async fn execute(
+        &self,
+        config: &fujin_config::StageConfig,
+        context: &StageContext,
+        workspace_root: &Path,
+        _progress_tx: Option<mpsc::UnboundedSender<String>>,
+        _cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> CoreResult<AgentOutput> {
+        let mut count = self.call_count.lock().unwrap();
+        *count += 1;
+        let call_num = *count;
+        drop(count);
+
+        // Capture the rendered prompt
+        self.captured_prompts.lock().unwrap().push(context.rendered_prompt.clone());
+
+        let _ = workspace_root;
+
+        // Verify stages have id starting with "__verify_"
+        let is_verify = config.id.starts_with("__verify_");
+
+        let response = if is_verify {
+            // First verify call: FAIL with specific feedback
+            // Second verify call: PASS
+            if call_num <= 4 {
+                // calls 1-2 are work stages, call 3 is first verify
+                "The function is missing null checks. FAIL".to_string()
+            } else {
+                "All issues resolved. PASS".to_string()
+            }
+        } else {
+            "Stage work done.".to_string()
+        };
+
+        Ok(AgentOutput {
+            response_text: response,
+            token_usage: None,
+        })
+    }
+
+    async fn health_check(&self) -> CoreResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_verify_feedback_injected_on_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: feedback-test-pipeline
+retry_groups:
+  fix:
+    max_retries: 5
+    verify:
+      system_prompt: "You are a verifier."
+      user_prompt: "Check the code."
+stages:
+  - id: code
+    name: Write Code
+    model: mock-model
+    system_prompt: "You are helpful."
+    user_prompt: "Write code. {{verify_feedback}}"
+    retry_group: fix
+  - id: test
+    name: Run Tests
+    model: mock-model
+    system_prompt: "You are helpful."
+    user_prompt: "Test code."
+    retry_group: fix
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let captured_prompts = Arc::new(Mutex::new(Vec::new()));
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(FeedbackCaptureMock::new(captured_prompts.clone())));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    // The mock will FAIL the first verify, then PASS the second.
+    // The pipeline should loop once and succeed.
+    let results = runner.run(&options).await.expect("Pipeline should eventually succeed");
+    assert_eq!(results.len(), 2, "Should have 2 completed stages");
+
+    let prompts = captured_prompts.lock().unwrap();
+
+    // Calls: code(1), test(2), verify->FAIL(3), code(4), test(5), verify->PASS(6)
+    // prompt[0] = first code run — no feedback
+    assert!(
+        !prompts[0].contains("missing null checks"),
+        "First code run should NOT have verify feedback, got: {}",
+        prompts[0]
+    );
+
+    // prompt[3] = second code run (after FAIL) — should have feedback
+    assert!(
+        prompts[3].contains("missing null checks"),
+        "Second code run should contain verify feedback, got: {}",
+        prompts[3]
+    );
 }

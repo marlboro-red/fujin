@@ -37,6 +37,10 @@ pub struct StageInfo {
     pub name: String,
     pub model: String,
     pub status: StageStatus,
+    pub rendered_prompt: Option<String>,
+    pub prior_summary: Option<String>,
+    /// Whether a retry-group verification is currently running for this stage.
+    pub verifying: bool,
 }
 
 /// State for the pipeline execution screen.
@@ -55,6 +59,8 @@ pub struct ExecutionState {
     pub selected_stage: usize,
     /// Pipeline start time.
     pub start_time: Instant,
+    /// Frozen elapsed time (set when pipeline finishes).
+    pub final_elapsed: Option<Duration>,
     /// Cumulative token usage.
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
@@ -70,6 +76,8 @@ pub struct ExecutionState {
     pub detail_scroll_pinned: bool,
     /// Total rendered line count of the detail panel (for scroll bounds).
     detail_content_height: usize,
+    /// Whether the detail panel is showing the prompt/context view.
+    pub show_prompt: bool,
 }
 
 /// Actions the execution screen can request.
@@ -84,15 +92,34 @@ pub enum ExecutionAction {
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 impl ExecutionState {
-    pub fn new(pipeline_name: String, run_id: String, total_stages: usize) -> Self {
+    pub fn new(
+        pipeline_name: String,
+        run_id: String,
+        total_stages: usize,
+        stage_names: Vec<(String, String)>,
+    ) -> Self {
+        let stages = stage_names
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, name))| StageInfo {
+                index: i,
+                id,
+                name,
+                model: String::new(),
+                status: StageStatus::Pending,
+                rendered_prompt: None,
+                prior_summary: None,
+                verifying: false,
+            })            .collect();
         Self {
             pipeline_name,
             run_id,
             total_stages,
-            stages: Vec::new(),
+            stages,
             active_stage: None,
             selected_stage: 0,
             start_time: Instant::now(),
+            final_elapsed: None,
             total_input_tokens: 0,
             total_output_tokens: 0,
             finished: false,
@@ -101,6 +128,7 @@ impl ExecutionState {
             detail_scroll: 0,
             detail_scroll_pinned: false,
             detail_content_height: 0,
+            show_prompt: false,
         }
     }
 
@@ -123,14 +151,23 @@ impl ExecutionState {
                         name: String::new(),
                         model: String::new(),
                         status: StageStatus::Pending,
+                        rendered_prompt: None,
+                        prior_summary: None,
+                        verifying: false,
                     });
                 }
-                self.stages[stage_index] = StageInfo {
-                    index: stage_index,
-                    id: stage_id,
-                    name: stage_name,
-                    model,
-                    status: StageStatus::Pending,
+                let stage = &mut self.stages[stage_index];
+                stage.id = stage_id;
+                stage.name = stage_name;
+                stage.model = model.clone();
+                // Immediately transition to Running so the TUI shows progress
+                stage.status = StageStatus::Running {
+                    elapsed: Duration::ZERO,
+                    activity_log: if model == "commands" {
+                        vec!["Starting commands...".to_string()]
+                    } else {
+                        Vec::new()
+                    },
                 };
                 self.active_stage = Some(stage_index);
                 self.selected_stage = stage_index;
@@ -139,6 +176,17 @@ impl ExecutionState {
             PipelineEvent::ContextBuilding { stage_index } => {
                 if let Some(stage) = self.stages.get_mut(stage_index) {
                     stage.status = StageStatus::Building;
+                }
+            }
+
+            PipelineEvent::StageContext {
+                stage_index,
+                rendered_prompt,
+                prior_summary,
+            } => {
+                if let Some(stage) = self.stages.get_mut(stage_index) {
+                    stage.rendered_prompt = Some(rendered_prompt);
+                    stage.prior_summary = prior_summary;
                 }
             }
 
@@ -159,10 +207,10 @@ impl ExecutionState {
             } => {
                 if let Some(stage) = self.stages.get_mut(stage_index) {
                     let activity = format!(
-                        "Running command [{}/{}]: {}",
+                        "$ {} [{}/{}]",
+                        command,
                         command_index + 1,
                         total_commands,
-                        command
                     );
                     match &mut stage.status {
                         StageStatus::Running { activity_log, .. } => {
@@ -268,6 +316,7 @@ impl ExecutionState {
                 stages_completed,
             } => {
                 self.finished = true;
+                self.final_elapsed = Some(self.start_time.elapsed());
                 self.final_message = Some(format!(
                     "Pipeline complete in {:.1}s — {} stages executed",
                     total_duration.as_secs_f64(),
@@ -277,6 +326,7 @@ impl ExecutionState {
 
             PipelineEvent::PipelineFailed { error } => {
                 self.finished = true;
+                self.final_elapsed = Some(self.start_time.elapsed());
                 self.final_message = Some(format!("Pipeline failed: {error}"));
             }
 
@@ -289,8 +339,79 @@ impl ExecutionState {
                 }
                 self.active_stage = None;
                 self.finished = true;
+                self.final_elapsed = Some(self.start_time.elapsed());
                 self.final_message =
                     Some(format!("Pipeline cancelled at stage {}", stage_index + 1));
+            }
+
+            PipelineEvent::RetryGroupAttempt {
+                group_name,
+                attempt,
+                max_retries,
+                first_stage_index,
+                failed_stage_id,
+                error,
+            } => {
+                // Mark the failed stage, then reset stages in the retry group
+                if let Some(stage) = self.stages.iter_mut().find(|s| s.id == failed_stage_id) {
+                    stage.status = StageStatus::Failed {
+                        error: format!(
+                            "Retrying ({}/{}) — {}",
+                            attempt, max_retries, error
+                        ),
+                    };
+                }
+                // Reset stages from first_stage_index onwards back to Pending
+                for stage in self.stages.iter_mut().skip(first_stage_index) {
+                    if stage.id != failed_stage_id {
+                        stage.status = StageStatus::Pending;
+                    }
+                }
+                let _ = &group_name;
+                self.active_stage = None;
+            }
+
+            PipelineEvent::RetryLimitReached {
+                response_tx,
+                ..
+            } => {
+                // In TUI mode, auto-continue (the TUI doesn't have a blocking prompt)
+                let _ = response_tx.send(true);
+            }
+
+            PipelineEvent::VerifyRunning { group_name, stage_index } => {
+                if let Some(stage) = self.stages.get_mut(stage_index) {
+                    stage.verifying = true;
+                    if let StageStatus::Completed { activity_log, .. } = &mut stage.status {
+                        activity_log.push(format!("Verifying retry group '{group_name}'…"));
+                    }
+                }
+            }
+
+            PipelineEvent::VerifyPassed { group_name, stage_index } => {
+                if let Some(stage) = self.stages.get_mut(stage_index) {
+                    stage.verifying = false;
+                    if let StageStatus::Completed { activity_log, .. } = &mut stage.status {
+                        activity_log.push(format!("Retry group '{group_name}' verification passed ✓"));
+                    }
+                }
+            }
+
+            PipelineEvent::VerifyFailed { group_name, stage_index, response } => {
+                if let Some(stage) = self.stages.get_mut(stage_index) {
+                    stage.verifying = false;
+                    if let StageStatus::Completed { activity_log, .. } = &mut stage.status {
+                        activity_log.push(format!("Retry group '{group_name}' verification failed: {response}"));
+                    }
+                }
+            }
+
+            PipelineEvent::VerifyActivity { stage_index, activity } => {
+                if let Some(stage) = self.stages.get_mut(stage_index) {
+                    if let StageStatus::Completed { activity_log, .. } = &mut stage.status {
+                        activity_log.push(activity);
+                    }
+                }
             }
         }
     }
@@ -316,8 +437,14 @@ impl ExecutionState {
             }
             KeyCode::Char('b') if self.finished => ExecutionAction::BackToBrowser,
             KeyCode::Char('?') => ExecutionAction::ToggleHelp,
-            // Stage navigation (finished only)
-            KeyCode::Up | KeyCode::Char('k') if self.finished => {
+            KeyCode::Char('p') => {
+                self.show_prompt = !self.show_prompt;
+                self.detail_scroll = 0;
+                self.detail_scroll_pinned = false;
+                ExecutionAction::None
+            }
+            // Stage navigation
+            KeyCode::Up | KeyCode::Char('k') => {
                 if self.selected_stage > 0 {
                     self.selected_stage -= 1;
                     self.detail_scroll = 0;
@@ -325,7 +452,7 @@ impl ExecutionState {
                 }
                 ExecutionAction::None
             }
-            KeyCode::Down | KeyCode::Char('j') if self.finished => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 if self.selected_stage + 1 < self.stages.len() {
                     self.selected_stage += 1;
                     self.detail_scroll = 0;
@@ -380,7 +507,7 @@ impl ExecutionState {
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let elapsed = self.start_time.elapsed();
+        let elapsed = self.final_elapsed.unwrap_or_else(|| self.start_time.elapsed());
         let elapsed_str = format_duration(elapsed);
         let run_short: String = self.run_id.chars().take(8).collect();
 
@@ -442,20 +569,33 @@ impl ExecutionState {
                 StageStatus::Completed {
                     duration,
                     artifacts,
+                    activity_log,
                     ..
-                } => (
-                    "✓",
-                    Color::Green,
-                    format!(
-                        "{:.1}s · {}",
-                        duration.as_secs_f64(),
-                        artifacts.summary()
-                    ),
-                ),
+                } => {
+                    if stage.verifying {
+                        let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
+                        let detail = if let Some(act) = activity_log.last() {
+                            format!("{:.1}s · verifying · {act}", duration.as_secs_f64())
+                        } else {
+                            format!("{:.1}s · verifying…", duration.as_secs_f64())
+                        };
+                        (spinner, Color::Yellow, detail)
+                    } else {
+                        (
+                            "✓",
+                            Color::Green,
+                            format!(
+                                "{:.1}s · {}",
+                                duration.as_secs_f64(),
+                                artifacts.summary()
+                            ),
+                        )
+                    }
+                }
                 StageStatus::Failed { .. } => ("✗", Color::Red, "failed".to_string()),
             };
 
-            let is_selected = i == self.selected_stage && self.finished;
+            let is_selected = i == self.selected_stage;
             let name_style = if is_selected {
                 Style::default()
                     .fg(Color::Cyan)
@@ -476,26 +616,12 @@ impl ExecutionState {
             ]));
         }
 
-        // Show pending stages that haven't started yet
-        for i in self.stages.len()..self.total_stages {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("·", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!(" {}. ", i + 1)),
-                Span::styled("pending", Style::default().fg(Color::DarkGray)),
-            ]));
-        }
-
         let paragraph = Paragraph::new(lines);
         frame.render_widget(paragraph, inner);
     }
 
     fn render_stage_detail(&mut self, frame: &mut Frame, area: Rect) {
-        let detail_idx = if self.finished {
-            self.selected_stage
-        } else {
-            self.active_stage.unwrap_or(0)
-        };
+        let detail_idx = self.selected_stage;
 
         let Some(stage) = self.stages.get(detail_idx) else {
             let block = Block::default()
@@ -508,15 +634,66 @@ impl ExecutionState {
             return;
         };
 
+        let title_suffix = if self.show_prompt { " [Prompt]" } else { "" };
         let title = format!(
-            " Stage {}/{}: {} ",
+            " Stage {}/{}: {}{} ",
             stage.index + 1,
             self.total_stages,
-            stage.name
+            stage.name,
+            title_suffix,
         );
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
+
+        // Prompt/context view (toggled with 'p')
+        if self.show_prompt {
+            let mut lines: Vec<Line> = Vec::new();
+
+            if let Some(ref summary) = stage.prior_summary {
+                lines.push(Line::from(Span::styled(
+                    "  Prior Summary:",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )));
+                for l in summary.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {l}"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines.push(Line::from(""));
+            }
+
+            if let Some(ref prompt) = stage.rendered_prompt {
+                lines.push(Line::from(Span::styled(
+                    "  Rendered Prompt:",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )));
+                for l in prompt.lines() {
+                    lines.push(Line::from(format!("  {l}")));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  No prompt available (command stage or not yet built)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
+            let visible_height = inner.height as usize;
+            let total_lines = lines.len();
+            self.detail_content_height = total_lines;
+
+            let scroll = if self.detail_scroll_pinned {
+                let max_scroll = total_lines.saturating_sub(visible_height) as u16;
+                self.detail_scroll.min(max_scroll)
+            } else {
+                0
+            };
+
+            let paragraph = Paragraph::new(lines).scroll((scroll, 0));
+            frame.render_widget(paragraph, inner);
+            return;
+        }
 
         let detail_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -527,7 +704,12 @@ impl ExecutionState {
             .split(inner);
 
         // Stage info header
-        let mut info_lines = vec![Line::from(format!("  model: {}", stage.model))];
+        let info_label = if stage.model == "commands" {
+            "  type: commands".to_string()
+        } else {
+            format!("  model: {}", stage.model)
+        };
+        let mut info_lines = vec![Line::from(info_label)];
 
         match &stage.status {
             StageStatus::Running { elapsed, .. } => {
@@ -573,14 +755,20 @@ impl ExecutionState {
 
         if let Some(log) = activity_log {
             if !log.is_empty() {
+                let label = if stage.model == "commands" { "  Output:" } else { "  Activity:" };
                 detail_lines.push(Line::from(Span::styled(
-                    "  Activity:",
+                    label,
                     Style::default().fg(Color::DarkGray),
                 )));
                 for entry in log {
+                    let style = if entry.starts_with("$ ") {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    };
                     detail_lines.push(Line::from(Span::styled(
                         format!("  {entry}"),
-                        Style::default().fg(Color::Cyan),
+                        style,
                     )));
                 }
             }
@@ -659,7 +847,7 @@ impl ExecutionState {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let elapsed = self.start_time.elapsed();
+        let elapsed = self.final_elapsed.unwrap_or_else(|| self.start_time.elapsed());
 
         let mut spans = vec![
             Span::raw("  "),
@@ -677,12 +865,18 @@ impl ExecutionState {
             spans.push(Span::raw(" Back  "));
             spans.push(Span::styled("[j/k]", Style::default().fg(Color::Cyan)));
             spans.push(Span::raw(" Browse stages  "));
+            spans.push(Span::styled("[p]", Style::default().fg(Color::Cyan)));
+            spans.push(Span::raw(" Prompt  "));
             spans.push(Span::styled("[PgUp/Dn]", Style::default().fg(Color::Cyan)));
             spans.push(Span::raw(" Scroll  "));
             spans.push(Span::styled("[q]", Style::default().fg(Color::Cyan)));
             spans.push(Span::raw(" Quit"));
         } else {
             spans.push(Span::raw("    "));
+            spans.push(Span::styled("[j/k]", Style::default().fg(Color::Cyan)));
+            spans.push(Span::raw(" Browse stages  "));
+            spans.push(Span::styled("[p]", Style::default().fg(Color::Cyan)));
+            spans.push(Span::raw(" Prompt  "));
             spans.push(Span::styled("[PgUp/Dn]", Style::default().fg(Color::Cyan)));
             spans.push(Span::raw(" Scroll  "));
             spans.push(Span::styled("[Ctrl+C]", Style::default().fg(Color::Yellow)));
@@ -744,7 +938,16 @@ mod tests {
     }
 
     fn new_state() -> ExecutionState {
-        ExecutionState::new("Test Pipeline".into(), String::new(), 3)
+        ExecutionState::new(
+            "Test Pipeline".into(),
+            String::new(),
+            3,
+            vec![
+                ("s0".into(), "Stage 0".into()),
+                ("s1".into(), "Stage 1".into()),
+                ("s2".into(), "Stage 2".into()),
+            ],
+        )
     }
 
     // --- Key handling tests ---
@@ -810,20 +1013,15 @@ mod tests {
     fn test_jk_navigation_when_finished() {
         let mut state = new_state();
         state.finished = true;
-        // Add some stages
-        for i in 0..3 {
-            state.stages.push(StageInfo {
-                index: i,
-                id: format!("s{i}"),
-                name: format!("Stage {i}"),
-                model: "test".into(),
-                status: StageStatus::Completed {
-                    duration: Duration::from_secs(1),
-                    artifacts: ArtifactSet::default(),
-                    token_usage: None,
-                    activity_log: vec![],
-                },
-            });
+        // Stages are already pre-populated by new_state() with 3 stages;
+        // mark them as completed for the navigation test.
+        for stage in &mut state.stages {
+            stage.status = StageStatus::Completed {
+                duration: Duration::from_secs(1),
+                artifacts: ArtifactSet::default(),
+                token_usage: None,
+                activity_log: vec![],
+            };
         }
         state.selected_stage = 0;
 
@@ -860,7 +1058,7 @@ mod tests {
             model: "sonnet".into(),
         });
 
-        assert_eq!(state.stages.len(), 1);
+        assert_eq!(state.stages.len(), 3); // pre-populated by new_state()
         assert_eq!(state.stages[0].id, "build");
         assert_eq!(state.stages[0].name, "Build Code");
         assert_eq!(state.active_stage, Some(0));

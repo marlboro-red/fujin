@@ -6,6 +6,7 @@ use crate::event::PipelineEvent;
 use crate::stage::StageResult;
 use crate::workspace::Workspace;
 use chrono::Utc;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -92,6 +93,22 @@ impl PipelineRunner {
         &self.config
     }
 
+    /// Pre-compute retry group stage ranges.
+    ///
+    /// Returns a map from group name to `(first_stage_index, last_stage_index)`.
+    fn compute_retry_group_ranges(&self) -> HashMap<&str, (usize, usize)> {
+        let mut ranges: HashMap<&str, (usize, usize)> = HashMap::new();
+        for (i, stage) in self.config.stages.iter().enumerate() {
+            if let Some(ref group) = stage.retry_group {
+                ranges
+                    .entry(group.as_str())
+                    .and_modify(|(_, last)| *last = i)
+                    .or_insert((i, i));
+            }
+        }
+        ranges
+    }
+
     /// Run the pipeline.
     pub async fn run(&self, options: &RunOptions) -> CoreResult<Vec<StageResult>> {
         // Ensure workspace exists
@@ -135,7 +152,18 @@ impl PipelineRunner {
         // Execute stages
         let pipeline_start = Instant::now();
 
-        for stage_idx in start_index..total_stages {
+        // Pre-compute retry group ranges: group_name -> (first_index, last_index)
+        let retry_group_ranges = self.compute_retry_group_ranges();
+
+        // Track retry attempts per group
+        let mut retry_counts: HashMap<String, u32> = HashMap::new();
+
+        // Store verify agent feedback per retry group for injection into stage context on retry
+        let mut verify_feedback: HashMap<String, String> = HashMap::new();
+
+        let mut stage_idx = start_index;
+
+        while stage_idx < total_stages {
             // Check for cancellation before starting each stage
             if let Some(ref flag) = self.cancel_flag {
                 if flag.load(Ordering::Relaxed) {
@@ -162,19 +190,24 @@ impl PipelineRunner {
 
             let stage_start = Instant::now();
 
-            // 1. Snapshot workspace
-            let before_snapshot = self.workspace.snapshot()?;
-
-            // 2. Execute stage (command or agent)
+            // 1. Execute stage (command or agent)
             let stage_exec_result = if stage_config.is_command_stage() {
                 self.run_command_stage(stage_idx, stage_config, &stage_start)
                     .await
             } else {
+                // Look up verify feedback for this stage's retry group
+                let feedback = stage_config
+                    .retry_group
+                    .as_ref()
+                    .and_then(|g| verify_feedback.get(g))
+                    .map(|s| s.as_str());
+
                 self.run_agent_stage(
                     stage_idx,
                     stage_config,
                     &checkpoint,
                     &stage_start,
+                    feedback,
                 )
                 .await
             };
@@ -193,6 +226,71 @@ impl PipelineRunner {
                     });
                 }
                 Err(e) => {
+                    // Check if this stage belongs to a retry group
+                    if let Some(ref group_name) = stage_config.retry_group {
+                        if let Some(&(first_idx, _last_idx)) = retry_group_ranges.get(group_name.as_str()) {
+                            let group_config = self.config.retry_groups.get(group_name);
+                            let max_retries = group_config.map_or(5, |g| g.max_retries);
+                            let count = retry_counts.entry(group_name.clone()).or_insert(0);
+                            *count += 1;
+
+                            if *count >= max_retries {
+                                // Ask user whether to continue
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                self.emit(PipelineEvent::RetryLimitReached {
+                                    group_name: group_name.clone(),
+                                    total_attempts: *count,
+                                    response_tx: tx,
+                                });
+
+                                match rx.await {
+                                    Ok(true) => {
+                                        // User chose to continue — reset counter
+                                        *count = 0;
+                                    }
+                                    _ => {
+                                        // User declined or channel dropped — fail the pipeline
+                                        checkpoint.next_stage_index = stage_idx;
+                                        checkpoint.updated_at = Utc::now();
+                                        let checkpoint_saved = self.checkpoint_manager.save(&checkpoint).is_ok();
+                                        self.emit(PipelineEvent::StageFailed {
+                                            stage_index: stage_idx,
+                                            stage_id: stage_config.id.clone(),
+                                            error: e.to_string(),
+                                            checkpoint_saved,
+                                        });
+                                        self.emit(PipelineEvent::PipelineFailed {
+                                            error: e.to_string(),
+                                        });
+                                        return Err(e);
+                                    }
+                                }
+                            }
+
+                            self.emit(PipelineEvent::RetryGroupAttempt {
+                                group_name: group_name.clone(),
+                                attempt: *retry_counts.get(group_name.as_str()).unwrap_or(&1),
+                                max_retries,
+                                first_stage_index: first_idx,
+                                failed_stage_id: stage_config.id.clone(),
+                                error: e.to_string(),
+                            });
+
+                            // Trim checkpoint back to before the retry group
+                            while checkpoint.completed_stages.len() > first_idx {
+                                checkpoint.completed_stages.pop();
+                            }
+                            checkpoint.next_stage_index = first_idx;
+                            checkpoint.updated_at = Utc::now();
+                            let _ = self.checkpoint_manager.save(&checkpoint);
+
+                            // Jump back to the first stage of the group
+                            stage_idx = first_idx;
+                            continue;
+                        }
+                    }
+
+                    // Not in a retry group — fail normally
                     checkpoint.next_stage_index = stage_idx;
                     checkpoint.updated_at = Utc::now();
                     let checkpoint_saved = self.checkpoint_manager.save(&checkpoint).is_ok();
@@ -209,9 +307,13 @@ impl PipelineRunner {
                 }
             };
 
-            // 3. Diff workspace
-            let after_snapshot = self.workspace.snapshot()?;
-            let artifacts = Workspace::diff(&before_snapshot, &after_snapshot);
+            // 2. Detect file changes via git (fast, even on large repos)
+            let ws_root = self.workspace.root().to_path_buf();
+            let artifacts = tokio::task::spawn_blocking(move || {
+                Workspace::new(ws_root).git_diff()
+            })
+                .await
+                .unwrap_or_default();
 
             let duration = stage_start.elapsed();
 
@@ -241,11 +343,179 @@ impl PipelineRunner {
             // 5. Save checkpoint
             self.checkpoint_manager.save(&checkpoint)?;
 
+            // Clear retry counter on successful completion of a retry group's last stage
+            if let Some(ref group_name) = stage_config.retry_group {
+                if let Some(&(first_idx, last_idx)) = retry_group_ranges.get(group_name.as_str()) {
+                    if stage_idx == last_idx {
+                        // Run verification agent if configured
+                        let group_config = self.config.retry_groups.get(group_name);
+                        if let Some(verify_cfg) = group_config.and_then(|g| g.verify.as_ref()) {
+                            self.emit(PipelineEvent::VerifyRunning {
+                                group_name: group_name.clone(),
+                                stage_index: stage_idx,
+                            });
+
+                            let verdict = self.run_verify_agent(
+                                verify_cfg,
+                                stage_idx,
+                                &checkpoint,
+                            ).await;
+
+                            match verdict {
+                                Ok(verify_response) => {
+                                    let passed = parse_verify_verdict(&verify_response);
+
+                                    if passed {
+                                        self.emit(PipelineEvent::VerifyPassed {
+                                            group_name: group_name.clone(),
+                                            stage_index: stage_idx,
+                                        });
+                                        verify_feedback.remove(group_name);
+                                    } else {
+                                        self.emit(PipelineEvent::VerifyFailed {
+                                            group_name: group_name.clone(),
+                                            stage_index: stage_idx,
+                                            response: verify_response.clone(),
+                                        });
+
+                                        // Store feedback so the first stage gets it on retry
+                                        verify_feedback.insert(group_name.clone(), verify_response.clone());
+
+                                        // Treat as a retry group failure
+                                        let max_retries = group_config.map_or(5, |g| g.max_retries);
+                                        let count = retry_counts.entry(group_name.clone()).or_insert(0);
+                                        *count += 1;
+
+                                        if *count >= max_retries {
+                                            let (tx, rx) = tokio::sync::oneshot::channel();
+                                            self.emit(PipelineEvent::RetryLimitReached {
+                                                group_name: group_name.clone(),
+                                                total_attempts: *count,
+                                                response_tx: tx,
+                                            });
+
+                                            match rx.await {
+                                                Ok(true) => {
+                                                    *count = 0;
+                                                }
+                                                _ => {
+                                                    checkpoint.next_stage_index = stage_idx;
+                                                    checkpoint.updated_at = Utc::now();
+                                                    let checkpoint_saved = self.checkpoint_manager.save(&checkpoint).is_ok();
+                                                    self.emit(PipelineEvent::StageFailed {
+                                                        stage_index: stage_idx,
+                                                        stage_id: stage_config.id.clone(),
+                                                        error: verify_response.clone(),
+                                                        checkpoint_saved,
+                                                    });
+                                                    self.emit(PipelineEvent::PipelineFailed {
+                                                        error: verify_response,
+                                                    });
+                                                    return Err(CoreError::AgentError { message: "Verification failed and retry limit reached".to_string() });
+                                                }
+                                            }
+                                        }
+
+                                        self.emit(PipelineEvent::RetryGroupAttempt {
+                                            group_name: group_name.clone(),
+                                            attempt: *retry_counts.get(group_name.as_str()).unwrap_or(&1),
+                                            max_retries,
+                                            first_stage_index: first_idx,
+                                            failed_stage_id: stage_config.id.clone(),
+                                            error: verify_response,
+                                        });
+
+                                        // Trim checkpoint back to before the retry group
+                                        while checkpoint.completed_stages.len() > first_idx {
+                                            checkpoint.completed_stages.pop();
+                                        }
+                                        checkpoint.next_stage_index = first_idx;
+                                        checkpoint.updated_at = Utc::now();
+                                        let _ = self.checkpoint_manager.save(&checkpoint);
+
+                                        stage_idx = first_idx;
+                                        continue;
+                                    }
+                                }
+                                Err(e) => {
+                                    // Agent execution error — treat as verify failure
+                                    let error_msg = e.to_string();
+                                    self.emit(PipelineEvent::VerifyFailed {
+                                        group_name: group_name.clone(),
+                                        stage_index: stage_idx,
+                                        response: error_msg.clone(),
+                                    });
+
+                                    verify_feedback.insert(group_name.clone(), error_msg.clone());
+
+                                    let max_retries = group_config.map_or(5, |g| g.max_retries);
+                                    let count = retry_counts.entry(group_name.clone()).or_insert(0);
+                                    *count += 1;
+
+                                    if *count >= max_retries {
+                                        let (tx, rx) = tokio::sync::oneshot::channel();
+                                        self.emit(PipelineEvent::RetryLimitReached {
+                                            group_name: group_name.clone(),
+                                            total_attempts: *count,
+                                            response_tx: tx,
+                                        });
+
+                                        match rx.await {
+                                            Ok(true) => {
+                                                *count = 0;
+                                            }
+                                            _ => {
+                                                checkpoint.next_stage_index = stage_idx;
+                                                checkpoint.updated_at = Utc::now();
+                                                let checkpoint_saved = self.checkpoint_manager.save(&checkpoint).is_ok();
+                                                self.emit(PipelineEvent::StageFailed {
+                                                    stage_index: stage_idx,
+                                                    stage_id: stage_config.id.clone(),
+                                                    error: error_msg.clone(),
+                                                    checkpoint_saved,
+                                                });
+                                                self.emit(PipelineEvent::PipelineFailed {
+                                                    error: error_msg,
+                                                });
+                                                return Err(CoreError::AgentError { message: "Verification failed and retry limit reached".to_string() });
+                                            }
+                                        }
+                                    }
+
+                                    self.emit(PipelineEvent::RetryGroupAttempt {
+                                        group_name: group_name.clone(),
+                                        attempt: *retry_counts.get(group_name.as_str()).unwrap_or(&1),
+                                        max_retries,
+                                        first_stage_index: first_idx,
+                                        failed_stage_id: stage_config.id.clone(),
+                                        error: error_msg,
+                                    });
+
+                                    while checkpoint.completed_stages.len() > first_idx {
+                                        checkpoint.completed_stages.pop();
+                                    }
+                                    checkpoint.next_stage_index = first_idx;
+                                    checkpoint.updated_at = Utc::now();
+                                    let _ = self.checkpoint_manager.save(&checkpoint);
+
+                                    stage_idx = first_idx;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        retry_counts.remove(group_name.as_str());
+                    }
+                }
+            }
+
             info!(
                 stage_id = %stage_config.id,
                 duration_secs = duration.as_secs_f64(),
                 "Stage completed"
             );
+
+            stage_idx += 1;
         }
 
         let total_duration = pipeline_start.elapsed();
@@ -267,6 +537,7 @@ impl PipelineRunner {
         stage_config: &StageConfig,
         checkpoint: &crate::checkpoint::Checkpoint,
         stage_start: &Instant,
+        verify_feedback: Option<&str>,
     ) -> CoreResult<(String, Option<crate::stage::TokenUsage>)> {
         // Build context
         self.emit(PipelineEvent::ContextBuilding {
@@ -275,8 +546,14 @@ impl PipelineRunner {
         let prior_result = checkpoint.completed_stages.last();
         let context = self
             .context_builder
-            .build(&self.config, stage_config, prior_result, &self.workspace)
+            .build(&self.config, stage_config, prior_result, &self.workspace, verify_feedback)
             .await?;
+
+        self.emit(PipelineEvent::StageContext {
+            stage_index: stage_idx,
+            rendered_prompt: context.rendered_prompt.clone(),
+            prior_summary: context.prior_summary.clone(),
+        });
 
         self.emit(PipelineEvent::AgentRunning {
             stage_index: stage_idx,
@@ -426,6 +703,77 @@ impl PipelineRunner {
         Ok((combined_output, None))
     }
 
+    /// Run the verification agent for a retry group.
+    ///
+    /// Returns the agent's response text. The caller parses it for PASS/FAIL.
+    async fn run_verify_agent(
+        &self,
+        verify_cfg: &fujin_config::VerifyConfig,
+        stage_idx: usize,
+        checkpoint: &crate::checkpoint::Checkpoint,
+    ) -> CoreResult<String> {
+        // Build a synthetic StageConfig for the verify agent
+        let verify_stage = StageConfig {
+            id: format!("__verify_{}", stage_idx),
+            name: "Verification".to_string(),
+            model: verify_cfg.model.clone(),
+            system_prompt: verify_cfg.system_prompt.clone(),
+            user_prompt: verify_cfg.user_prompt.clone(),
+            timeout_secs: verify_cfg.timeout_secs,
+            allowed_tools: verify_cfg.allowed_tools.clone(),
+            commands: None,
+            retry_group: None,
+        };
+
+        // Build context (includes prior stage results and changed files)
+        let prior_result = checkpoint.completed_stages.last();
+        let context = self
+            .context_builder
+            .build(&self.config, &verify_stage, prior_result, &self.workspace, None)
+            .await?;
+
+        // Create a progress channel that bridges verify agent activity to PipelineEvent
+        let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
+        let activity_tx = self.event_tx.clone();
+        let activity_idx = stage_idx;
+        tokio::spawn(async move {
+            while let Some(activity) = prx.recv().await {
+                if activity_tx
+                    .send(PipelineEvent::VerifyActivity {
+                        stage_index: activity_idx,
+                        activity,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // Execute with optional timeout
+        let agent_future = self.runtime.execute(
+            &verify_stage,
+            &context,
+            self.workspace.root(),
+            Some(ptx),
+            self.cancel_flag.clone(),
+        );
+
+        let agent_result = if let Some(timeout_secs) = verify_cfg.timeout_secs {
+            let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+            match tokio::time::timeout(timeout_duration, agent_future).await {
+                Ok(result) => result,
+                Err(_) => Err(CoreError::AgentError {
+                    message: format!("Verification timed out after {}s", timeout_secs),
+                }),
+            }
+        } else {
+            agent_future.await
+        };
+
+        Ok(agent_result?.response_text)
+    }
+
     /// Execute a single shell command and return its output.
     async fn execute_command(
         &self,
@@ -459,10 +807,30 @@ impl PipelineRunner {
             message: format!("Failed to spawn command '{command}': {e}"),
         })?;
 
-        // Stream stdout lines as CommandOutput events
+        // Stream both stdout and stderr lines as CommandOutput events
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let event_tx = self.event_tx.clone();
+        let stderr_idx = stage_idx;
+        let stderr_handle = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            if let Some(stream) = stderr {
+                let mut reader = BufReader::new(stream).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    let _ = event_tx.send(PipelineEvent::CommandOutput {
+                        stage_index: stderr_idx,
+                        line: line.clone(),
+                    });
+                    lines.push(line);
+                }
+            }
+            lines
+        });
+
         let mut output_lines = Vec::new();
-        if let Some(stdout) = child.stdout.take() {
-            let mut reader = BufReader::new(stdout).lines();
+        if let Some(stream) = stdout {
+            let mut reader = BufReader::new(stream).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 self.emit(PipelineEvent::CommandOutput {
                     stage_index: stage_idx,
@@ -472,6 +840,8 @@ impl PipelineRunner {
             }
         }
 
+        let stderr_lines = stderr_handle.await.unwrap_or_default();
+
         let status = child.wait().await.map_err(|e| CoreError::AgentError {
             message: format!("Failed to wait for command '{command}': {e}"),
         })?;
@@ -479,12 +849,7 @@ impl PipelineRunner {
         let stdout_text = output_lines.join("\n");
 
         if !status.success() {
-            // Capture stderr for the error message
-            let mut stderr_text = String::new();
-            if let Some(mut stderr) = child.stderr.take() {
-                use tokio::io::AsyncReadExt;
-                let _ = stderr.read_to_string(&mut stderr_text).await;
-            }
+            let stderr_text = stderr_lines.join("\n");
             return Err(CoreError::AgentError {
                 message: format!(
                     "Command failed in stage '{}' (exit {}): {}\n{}",
@@ -511,4 +876,61 @@ fn render_command_template(
         .map_err(|e| CoreError::TemplateError(format!("Invalid command template: {e}")))?;
     hbs.render("cmd", vars)
         .map_err(|e| CoreError::TemplateError(format!("Command template rendering failed: {e}")))
+}
+
+/// Parse a verification agent's response for a PASS or FAIL verdict.
+///
+/// Scans the response for the last occurrence of "PASS" or "FAIL" (case-insensitive,
+/// whole word). Returns `true` if the final verdict is PASS, `false` otherwise
+/// (including when neither keyword is found).
+fn parse_verify_verdict(response: &str) -> bool {
+    let response_upper = response.to_uppercase();
+    let last_pass = response_upper.rfind("PASS");
+    let last_fail = response_upper.rfind("FAIL");
+
+    match (last_pass, last_fail) {
+        (Some(p), Some(f)) => p > f,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verdict_pass() {
+        assert!(parse_verify_verdict("PASS"));
+        assert!(parse_verify_verdict("Everything looks correct. PASS"));
+        assert!(parse_verify_verdict("The tests pass. Verdict: PASS"));
+    }
+
+    #[test]
+    fn test_verdict_fail() {
+        assert!(!parse_verify_verdict("FAIL"));
+        assert!(!parse_verify_verdict("The code is broken. FAIL"));
+        assert!(!parse_verify_verdict("Verdict: FAIL"));
+    }
+
+    #[test]
+    fn test_verdict_last_wins() {
+        // When both appear, last one wins
+        assert!(parse_verify_verdict("Initially I thought it would FAIL, but actually PASS"));
+        assert!(!parse_verify_verdict("It could PASS but there's a bug so FAIL"));
+    }
+
+    #[test]
+    fn test_verdict_case_insensitive() {
+        assert!(parse_verify_verdict("pass"));
+        assert!(!parse_verify_verdict("fail"));
+        assert!(parse_verify_verdict("Pass"));
+        assert!(!parse_verify_verdict("Fail"));
+    }
+
+    #[test]
+    fn test_verdict_no_keyword() {
+        assert!(!parse_verify_verdict(""));
+        assert!(!parse_verify_verdict("The code looks fine"));
+    }
 }

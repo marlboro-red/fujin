@@ -400,6 +400,88 @@ fn spawn_cli_display(mut rx: mpsc::UnboundedReceiver<PipelineEvent>) {
                     );
                 }
 
+                PipelineEvent::RetryGroupAttempt {
+                    group_name,
+                    attempt,
+                    max_retries,
+                    failed_stage_id,
+                    error,
+                    ..
+                } => {
+                    if let Some(ref s) = spinner {
+                        s.finish_and_clear();
+                        spinner = None;
+                    }
+                    eprintln!(
+                        "  {} Retry group '{}' — attempt {}/{} (stage '{}' failed: {})",
+                        style("↻").yellow().bold(),
+                        group_name,
+                        attempt,
+                        max_retries,
+                        failed_stage_id,
+                        truncate_chars(&error, 80)
+                    );
+                }
+
+                PipelineEvent::RetryLimitReached {
+                    group_name,
+                    total_attempts,
+                    response_tx,
+                } => {
+                    if let Some(ref s) = spinner {
+                        s.finish_and_clear();
+                        spinner = None;
+                    }
+                    eprintln!(
+                        "\n  {} Retry group '{}' exhausted {} attempts.",
+                        style("⚠").yellow().bold(),
+                        group_name,
+                        total_attempts
+                    );
+                    eprint!("  Continue with another round of retries? [y/N] ");
+                    use std::io::{self, BufRead};
+                    let answer = io::stdin()
+                        .lock()
+                        .lines()
+                        .next()
+                        .and_then(|l| l.ok())
+                        .unwrap_or_default();
+                    let should_continue = matches!(
+                        answer.trim().to_lowercase().as_str(),
+                        "y" | "yes"
+                    );
+                    let _ = response_tx.send(should_continue);
+                }
+
+                PipelineEvent::VerifyRunning { group_name, .. } => {
+                    if let Some(ref s) = spinner {
+                        s.finish_and_clear();
+                        spinner = None;
+                    }
+                    eprintln!(
+                        "  {} Verifying retry group '{}'…",
+                        style("⟳").cyan().bold(),
+                        group_name
+                    );
+                }
+
+                PipelineEvent::VerifyPassed { group_name, .. } => {
+                    eprintln!(
+                        "  {} Retry group '{}' verification passed",
+                        style("✓").green().bold(),
+                        group_name
+                    );
+                }
+
+                PipelineEvent::VerifyFailed { group_name, response, .. } => {
+                    eprintln!(
+                        "  {} Retry group '{}' verification failed: {}",
+                        style("✗").red().bold(),
+                        group_name,
+                        truncate_chars(&response, 80)
+                    );
+                }
+
                 // Tick / activity / context-building are handled by the spinner
                 _ => {}
             }
@@ -482,12 +564,11 @@ fn print_dry_run(config: &PipelineConfig) {
 
     for (i, stage) in config.stages.iter().enumerate() {
         println!(
-            "  {} Stage {}: {} [model={}, max_turns={}{}]",
+            "  {} Stage {}: {} [model={}{}]",
             style("○ pending").dim(),
             i + 1,
             style(&stage.name).bold(),
             stage.model,
-            stage.max_turns,
             stage
                 .timeout_secs
                 .map(|t| format!(", timeout={t}s"))

@@ -73,6 +73,16 @@ impl ClaudeCodeRuntime {
     fn build_prompt(context: &StageContext) -> String {
         let mut prompt = context.rendered_prompt.clone();
 
+        // If there's verify feedback from a prior failed verification, prepend it
+        if let Some(ref feedback) = context.verify_feedback {
+            if !feedback.is_empty() {
+                prompt = format!(
+                    "Previous verification feedback (address these issues):\n{}\n\n---\n\n{}",
+                    feedback, prompt
+                );
+            }
+        }
+
         // If there's prior context, prepend it
         if let Some(ref prior) = context.prior_summary {
             if !prior.is_empty() && !prompt.contains(prior) {
@@ -196,7 +206,7 @@ fn extract_activity(line: &StreamLine) -> Option<String> {
                                             .or_else(|| input.get("pattern"))
                                             .or_else(|| input.get("command"))
                                             .and_then(|v| v.as_str())
-                                            .map(|s| truncate_chars(s, 60))
+                                            .map(|s| s.to_string())
                                     })
                                     .unwrap_or_default();
                                 if summary.is_empty() {
@@ -293,8 +303,6 @@ impl AgentRuntime for ClaudeCodeRuntime {
 
         cmd.arg("--model")
             .arg(&config.model)
-            .arg("--max-turns")
-            .arg(config.max_turns.to_string())
             .arg("--dangerously-skip-permissions")
             .arg("--append-system-prompt")
             .arg(&config.system_prompt);

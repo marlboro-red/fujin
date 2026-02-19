@@ -7,7 +7,7 @@ use std::time::Duration;
 /// All pipeline progress is communicated via these events. The runner
 /// always emits events through the provided `mpsc::UnboundedSender`.
 /// Consumers (CLI, TUI) decide how to render them.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum PipelineEvent {
     /// Pipeline execution has started.
     PipelineStarted {
@@ -34,6 +34,13 @@ pub enum PipelineEvent {
     /// Context is being built for a stage (summarization, template rendering).
     ContextBuilding {
         stage_index: usize,
+    },
+
+    /// The fully rendered context/prompt that a stage will receive.
+    StageContext {
+        stage_index: usize,
+        rendered_prompt: String,
+        prior_summary: Option<String>,
     },
 
     /// The agent is actively running for a stage.
@@ -99,5 +106,48 @@ pub enum PipelineEvent {
     /// The pipeline was cancelled by the user.
     PipelineCancelled {
         stage_index: usize,
+    },
+
+    /// A retry group is restarting after a stage failure.
+    RetryGroupAttempt {
+        group_name: String,
+        attempt: u32,
+        max_retries: u32,
+        first_stage_index: usize,
+        failed_stage_id: String,
+        error: String,
+    },
+
+    /// A retry group has exhausted its retries and is asking the user to continue.
+    RetryLimitReached {
+        group_name: String,
+        total_attempts: u32,
+        response_tx: tokio::sync::oneshot::Sender<bool>,
+    },
+
+    /// Verification commands are running for a retry group.
+    VerifyRunning {
+        group_name: String,
+        stage_index: usize,
+    },
+
+    /// All verification commands passed for a retry group.
+    VerifyPassed {
+        group_name: String,
+        stage_index: usize,
+    },
+
+    /// A verification command failed, causing the retry group to loop.
+    VerifyFailed {
+        group_name: String,
+        stage_index: usize,
+        /// The verification agent's full response text.
+        response: String,
+    },
+
+    /// Real-time activity from the verification agent.
+    VerifyActivity {
+        stage_index: usize,
+        activity: String,
     },
 }
