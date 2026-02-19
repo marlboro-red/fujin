@@ -4,10 +4,10 @@ use console::style;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
-use fujin_config::{PipelineConfig, validate};
+use fujin_config::{PipelineConfig, validate, KNOWN_RUNTIMES};
 use fujin_core::{
-    AgentRuntime, CheckpointManager, ClaudeCodeRuntime, PipelineRunner, RunOptions,
-    paths,
+    CheckpointManager, PipelineRunner, RunOptions,
+    create_runtime, paths,
     event::PipelineEvent,
     artifact::FileChangeKind,
     util::truncate_chars,
@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 /// fujin — AI Agent Pipeline CLI
 ///
-/// Execute multi-stage AI agent pipelines using Claude Code.
+/// Execute multi-stage AI agent pipelines using Claude Code or GitHub Copilot CLI.
 /// Run with no arguments to launch the interactive TUI.
 #[derive(Parser)]
 #[command(name = "fujin", version, about)]
@@ -267,7 +267,7 @@ fn spawn_cli_display(mut rx: mpsc::UnboundedReceiver<PipelineEvent>) {
                                 "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
                             ]),
                     );
-                    s.set_message(format!("Running {stage_id} with Claude Code..."));
+                    s.set_message(format!("Running {stage_id}..."));
                     s.enable_steady_tick(std::time::Duration::from_millis(100));
                     spinner = Some(s);
                 }
@@ -634,22 +634,37 @@ fn cmd_validate(config_path: PathBuf) -> Result<()> {
 }
 
 async fn cmd_agents(check: bool) -> Result<()> {
-    let runtime = ClaudeCodeRuntime::new();
-
     println!("{}", style("Agent Runtimes").bold());
     println!("{}", style("─".repeat(40)).dim());
 
+    let runtime_labels: HashMap<&str, &str> = HashMap::from([
+        ("claude-code", "Claude Code CLI"),
+        ("copilot-cli", "GitHub Copilot CLI"),
+    ]);
+
     if check {
-        print!("  Claude Code CLI... ");
-        match runtime.health_check().await {
-            Ok(()) => println!("{}", style("available").green()),
-            Err(e) => {
-                println!("{}", style("unavailable").red());
-                eprintln!("    {e}");
+        for name in KNOWN_RUNTIMES {
+            let label = runtime_labels.get(name).unwrap_or(name);
+            print!("  {label}... ");
+            match create_runtime(name) {
+                Ok(runtime) => match runtime.health_check().await {
+                    Ok(()) => println!("{}", style("available").green()),
+                    Err(e) => {
+                        println!("{}", style("unavailable").red());
+                        eprintln!("    {e}");
+                    }
+                },
+                Err(e) => {
+                    println!("{}", style("error").red());
+                    eprintln!("    {e}");
+                }
             }
         }
     } else {
-        println!("  • claude-code (Claude Code CLI)");
+        for name in KNOWN_RUNTIMES {
+            let label = runtime_labels.get(name).unwrap_or(name);
+            println!("  • {name} ({label})");
+        }
         println!("\n  Use --check to test availability.");
     }
 

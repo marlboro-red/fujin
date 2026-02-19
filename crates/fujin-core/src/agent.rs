@@ -29,6 +29,15 @@ pub trait AgentRuntime: Send + Sync {
     /// Human-readable name for this runtime.
     fn name(&self) -> &str;
 
+    /// Whether this runtime supports real-time streaming of tool-use activity.
+    ///
+    /// When `true`, the runtime emits detailed progress messages (tool names,
+    /// file paths) via `progress_tx`. When `false`, consumers should show a
+    /// generic "working..." indicator instead.
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
     /// Execute a stage: send prompt, let agent work, return result.
     ///
     /// `progress_tx` is an optional channel for streaming human-readable

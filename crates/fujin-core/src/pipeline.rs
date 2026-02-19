@@ -1,6 +1,7 @@
-use crate::agent::{AgentRuntime, ClaudeCodeRuntime};
+use crate::agent::AgentRuntime;
 use crate::checkpoint::CheckpointManager;
 use crate::context::ContextBuilder;
+use crate::create_runtime;
 use crate::error::{CoreError, CoreResult};
 use crate::event::PipelineEvent;
 use crate::stage::StageResult;
@@ -33,7 +34,11 @@ pub struct RunOptions {
 pub struct PipelineRunner {
     config: PipelineConfig,
     config_yaml: String,
+    /// Default runtime for the pipeline (from config `runtime` field).
     runtime: Box<dyn AgentRuntime>,
+    /// Additional runtimes for per-stage overrides, keyed by runtime name.
+    /// Pre-built during construction for all unique stage runtime overrides.
+    extra_runtimes: HashMap<String, Box<dyn AgentRuntime>>,
     context_builder: ContextBuilder,
     workspace: Workspace,
     checkpoint_manager: CheckpointManager,
@@ -44,6 +49,10 @@ pub struct PipelineRunner {
 impl PipelineRunner {
     /// Create a new pipeline runner.
     ///
+    /// Uses the `runtime` field from the pipeline config to select the default
+    /// agent runtime. Falls back to `claude-code` if the runtime is unknown.
+    /// Pre-builds any additional runtimes needed for per-stage overrides.
+    ///
     /// `event_tx` is required — all progress is communicated via events.
     pub fn new(
         config: PipelineConfig,
@@ -53,13 +62,29 @@ impl PipelineRunner {
     ) -> Self {
         let workspace = Workspace::new(workspace_root.clone());
         let checkpoint_manager = CheckpointManager::new(&workspace_root);
-        let runtime = Box::new(ClaudeCodeRuntime::new());
-        let context_builder = ContextBuilder::new();
+        let default_runtime_name = config.runtime.clone();
+        let runtime = create_runtime(&default_runtime_name)
+            .unwrap_or_else(|_| create_runtime("claude-code").unwrap());
+
+        // Pre-build any extra runtimes needed for per-stage overrides
+        let mut extra_runtimes: HashMap<String, Box<dyn AgentRuntime>> = HashMap::new();
+        for stage in &config.stages {
+            if let Some(ref rt_name) = stage.runtime {
+                if rt_name != &default_runtime_name && !extra_runtimes.contains_key(rt_name) {
+                    if let Ok(rt) = create_runtime(rt_name) {
+                        extra_runtimes.insert(rt_name.clone(), rt);
+                    }
+                }
+            }
+        }
+
+        let context_builder = ContextBuilder::with_runtime(default_runtime_name);
 
         Self {
             config,
             config_yaml,
             runtime,
+            extra_runtimes,
             context_builder,
             workspace,
             checkpoint_manager,
@@ -68,10 +93,23 @@ impl PipelineRunner {
         }
     }
 
-    /// Override the agent runtime (for testing or alternative runtimes).
+    /// Override the default agent runtime (for testing or alternative runtimes).
     pub fn with_runtime(mut self, runtime: Box<dyn AgentRuntime>) -> Self {
         self.runtime = runtime;
         self
+    }
+
+    /// Get the appropriate runtime for a stage.
+    ///
+    /// If the stage has a `runtime` override that differs from the default,
+    /// returns the pre-built override runtime. Otherwise returns the default.
+    fn runtime_for_stage(&self, stage_config: &StageConfig) -> &dyn AgentRuntime {
+        if let Some(ref runtime_name) = stage_config.runtime {
+            if let Some(rt) = self.extra_runtimes.get(runtime_name) {
+                return rt.as_ref();
+            }
+        }
+        self.runtime.as_ref()
     }
 
     /// Set a cancellation flag for cooperative cancellation.
@@ -561,8 +599,9 @@ impl PipelineRunner {
             }
         });
 
-        // Execute agent (with optional timeout)
-        let agent_future = self.runtime.execute(
+        // Execute agent (with optional timeout), using per-stage runtime if configured
+        let stage_runtime = self.runtime_for_stage(stage_config);
+        let agent_future = stage_runtime.execute(
             stage_config,
             &context,
             self.workspace.root(),
@@ -679,6 +718,7 @@ impl PipelineRunner {
         let verify_stage = StageConfig {
             id: format!("__verify_{}", stage_idx),
             name: "Verification".to_string(),
+            runtime: None,
             model: verify_cfg.model.clone(),
             system_prompt: verify_cfg.system_prompt.clone(),
             user_prompt: verify_cfg.user_prompt.clone(),
@@ -713,8 +753,9 @@ impl PipelineRunner {
             }
         });
 
-        // Execute with optional timeout
-        let agent_future = self.runtime.execute(
+        // Execute with optional timeout (verify uses default runtime)
+        let stage_runtime = self.runtime_for_stage(&verify_stage);
+        let agent_future = stage_runtime.execute(
             &verify_stage,
             &context,
             self.workspace.root(),

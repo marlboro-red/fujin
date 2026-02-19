@@ -1,0 +1,374 @@
+use crate::agent::{AgentOutput, AgentRuntime};
+use crate::context::StageContext;
+use crate::error::{CoreError, CoreResult};
+use async_trait::async_trait;
+use fujin_config::StageConfig;
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
+
+/// GitHub Copilot CLI agent runtime.
+///
+/// Spawns `copilot` as a subprocess for each stage using programmatic mode
+/// (`-p -s`). Copilot CLI handles file I/O and tool execution natively.
+///
+/// Note: Copilot CLI in programmatic mode does not provide structured JSON
+/// output or token usage data. The TUI will show generic progress instead
+/// of per-tool activity.
+pub struct CopilotCliRuntime {
+    /// Path to the `copilot` binary (defaults to "copilot").
+    copilot_bin: String,
+}
+
+impl CopilotCliRuntime {
+    pub fn new() -> Self {
+        Self {
+            copilot_bin: "copilot".to_string(),
+        }
+    }
+
+    pub fn with_binary(copilot_bin: String) -> Self {
+        Self { copilot_bin }
+    }
+
+    /// Build the rendered prompt combining system context and user prompt.
+    ///
+    /// Since Copilot CLI has no `--append-system-prompt` flag, the system
+    /// prompt is embedded directly into the user prompt.
+    fn build_prompt(config: &StageConfig, context: &StageContext) -> String {
+        let mut prompt = String::new();
+
+        // Embed system prompt as a preamble (Copilot CLI has no separate system prompt flag)
+        if !config.system_prompt.is_empty() {
+            prompt.push_str("<system>\n");
+            prompt.push_str(&config.system_prompt);
+            prompt.push_str("\n</system>\n\n");
+        }
+
+        // Add verify feedback if present
+        if let Some(ref feedback) = context.verify_feedback {
+            if !feedback.is_empty() {
+                prompt.push_str("Previous verification feedback (address these issues):\n");
+                prompt.push_str(feedback);
+                prompt.push_str("\n\n---\n\n");
+            }
+        }
+
+        // Add prior context
+        if let Some(ref prior) = context.prior_summary {
+            if !prior.is_empty() && !context.rendered_prompt.contains(prior) {
+                prompt.push_str("Context from previous stage:\n");
+                prompt.push_str(prior);
+                prompt.push_str("\n\n---\n\n");
+            }
+        }
+
+        prompt.push_str(&context.rendered_prompt);
+
+        // Append changed files list
+        if !context.changed_files.is_empty() {
+            let file_list = context
+                .changed_files
+                .iter()
+                .map(|p| format!("  - {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            prompt.push_str("\n\nFiles from previous stages:\n");
+            prompt.push_str(&file_list);
+        }
+
+        prompt
+    }
+
+    /// Build allowed tools flags for Copilot CLI.
+    ///
+    /// Copilot CLI uses `--allow-tool <name>` per tool (not comma-separated).
+    /// Tool name mapping differs from Claude Code.
+    fn build_tools_flags(allowed_tools: &[String]) -> Vec<String> {
+        if allowed_tools.is_empty() {
+            return vec!["--allow-all-tools".to_string()];
+        }
+
+        allowed_tools
+            .iter()
+            .flat_map(|t| {
+                let tool_name = match t.as_str() {
+                    "read" => "Read",
+                    "write" => "Write",
+                    "edit" => "Edit",
+                    "bash" => "shell",
+                    "glob" => "Glob",
+                    "grep" => "Grep",
+                    "notebook" => "NotebookEdit",
+                    other => other,
+                };
+                vec!["--allow-tool".to_string(), tool_name.to_string()]
+            })
+            .collect()
+    }
+}
+
+impl Default for CopilotCliRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Poll a cancel flag until it becomes true. Used with `tokio::select!`.
+async fn cancel_poll(flag: &Arc<AtomicBool>) {
+    loop {
+        if flag.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for CopilotCliRuntime {
+    fn name(&self) -> &str {
+        "copilot-cli"
+    }
+
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    async fn execute(
+        &self,
+        config: &StageConfig,
+        context: &StageContext,
+        workspace_root: &Path,
+        progress_tx: Option<mpsc::UnboundedSender<String>>,
+        cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> CoreResult<AgentOutput> {
+        let prompt = Self::build_prompt(config, context);
+
+        info!(
+            stage_id = %config.id,
+            model = %config.model,
+            "Executing stage with Copilot CLI"
+        );
+        debug!(prompt_length = prompt.len(), "Built prompt");
+
+        let mut cmd = Command::new(&self.copilot_bin);
+
+        // Programmatic mode with silent output
+        cmd.arg("-p").arg("-"); // Read prompt from stdin
+        cmd.arg("-s"); // Silent mode: clean output for scripting
+
+        cmd.arg("--model").arg(&config.model);
+
+        // Add tool permissions
+        let tools_flags = Self::build_tools_flags(&config.allowed_tools);
+        for flag in &tools_flags {
+            cmd.arg(flag);
+        }
+
+        cmd.current_dir(workspace_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        debug!(command = ?cmd, "Spawning Copilot CLI process");
+
+        let mut child = cmd.spawn().map_err(|e| CoreError::AgentError {
+            message: format!("Failed to spawn copilot process: {e}"),
+        })?;
+
+        // Pipe the prompt via stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(prompt.as_bytes()).await.map_err(|e| {
+                CoreError::AgentError {
+                    message: format!("Failed to write prompt to stdin: {e}"),
+                }
+            })?;
+            // Drop stdin to close it, signaling EOF
+        }
+
+        // Emit a generic activity message since Copilot CLI doesn't stream tool use
+        if let Some(ref tx) = progress_tx {
+            let _ = tx.send("Agent working...".to_string());
+        }
+
+        // Wait for completion, with cancellation support
+        let wait_result = if let Some(ref flag) = cancel_flag {
+            tokio::select! {
+                result = child.wait() => Some(result),
+                _ = cancel_poll(flag) => {
+                    let _ = child.kill().await;
+                    return Err(CoreError::Cancelled {
+                        stage_id: config.id.clone(),
+                    });
+                }
+            }
+        } else {
+            Some(child.wait().await)
+        };
+
+        let status = wait_result
+            .unwrap()
+            .map_err(|e| CoreError::AgentError {
+                message: format!("Failed to wait for copilot process: {e}"),
+            })?;
+
+        // Read stdout and stderr after process exits
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            use tokio::io::AsyncReadExt;
+            let _ = out.read_to_string(&mut stdout).await;
+        }
+        if let Some(mut err) = child.stderr.take() {
+            use tokio::io::AsyncReadExt;
+            let _ = err.read_to_string(&mut stderr).await;
+        }
+
+        if !status.success() {
+            warn!(
+                exit_code = ?status.code(),
+                stderr = %stderr,
+                "Copilot CLI process exited with non-zero status"
+            );
+            return Err(CoreError::AgentError {
+                message: format!(
+                    "Copilot CLI exited with status {}: {}",
+                    status,
+                    if stderr.is_empty() { &stdout } else { &stderr }
+                ),
+            });
+        }
+
+        debug!(stdout_len = stdout.len(), "Copilot CLI process completed");
+
+        let response_text = stdout.trim().to_string();
+
+        // Copilot CLI programmatic mode does not provide token usage
+        Ok(AgentOutput {
+            response_text,
+            token_usage: None,
+        })
+    }
+
+    async fn health_check(&self) -> CoreResult<()> {
+        let output = Command::new(&self.copilot_bin)
+            .arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| CoreError::RuntimeUnavailable {
+                runtime: self.name().to_string(),
+                reason: format!("Failed to run '{} --version': {e}", self.copilot_bin),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(CoreError::RuntimeUnavailable {
+                runtime: self.name().to_string(),
+                reason: format!("copilot --version failed: {stderr}"),
+            });
+        }
+
+        let version = String::from_utf8_lossy(&output.stdout);
+        info!(version = %version.trim(), "Copilot CLI is available");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_tools_flags_empty() {
+        let flags = CopilotCliRuntime::build_tools_flags(&[]);
+        assert_eq!(flags, vec!["--allow-all-tools"]);
+    }
+
+    #[test]
+    fn test_build_tools_flags_mapped() {
+        let tools = vec!["read".to_string(), "write".to_string(), "bash".to_string()];
+        let flags = CopilotCliRuntime::build_tools_flags(&tools);
+        assert_eq!(
+            flags,
+            vec![
+                "--allow-tool", "Read",
+                "--allow-tool", "Write",
+                "--allow-tool", "shell",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_tools_flags_passthrough() {
+        let tools = vec!["fetch".to_string(), "websearch".to_string()];
+        let flags = CopilotCliRuntime::build_tools_flags(&tools);
+        assert_eq!(
+            flags,
+            vec![
+                "--allow-tool", "fetch",
+                "--allow-tool", "websearch",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_with_system() {
+        let config = StageConfig {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            runtime: None,
+            model: "claude-sonnet-4".to_string(),
+            system_prompt: "You are a coding assistant.".to_string(),
+            user_prompt: "".to_string(),
+            timeout_secs: None,
+            allowed_tools: vec![],
+            commands: None,
+            retry_group: None,
+        };
+        let context = StageContext {
+            rendered_prompt: "Write hello world".to_string(),
+            prior_summary: None,
+            changed_files: vec![],
+            verify_feedback: None,
+        };
+
+        let prompt = CopilotCliRuntime::build_prompt(&config, &context);
+        assert!(prompt.contains("<system>"));
+        assert!(prompt.contains("You are a coding assistant."));
+        assert!(prompt.contains("</system>"));
+        assert!(prompt.contains("Write hello world"));
+    }
+
+    #[test]
+    fn test_build_prompt_no_system() {
+        let config = StageConfig {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            runtime: None,
+            model: "claude-sonnet-4".to_string(),
+            system_prompt: String::new(),
+            user_prompt: "".to_string(),
+            timeout_secs: None,
+            allowed_tools: vec![],
+            commands: None,
+            retry_group: None,
+        };
+        let context = StageContext {
+            rendered_prompt: "Write hello world".to_string(),
+            prior_summary: None,
+            changed_files: vec![],
+            verify_feedback: None,
+        };
+
+        let prompt = CopilotCliRuntime::build_prompt(&config, &context);
+        assert!(!prompt.contains("<system>"));
+        assert_eq!(prompt, "Write hello world");
+    }
+}
