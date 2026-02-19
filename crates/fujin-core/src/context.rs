@@ -28,20 +28,24 @@ pub struct StageContext {
 }
 
 /// Builds context for each stage, including template rendering and summarization.
+///
+/// The summarizer uses the pipeline's configured runtime to invoke the
+/// appropriate CLI tool for text summarization.
 pub struct ContextBuilder {
-    /// Path to the claude binary for summarization.
-    claude_bin: String,
+    /// Name of the runtime to use for summarization.
+    /// Determines which CLI binary and flags to use.
+    runtime_name: String,
 }
 
 impl ContextBuilder {
     pub fn new() -> Self {
         Self {
-            claude_bin: "claude".to_string(),
+            runtime_name: "claude-code".to_string(),
         }
     }
 
-    pub fn with_claude_bin(claude_bin: String) -> Self {
-        Self { claude_bin }
+    pub fn with_runtime(runtime_name: String) -> Self {
+        Self { runtime_name }
     }
 
     /// Build the context for a stage, incorporating prior results.
@@ -107,13 +111,21 @@ impl ContextBuilder {
         })
     }
 
-    /// Summarize text using the configured summarizer model via Claude CLI.
+    /// Summarize text using the configured summarizer model.
+    ///
+    /// Dispatches to the appropriate CLI tool based on the runtime name:
+    /// - `claude-code`: uses `claude --print --model <model>`
+    /// - `copilot-cli`: uses `copilot -p - -s --model <model>`
     async fn summarize(&self, config: &SummarizerConfig, text: &str) -> CoreResult<String> {
         if text.trim().is_empty() {
             return Ok(String::new());
         }
 
-        info!(model = %config.model, "Summarizing prior stage output");
+        info!(
+            model = %config.model,
+            runtime = %self.runtime_name,
+            "Summarizing prior stage output"
+        );
 
         let summarize_prompt = format!(
             "Summarize the following AI agent output concisely. Focus on what was accomplished, \
@@ -122,18 +134,35 @@ impl ContextBuilder {
             config.max_tokens, text
         );
 
-        // Pipe prompt via stdin to avoid OS argument length limits
-        let mut child = Command::new(&self.claude_bin)
-            .arg("--print")
-            .arg("--model")
-            .arg(&config.model)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| CoreError::ContextError {
-                message: format!("Failed to spawn summarizer: {e}"),
-            })?;
+        let mut child = match self.runtime_name.as_str() {
+            "copilot-cli" => {
+                Command::new("copilot")
+                    .arg("-p").arg("-")
+                    .arg("-s")
+                    .arg("--model").arg(&config.model)
+                    .arg("--allow-all-tools")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| CoreError::ContextError {
+                        message: format!("Failed to spawn copilot summarizer: {e}"),
+                    })?
+            }
+            _ => {
+                // Default: claude-code
+                Command::new("claude")
+                    .arg("--print")
+                    .arg("--model").arg(&config.model)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| CoreError::ContextError {
+                        message: format!("Failed to spawn claude summarizer: {e}"),
+                    })?
+            }
+        };
 
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;

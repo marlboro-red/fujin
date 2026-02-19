@@ -11,6 +11,11 @@ pub struct PipelineConfig {
     #[serde(default = "default_version")]
     pub version: String,
 
+    /// Default agent runtime for all stages (e.g., "claude-code", "copilot-cli").
+    /// Individual stages can override this with their own `runtime` field.
+    #[serde(default = "default_runtime")]
+    pub runtime: String,
+
     /// Template variables available in prompt rendering.
     #[serde(default)]
     pub variables: HashMap<String, String>,
@@ -106,7 +111,7 @@ pub struct VerifyConfig {
 
 /// Configuration for a single pipeline stage.
 ///
-/// A stage is either an **agent stage** (uses Claude Code with prompts) or a
+/// A stage is either an **agent stage** (uses an AI agent with prompts) or a
 /// **command stage** (runs a series of CLI commands). When `commands` is set,
 /// the stage is treated as a command stage and agent-specific fields
 /// (`system_prompt`, `user_prompt`, `model`, etc.) are ignored.
@@ -117,6 +122,12 @@ pub struct StageConfig {
 
     /// Human-readable stage name.
     pub name: String,
+
+    /// Agent runtime override for this specific stage.
+    /// When set, this stage uses the specified runtime instead of the pipeline default.
+    /// Valid values: "claude-code", "copilot-cli".
+    #[serde(default)]
+    pub runtime: Option<String>,
 
     /// Model to use for this stage (agent stages only).
     #[serde(default = "default_stage_model")]
@@ -134,7 +145,7 @@ pub struct StageConfig {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 
-    /// Which tools Claude Code can use in this stage (agent stages only).
+    /// Which tools the agent can use in this stage (agent stages only).
     #[serde(default = "default_allowed_tools")]
     pub allowed_tools: Vec<String>,
 
@@ -156,6 +167,13 @@ impl StageConfig {
     pub fn is_command_stage(&self) -> bool {
         self.commands.as_ref().is_some_and(|c| !c.is_empty())
     }
+}
+
+/// Known runtime identifiers.
+pub const KNOWN_RUNTIMES: &[&str] = &["claude-code", "copilot-cli"];
+
+fn default_runtime() -> String {
+    "claude-code".to_string()
 }
 
 fn default_version() -> String {

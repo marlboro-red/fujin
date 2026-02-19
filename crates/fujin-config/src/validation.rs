@@ -1,3 +1,4 @@
+use crate::pipeline_config::KNOWN_RUNTIMES;
 use crate::PipelineConfig;
 use std::collections::HashSet;
 
@@ -21,6 +22,15 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
     // Must have a name
     if config.name.trim().is_empty() {
         result.errors.push("Pipeline name must not be empty".to_string());
+    }
+
+    // Validate pipeline-level runtime
+    if !KNOWN_RUNTIMES.contains(&config.runtime.as_str()) {
+        result.warnings.push(format!(
+            "Unknown pipeline runtime '{}' (known: {})",
+            config.runtime,
+            KNOWN_RUNTIMES.join(", ")
+        ));
     }
 
     // Must have at least one stage
@@ -50,6 +60,17 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
             result
                 .errors
                 .push(format!("{prefix}: name must not be empty"));
+        }
+
+        // Validate per-stage runtime override
+        if let Some(ref runtime) = stage.runtime {
+            if !KNOWN_RUNTIMES.contains(&runtime.as_str()) {
+                result.warnings.push(format!(
+                    "{prefix}: unknown runtime '{}' (known: {})",
+                    runtime,
+                    KNOWN_RUNTIMES.join(", ")
+                ));
+            }
         }
 
         if stage.is_command_stage() {
