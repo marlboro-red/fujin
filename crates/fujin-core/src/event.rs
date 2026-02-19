@@ -97,6 +97,8 @@ pub enum PipelineEvent {
     PipelineCompleted {
         total_duration: Duration,
         stages_completed: usize,
+        /// Token usage aggregated by model name (sorted alphabetically).
+        token_usage_by_model: Vec<(String, TokenUsage)>,
     },
 
     /// The pipeline failed.

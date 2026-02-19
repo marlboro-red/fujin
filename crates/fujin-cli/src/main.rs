@@ -335,6 +335,7 @@ fn spawn_cli_display(mut rx: mpsc::UnboundedReceiver<PipelineEvent>) {
                 PipelineEvent::PipelineCompleted {
                     total_duration,
                     stages_completed,
+                    token_usage_by_model,
                 } => {
                     println!("{}", style("─".repeat(60)).dim());
                     println!(
@@ -343,6 +344,31 @@ fn spawn_cli_display(mut rx: mpsc::UnboundedReceiver<PipelineEvent>) {
                         total_duration.as_secs_f64(),
                         stages_completed
                     );
+
+                    if !token_usage_by_model.is_empty() {
+                        println!();
+                        println!("  {}", style("Token usage by model:").bold());
+                        let mut total_in: u64 = 0;
+                        let mut total_out: u64 = 0;
+                        for (model, usage) in &token_usage_by_model {
+                            total_in += usage.input_tokens;
+                            total_out += usage.output_tokens;
+                            println!(
+                                "    {} {:>10} in / {:>10} out",
+                                style(format!("{:<30}", model)).cyan(),
+                                usage.input_tokens,
+                                usage.output_tokens,
+                            );
+                        }
+                        if token_usage_by_model.len() > 1 {
+                            println!(
+                                "    {} {:>10} in / {:>10} out",
+                                style(format!("{:<30}", "Total")).bold(),
+                                total_in,
+                                total_out,
+                            );
+                        }
+                    }
                 }
 
                 PipelineEvent::PipelineFailed { error } => {

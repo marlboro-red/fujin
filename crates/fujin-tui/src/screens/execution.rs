@@ -87,6 +87,8 @@ pub struct ExecutionState {
     /// Cumulative token usage.
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    /// Per-model token breakdown (populated on pipeline completion).
+    pub token_usage_by_model: Vec<(String, TokenUsage)>,
     /// Whether the pipeline has finished (success or failure).
     pub finished: bool,
     /// Final status message.
@@ -155,6 +157,7 @@ impl ExecutionState {
             final_elapsed: None,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            token_usage_by_model: Vec::new(),
             finished: false,
             final_message: None,
             spinner_frame: 0,
@@ -420,9 +423,11 @@ impl ExecutionState {
             PipelineEvent::PipelineCompleted {
                 total_duration,
                 stages_completed,
+                token_usage_by_model,
             } => {
                 self.finished = true;
                 self.final_elapsed = Some(self.start_time.elapsed());
+                self.token_usage_by_model = token_usage_by_model;
                 self.final_message = Some(format!(
                     "Pipeline complete in {:.1}s \u{2014} {} stages executed",
                     total_duration.as_secs_f64(),
@@ -636,15 +641,28 @@ impl ExecutionState {
         self.detail_scroll_pinned = true;
     }
 
+    /// Compute how many lines the footer needs.
+    fn footer_height(&self) -> u16 {
+        // 1 line for separator + 1 line for controls/total
+        let base: u16 = 2;
+        if self.finished && self.token_usage_by_model.len() > 1 {
+            // Per-model lines + total line
+            base + self.token_usage_by_model.len() as u16 + 1
+        } else {
+            base
+        }
+    }
+
     /// Render the execution screen.
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let footer_h = self.footer_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2), // header
-                Constraint::Length(1), // progress bar
-                Constraint::Min(0),    // main content
-                Constraint::Length(2), // footer
+                Constraint::Length(2),      // header
+                Constraint::Length(1),      // progress bar
+                Constraint::Min(0),        // main content
+                Constraint::Length(footer_h), // footer
             ])
             .split(area);
 
@@ -1313,10 +1331,20 @@ impl ExecutionState {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // separator
+        if self.finished && self.token_usage_by_model.len() > 1 {
+            // Per-model lines + total line
+            for _ in 0..self.token_usage_by_model.len() + 1 {
+                constraints.push(Constraint::Length(1));
+            }
+        }
+        constraints.push(Constraint::Length(1)); // controls line
+
         let sub = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .constraints(constraints)
             .split(area);
+
         let sep = Block::default()
             .borders(Borders::TOP)
             .border_style(Style::default().fg(theme::BORDER));
@@ -1337,20 +1365,87 @@ impl ExecutionState {
             return;
         }
 
-        let mut spans = vec![
-            Span::raw("  "),
-            Span::styled("Tokens: ", Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled(
-                format!(
-                    "{} in / {} out",
-                    format_number(self.total_input_tokens),
-                    format_number(self.total_output_tokens)
+        // Per-model token breakdown (only when finished and >1 model)
+        let controls_row = if self.finished && self.token_usage_by_model.len() > 1 {
+            for (i, (model, usage)) in self.token_usage_by_model.iter().enumerate() {
+                let model_short = theme::shorten_model(model);
+                let line = Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("{:<16}", model_short),
+                        Style::default().fg(theme::ACCENT),
+                    ),
+                    Span::styled(
+                        format!("{:>8} in", format_number(usage.input_tokens)),
+                        Style::default().fg(theme::TOKEN_LABEL),
+                    ),
+                    Span::styled(" / ", Style::default().fg(theme::TEXT_MUTED)),
+                    Span::styled(
+                        format!("{:>8} out", format_number(usage.output_tokens)),
+                        Style::default().fg(theme::TOKEN_LABEL),
+                    ),
+                ]);
+                frame.render_widget(Paragraph::new(line), sub[1 + i]);
+            }
+            // Total line
+            let total_line = Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    format!("{:<16}", "Total"),
+                    Style::default()
+                        .fg(theme::TEXT_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Style::default().fg(theme::TOKEN_LABEL),
-            ),
-        ];
+                Span::styled(
+                    format!("{:>8} in", format_number(self.total_input_tokens)),
+                    Style::default().fg(theme::TOKEN_LABEL).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" / ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(
+                    format!("{:>8} out", format_number(self.total_output_tokens)),
+                    Style::default().fg(theme::TOKEN_LABEL).add_modifier(Modifier::BOLD),
+                ),
+            ]);
+            let total_idx = 1 + self.token_usage_by_model.len();
+            frame.render_widget(Paragraph::new(total_line), sub[total_idx]);
+            total_idx + 1
+        } else {
+            1 // controls go in sub[1]
+        };
 
-        spans.push(Span::raw("    "));
+        // Controls line
+        let mut spans = vec![Span::raw("  ")];
+
+        // Show inline total when not showing per-model breakdown
+        if !self.finished || self.token_usage_by_model.len() <= 1 {
+            spans.push(Span::styled("Tokens: ", Style::default().fg(theme::TEXT_MUTED)));
+            if self.token_usage_by_model.len() == 1 {
+                let (model, usage) = &self.token_usage_by_model[0];
+                let model_short = theme::shorten_model(model);
+                spans.push(Span::styled(
+                    format!("{model_short}: "),
+                    Style::default().fg(theme::ACCENT),
+                ));
+                spans.push(Span::styled(
+                    format!(
+                        "{} in / {} out",
+                        format_number(usage.input_tokens),
+                        format_number(usage.output_tokens)
+                    ),
+                    Style::default().fg(theme::TOKEN_LABEL),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!(
+                        "{} in / {} out",
+                        format_number(self.total_input_tokens),
+                        format_number(self.total_output_tokens)
+                    ),
+                    Style::default().fg(theme::TOKEN_LABEL),
+                ));
+            }
+            spans.push(Span::raw("    "));
+        }
 
         if self.detail_focused {
             spans.push(Span::styled("[Esc]", Style::default().fg(theme::ACCENT)));
@@ -1395,7 +1490,7 @@ impl ExecutionState {
         ));
 
         let footer = Line::from(spans);
-        frame.render_widget(Paragraph::new(footer), sub[1]);
+        frame.render_widget(Paragraph::new(footer), sub[controls_row]);
     }
 }
 
@@ -1693,6 +1788,7 @@ mod tests {
         state.handle_pipeline_event(PipelineEvent::PipelineCompleted {
             total_duration: Duration::from_secs(30),
             stages_completed: 3,
+            token_usage_by_model: vec![],
         });
 
         assert!(state.finished);

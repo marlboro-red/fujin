@@ -1,6 +1,12 @@
 # fujin
 
-A Rust CLI tool that orchestrates multi-stage AI agent pipelines using [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Define stages in YAML, and `fujin` executes them sequentially — each stage gets a fresh Claude Code context, operates directly on the current directory, and passes summarized results to the next stage.
+A Rust CLI tool that orchestrates multi-stage AI agent pipelines. Define stages in YAML, and `fujin` executes them sequentially — each stage gets a fresh agent context, operates directly on the current directory, and passes summarized results to the next stage.
+
+Fujin supports multiple agent runtimes:
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** — the default runtime, with structured JSON output and streaming progress
+- **[GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli)** — an alternative runtime using Copilot's programmatic mode
+
+You can choose a runtime per-pipeline or per-stage, and mix runtimes in the same pipeline.
 
 ## How It Works
 
@@ -22,7 +28,10 @@ Claude Code handles all file I/O, bash execution, and tool use natively. The pip
 
 ## Installation
 
-Requires [Rust](https://rustup.rs/) and the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code).
+Requires [Rust](https://rustup.rs/) and at least one agent runtime:
+
+- **Claude Code CLI** — `npm install -g @anthropic-ai/claude-code` ([docs](https://docs.anthropic.com/en/docs/claude-code))
+- **GitHub Copilot CLI** — `npm install -g @github/copilot` ([docs](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli))
 
 ```bash
 # Clone and build
@@ -37,7 +46,7 @@ cp target/release/fujin ~/.local/bin/
 Verify setup:
 
 ```bash
-fujin agents --check
+fujin agents --check    # checks all installed runtimes
 ```
 
 ## Quick Start
@@ -86,6 +95,55 @@ stages:
       - "read"
       - "bash"
 ```
+
+### Agent Runtimes
+
+By default, pipelines use Claude Code. Set the `runtime` field to choose a different agent runtime:
+
+```yaml
+name: "My Pipeline"
+runtime: "copilot-cli"    # use GitHub Copilot CLI for all stages
+
+stages:
+  - id: "codegen"
+    name: "Generate Code"
+    model: "claude-sonnet-4"    # use Copilot CLI model names
+    system_prompt: |
+      You are an expert developer.
+    user_prompt: |
+      Create a project.
+    allowed_tools:
+      - "write"
+      - "read"
+      - "bash"
+```
+
+You can also override the runtime per-stage to mix runtimes in the same pipeline:
+
+```yaml
+name: "Mixed Runtime Pipeline"
+runtime: "claude-code"    # default runtime
+
+stages:
+  - id: "codegen"
+    name: "Generate Code"
+    model: "claude-sonnet-4-6"
+    system_prompt: "You are an expert developer."
+    user_prompt: "Implement the feature."
+    allowed_tools: ["write", "read", "bash"]
+
+  - id: "review"
+    name: "Review Code"
+    runtime: "copilot-cli"    # override: use Copilot CLI for this stage
+    model: "gpt-5"
+    system_prompt: "You are a senior code reviewer."
+    user_prompt: "Review the code for correctness and style."
+    allowed_tools: ["read"]
+```
+
+Available runtimes: `claude-code` (default), `copilot-cli`.
+
+> **Note:** Model names differ between runtimes. Claude Code uses names like `claude-sonnet-4-6` while Copilot CLI uses `claude-sonnet-4`, `claude-haiku-4.5`, or `gpt-5`. Use the model names appropriate for the stage's runtime.
 
 A multi-stage pipeline passes context between stages automatically:
 
@@ -191,6 +249,7 @@ Run `fujin init --list` to see all available templates, or `fujin setup` to inst
 |-------|------|---------|-------------|
 | `name` | string | *required* | Pipeline name |
 | `version` | string | `"1.0"` | Config version |
+| `runtime` | string | `"claude-code"` | Default agent runtime (`claude-code` or `copilot-cli`) |
 | `variables` | map | `{}` | Template variables for prompts |
 | `summarizer` | object | see below | Inter-stage summarizer settings |
 | `stages` | list | *required* | Pipeline stages (at least 1) |
@@ -215,13 +274,16 @@ Run `fujin init --list` to see all available templates, or `fujin setup` to inst
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `model` | string | `"claude-sonnet-4-6"` | Claude model to use |
+| `runtime` | string | pipeline default | Override runtime for this stage |
+| `model` | string | `"claude-sonnet-4-6"` | Model to use (names vary by runtime) |
 | `system_prompt` | string | *required* | System prompt for the agent |
 | `user_prompt` | string | *required* | User prompt template |
 | `max_turns` | integer | `10` | Max agentic turns for Claude Code |
-| `allowed_tools` | list | `["read", "write"]` | Tools Claude Code can use |
+| `allowed_tools` | list | `["read", "write"]` | Tools the agent can use |
 
 **Allowed tools:** `read`, `write`, `edit`, `bash`, `glob`, `grep`, `notebook`
+
+Tool names are the same across runtimes — fujin maps them to runtime-specific names automatically (e.g., `bash` maps to `Bash` in Claude Code and `shell` in Copilot CLI).
 
 ### Template Variables
 
@@ -274,7 +336,7 @@ Check agent runtime availability.
 fujin agents [--check]
 
 Options:
-  --check    Run health checks (tests that `claude` CLI is installed and working)
+  --check    Run health checks on all installed runtimes (claude and copilot)
 ```
 
 ### `fujin init`
@@ -350,6 +412,7 @@ fujin/
 │   │       ├── pipeline.rs       # Pipeline execution loop
 │   │       ├── stage.rs          # Stage result types
 │   │       ├── agent.rs          # AgentRuntime trait + ClaudeCodeRuntime
+│   │       ├── copilot.rs       # CopilotCliRuntime (GitHub Copilot CLI)
 │   │       ├── artifact.rs       # File change tracking
 │   │       ├── workspace.rs      # Filesystem snapshot/diff
 │   │       ├── checkpoint.rs     # Checkpoint save/load/resume

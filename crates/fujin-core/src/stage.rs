@@ -9,6 +9,10 @@ pub struct StageResult {
     /// Stage ID from config.
     pub stage_id: String,
 
+    /// Model used for this stage (empty for command stages).
+    #[serde(default)]
+    pub model: String,
+
     /// The agent's text response.
     pub response_text: String,
 

@@ -4,7 +4,9 @@ This document covers everything you need to know to create fujin pipeline config
 
 ## Overview
 
-A fujin pipeline is a YAML file that defines a sequence of **stages**. Each stage invokes a Claude Code agent with a specific prompt, model, and set of tools. Stages execute sequentially — the output of one stage feeds into the next through automatic summarization and file change tracking. Models always run in the directory where `fujin` was invoked.
+A fujin pipeline is a YAML file that defines a sequence of **stages**. Each stage invokes an agent with a specific prompt, model, and set of tools. Stages execute sequentially — the output of one stage feeds into the next through automatic summarization and file change tracking. Agents always run in the directory where `fujin` was invoked.
+
+Fujin supports multiple agent runtimes — Claude Code (default) and GitHub Copilot CLI — which can be configured per-pipeline or per-stage.
 
 ## Where to put pipeline files
 
@@ -33,6 +35,7 @@ fujin run -c my-pipeline          # searches CWD then global configs dir
 ```yaml
 name: "My Pipeline"               # REQUIRED — human-readable name
 version: "1.0"                     # optional, default: "1.0"
+runtime: "claude-code"             # optional, default: "claude-code"
 variables:                         # optional, default: {}
   key: "value"
 summarizer:                        # optional, has defaults
@@ -49,6 +52,19 @@ A human-readable name for the pipeline. Displayed in the TUI and CLI output.
 #### `version` (optional, string)
 
 A version string for your config. Informational only. Default: `"1.0"`.
+
+#### `runtime` (optional, string)
+
+The default agent runtime for all stages. Default: `"claude-code"`.
+
+Available runtimes:
+
+| Runtime | Description |
+|---------|-------------|
+| `claude-code` | Claude Code CLI — structured JSON output, streaming progress, token tracking |
+| `copilot-cli` | GitHub Copilot CLI — programmatic mode (`copilot -p -s`), plain text output |
+
+Individual stages can override this with their own `runtime` field (see [Per-stage runtime selection](#per-stage-runtime-selection)).
 
 #### `variables` (optional, map)
 
@@ -81,6 +97,7 @@ An ordered list of stage configurations. Stages execute top-to-bottom. The pipel
 stages:
   - id: "codegen"                          # REQUIRED — unique identifier
     name: "Generate Code"                  # REQUIRED — display name
+    runtime: "copilot-cli"                 # optional — overrides pipeline default
     model: "claude-sonnet-4-6"             # optional, default: "claude-sonnet-4-6"
     system_prompt: |                       # REQUIRED — sets agent behavior
       You are an expert developer...
@@ -102,11 +119,17 @@ Good IDs are short, descriptive, and kebab-case: `"design"`, `"codegen"`, `"writ
 
 A human-readable name displayed in the TUI stage list and CLI output.
 
+#### `runtime` (optional, string)
+
+Override the pipeline-level runtime for this specific stage. When not set, the stage uses the pipeline's `runtime` value. See [Per-stage runtime selection](#per-stage-runtime-selection) for details.
+
 #### `model` (optional, string)
 
-The Claude model to use for this stage. Default: `"claude-sonnet-4-6"`.
+The model to use for this stage. Default: `"claude-sonnet-4-6"`.
 
-Available models:
+Model names differ between runtimes. Use the names appropriate for the stage's runtime:
+
+**Claude Code models:**
 
 | Model | Best for |
 |-------|----------|
@@ -114,11 +137,19 @@ Available models:
 | `claude-sonnet-4-6` | General-purpose coding, good balance of quality and speed |
 | `claude-haiku-4-5-20251001` | Fast, cheap tasks — summaries, simple edits, validation |
 
+**Copilot CLI models:**
+
+| Model | Best for |
+|-------|----------|
+| `claude-sonnet-4` | General-purpose coding (Copilot CLI default) |
+| `claude-haiku-4.5` | Fast, cheap tasks |
+| `gpt-5` | OpenAI model available through Copilot |
+
 You can mix models across stages. Use a powerful model for complex design work and a cheaper model for mechanical tasks.
 
 #### `system_prompt` (required, string)
 
-Sets the agent's persona and behavioral constraints. This is sent as the system prompt to Claude Code.
+Sets the agent's persona and behavioral constraints. With Claude Code, this is sent as the system prompt via `--append-system-prompt`. With Copilot CLI (which has no system prompt flag), it is automatically embedded into the user prompt.
 
 Tips:
 - Be specific about the agent's role: `"You are a senior Rust developer"` not `"You are helpful"`
@@ -132,19 +163,21 @@ The task prompt sent to the agent. This is where you describe what the stage sho
 
 #### `allowed_tools` (optional, list of strings)
 
-Controls which Claude Code tools the agent can use in this stage. Default: `["read", "write"]`.
+Controls which tools the agent can use in this stage. Default: `["read", "write"]`.
 
-Available tools:
+Use the same tool names regardless of runtime — fujin maps them to the correct runtime-specific names automatically:
 
-| Tool | Description |
-|------|-------------|
-| `read` | Read file contents |
-| `write` | Create or overwrite files |
-| `edit` | Make targeted edits to existing files |
-| `bash` | Run shell commands |
-| `glob` | Find files by pattern |
-| `grep` | Search file contents |
-| `notebook` | Edit Jupyter notebooks |
+| Tool | Claude Code | Copilot CLI | Description |
+|------|-------------|-------------|-------------|
+| `read` | `Read` | `Read` | Read file contents |
+| `write` | `Write` | `Write` | Create or overwrite files |
+| `edit` | `Edit` | `Edit` | Make targeted edits to existing files |
+| `bash` | `Bash` | `shell` | Run shell commands |
+| `glob` | `Glob` | `Glob` | Find files by pattern |
+| `grep` | `Grep` | `Grep` | Search file contents |
+| `notebook` | `NotebookEdit` | `NotebookEdit` | Edit Jupyter notebooks |
+
+Unknown tool names are passed through to the runtime unchanged.
 
 Restricting tools is useful for safety and focus:
 - A "design" stage might only need `read` + `write` (no shell access)
@@ -213,6 +246,80 @@ All stages share the same working directory (the directory where `fujin` was inv
 ### 3. Artifact variables
 
 `{{artifact_list}}` gives you a simple list of changed file paths. `{{all_artifacts}}` gives you the full content of those files inlined into the prompt. Use these when you want the next stage to explicitly see what the previous stage produced without needing to read files.
+
+---
+
+## Agent runtimes
+
+Fujin supports pluggable agent runtimes through its `AgentRuntime` trait. Each runtime wraps a different CLI tool as a subprocess backend for executing pipeline stages.
+
+### Claude Code (default)
+
+The default runtime. Uses `claude --print` with structured JSON output.
+
+- Full token usage tracking
+- Streaming tool-use activity in the TUI (shows which tools the agent is using in real time)
+- System prompt sent via `--append-system-prompt`
+- Requires an Anthropic API key or Claude Code authentication
+
+### GitHub Copilot CLI
+
+An alternative runtime using `copilot -p -s` (programmatic + silent mode).
+
+- No token usage tracking (always reports `None`)
+- No streaming progress — the TUI shows a generic "Agent working..." message instead of per-tool activity
+- System prompt is embedded into the user prompt (Copilot CLI has no system prompt flag)
+- Uses `--yolo` flag to skip interactive permission prompts
+- Requires GitHub authentication (`GH_TOKEN` / `GITHUB_TOKEN` / GitHub OAuth) with a Copilot subscription
+
+To use Copilot CLI, set `runtime: "copilot-cli"` at the pipeline level or on individual stages.
+
+### Per-stage runtime selection
+
+You can override the runtime on a per-stage basis. This lets you use different runtimes (and different models) for different stages in the same pipeline:
+
+```yaml
+name: "Mixed Runtime Pipeline"
+runtime: "claude-code"              # default for all stages
+
+stages:
+  - id: "design"
+    name: "Design Architecture"
+    model: "claude-opus-4-6"        # Claude Code model name
+    system_prompt: "You are a senior architect."
+    user_prompt: "Design the system."
+    allowed_tools: ["read", "write"]
+
+  - id: "implement"
+    name: "Implement Code"
+    runtime: "copilot-cli"          # override: use Copilot CLI
+    model: "gpt-5"                  # Copilot CLI model name
+    system_prompt: "You are an expert developer."
+    user_prompt: |
+      Previous stage summary: {{prior_summary}}
+      Implement the design.
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: "review"
+    name: "Code Review"
+    model: "claude-sonnet-4-6"      # back to Claude Code (pipeline default)
+    system_prompt: "You are a code reviewer."
+    user_prompt: |
+      Previous stage summary: {{prior_summary}}
+      Review the implementation.
+    allowed_tools: ["read"]
+```
+
+### Runtime feature comparison
+
+| Feature | Claude Code | Copilot CLI |
+|---------|-------------|-------------|
+| Token usage tracking | Yes | No |
+| Streaming tool activity | Yes | No (generic spinner) |
+| System prompt | Dedicated flag | Inlined into prompt |
+| Structured JSON output | Yes | Plain text |
+| Authentication | Anthropic API key | GitHub OAuth / `GH_TOKEN` |
+| Billing | Anthropic API usage | GitHub Copilot subscription |
 
 ---
 
@@ -328,6 +435,45 @@ stages:
       - "read"
 ```
 
+### Copilot CLI pipeline
+
+A pipeline using GitHub Copilot CLI as the runtime:
+
+```yaml
+name: "Copilot Code Generator"
+runtime: "copilot-cli"
+
+variables:
+  language: "typescript"
+  description: "A REST API with Express"
+
+stages:
+  - id: "codegen"
+    name: "Generate Code"
+    model: "claude-sonnet-4"
+    system_prompt: |
+      You are an expert {{language}} developer.
+    user_prompt: |
+      Create a {{language}} project: {{description}}
+    allowed_tools:
+      - "write"
+      - "read"
+      - "bash"
+
+  - id: "test"
+    name: "Write Tests"
+    model: "claude-sonnet-4"
+    system_prompt: |
+      You are a test engineer.
+    user_prompt: |
+      Previous stage summary: {{prior_summary}}
+      Write comprehensive tests for the project.
+    allowed_tools:
+      - "read"
+      - "write"
+      - "bash"
+```
+
 ### Review and refactor pipeline
 
 A pipeline that generates code and then reviews/improves it:
@@ -401,6 +547,7 @@ Fujin validates your pipeline config before execution. The following rules are e
 
 **Warnings** (reported but don't prevent execution):
 - Unknown tool names in `allowed_tools` (valid: `read`, `write`, `bash`, `edit`, `glob`, `grep`, `notebook`)
+- Unknown runtime name (valid: `claude-code`, `copilot-cli`)
 - First stage references `{{prior_summary}}` (will be empty)
 
 Validate without running:
@@ -450,3 +597,7 @@ fujin run -c pipeline.yaml --dry-run
 ```
 
 **Use variables for reusability.** Put project-specific values in `variables` so the same pipeline structure can be reused across projects with `--var` overrides.
+
+**Choose the right runtime.** Claude Code provides richer integration (streaming progress, token tracking), while Copilot CLI gives access to models like GPT-5 through a GitHub Copilot subscription. You can mix runtimes in the same pipeline — use per-stage `runtime` overrides to leverage the strengths of each.
+
+**Use runtime-appropriate model names.** Claude Code and Copilot CLI use different model name formats. Double-check that the `model` field matches the runtime that will execute that stage.

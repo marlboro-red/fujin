@@ -431,6 +431,7 @@ impl PipelineRunner {
             // 4. Build stage result
             let stage_result = StageResult {
                 stage_id: stage_config.id.clone(),
+                model: stage_config.model.clone(),
                 response_text,
                 artifacts,
                 summary: None, // Will be populated by context builder for next stage
@@ -585,9 +586,23 @@ impl PipelineRunner {
 
         let total_duration = pipeline_start.elapsed();
 
+        // Aggregate token usage by model
+        let mut by_model: HashMap<String, crate::stage::TokenUsage> = HashMap::new();
+        for result in &checkpoint.completed_stages {
+            if let Some(ref usage) = result.token_usage {
+                let entry = by_model.entry(result.model.clone()).or_default();
+                entry.input_tokens += usage.input_tokens;
+                entry.output_tokens += usage.output_tokens;
+            }
+        }
+        let mut token_usage_by_model: Vec<(String, crate::stage::TokenUsage)> =
+            by_model.into_iter().collect();
+        token_usage_by_model.sort_by(|a, b| a.0.cmp(&b.0));
+
         self.emit(PipelineEvent::PipelineCompleted {
             total_duration,
             stages_completed: checkpoint.completed_stages.len(),
+            token_usage_by_model,
         });
 
         Ok(checkpoint.completed_stages)
