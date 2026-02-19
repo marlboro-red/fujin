@@ -93,12 +93,11 @@ impl ContextBuilder {
         let all_artifacts = self.build_all_artifacts_var(&changed_files, workspace)?;
         vars.insert("all_artifacts".to_string(), all_artifacts);
 
-        // Add verify feedback if present
+        // Verify feedback is NOT injected as a template variable to avoid
+        // double injection — the agent runtime's build_prompt() prepends it
+        // automatically. We still store it on StageContext for the runtime.
         let verify_feedback_owned = verify_feedback.map(|s| s.to_string());
-        vars.insert(
-            "verify_feedback".to_string(),
-            verify_feedback_owned.clone().unwrap_or_default(),
-        );
+        vars.insert("verify_feedback".to_string(), String::new());
 
         // Render the user prompt template
         let rendered_prompt = render_template(&stage_config.user_prompt, &vars)?;

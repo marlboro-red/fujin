@@ -801,17 +801,21 @@ async fn test_retry_group_verify_fail_loops() {
     drop(runner);
     let events = event_handle.await.unwrap();
 
+    // With max_retries: 2 and the off-by-one fix (count > max_retries):
+    // Attempt 1: verify FAIL → count=1, 1 not > 2, retry
+    // Attempt 2: verify FAIL → count=2, 2 not > 2, retry
+    // Attempt 3: verify FAIL → count=3, 3 > 2, prompt user → user declines
     let verify_failed_count = events
         .iter()
         .filter(|e| matches!(e, PipelineEvent::VerifyFailed { .. }))
         .count();
-    assert!(verify_failed_count >= 1, "Expected at least one VerifyFailed event, got {verify_failed_count}");
+    assert_eq!(verify_failed_count, 3, "Expected 3 VerifyFailed events (max_retries=2 means 3 total attempts), got {verify_failed_count}");
 
     let retry_attempt_count = events
         .iter()
         .filter(|e| matches!(e, PipelineEvent::RetryGroupAttempt { .. }))
         .count();
-    assert!(retry_attempt_count >= 1, "Expected RetryGroupAttempt events from verify failures, got {retry_attempt_count}");
+    assert_eq!(retry_attempt_count, 2, "Expected 2 RetryGroupAttempt events (first 2 failures trigger retry), got {retry_attempt_count}");
 }
 
 // ---------------------------------------------------------------------------
@@ -820,19 +824,26 @@ async fn test_retry_group_verify_fail_loops() {
 
 use std::sync::Mutex;
 
+/// Captured context from a single agent invocation.
+#[derive(Debug, Clone)]
+struct CapturedCall {
+    rendered_prompt: String,
+    verify_feedback: Option<String>,
+}
+
 /// A stateful mock runtime that tracks call count and captures contexts.
 /// - Returns "FAIL" on the first verify call, "PASS" on the second.
-/// - Captures the rendered prompt from each call for inspection.
+/// - Captures the rendered prompt and verify_feedback from each call.
 struct FeedbackCaptureMock {
     call_count: Mutex<u32>,
-    captured_prompts: Arc<Mutex<Vec<String>>>,
+    captured_calls: Arc<Mutex<Vec<CapturedCall>>>,
 }
 
 impl FeedbackCaptureMock {
-    fn new(captured_prompts: Arc<Mutex<Vec<String>>>) -> Self {
+    fn new(captured_calls: Arc<Mutex<Vec<CapturedCall>>>) -> Self {
         Self {
             call_count: Mutex::new(0),
-            captured_prompts,
+            captured_calls,
         }
     }
 }
@@ -856,8 +867,11 @@ impl AgentRuntime for FeedbackCaptureMock {
         let call_num = *count;
         drop(count);
 
-        // Capture the rendered prompt
-        self.captured_prompts.lock().unwrap().push(context.rendered_prompt.clone());
+        // Capture the rendered prompt and verify feedback
+        self.captured_calls.lock().unwrap().push(CapturedCall {
+            rendered_prompt: context.rendered_prompt.clone(),
+            verify_feedback: context.verify_feedback.clone(),
+        });
 
         let _ = workspace_root;
 
@@ -927,11 +941,11 @@ stages:
     .to_string();
     let config = parse_config(&yaml);
 
-    let captured_prompts = Arc::new(Mutex::new(Vec::new()));
+    let captured_calls = Arc::new(Mutex::new(Vec::new()));
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
-        .with_runtime(Box::new(FeedbackCaptureMock::new(captured_prompts.clone())));
+        .with_runtime(Box::new(FeedbackCaptureMock::new(captured_calls.clone())));
 
     let options = RunOptions {
         resume: false,
@@ -943,20 +957,258 @@ stages:
     let results = runner.run(&options).await.expect("Pipeline should eventually succeed");
     assert_eq!(results.len(), 2, "Should have 2 completed stages");
 
-    let prompts = captured_prompts.lock().unwrap();
+    let calls = captured_calls.lock().unwrap();
 
     // Calls: code(1), test(2), verify->FAIL(3), code(4), test(5), verify->PASS(6)
-    // prompt[0] = first code run — no feedback
+    // calls[0] = first code run — no feedback
     assert!(
-        !prompts[0].contains("missing null checks"),
-        "First code run should NOT have verify feedback, got: {}",
-        prompts[0]
+        calls[0].verify_feedback.is_none(),
+        "First code run should NOT have verify feedback, got: {:?}",
+        calls[0].verify_feedback
     );
 
-    // prompt[3] = second code run (after FAIL) — should have feedback
+    // calls[3] = second code run (after FAIL) — should have feedback via StageContext.verify_feedback
+    let feedback = calls[3].verify_feedback.as_deref().unwrap_or("");
     assert!(
-        prompts[3].contains("missing null checks"),
-        "Second code run should contain verify feedback, got: {}",
-        prompts[3]
+        feedback.contains("missing null checks"),
+        "Second code run should contain verify feedback in context, got: {}",
+        feedback
+    );
+
+    // Verify that {{verify_feedback}} in the template is NOT populated (no double injection)
+    assert!(
+        !calls[3].rendered_prompt.contains("missing null checks"),
+        "Template variable {{{{verify_feedback}}}} should be empty (feedback delivered via build_prompt), got: {}",
+        calls[3].rendered_prompt
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stage failure feedback injection test
+// ---------------------------------------------------------------------------
+
+/// A mock runtime that fails the first time a specific stage runs, then succeeds.
+/// Captures verify_feedback on each call to check that failure feedback is injected.
+struct FailOnceMock {
+    fail_stage_id: String,
+    fail_count: Mutex<u32>,
+    max_failures: u32,
+    captured_calls: Arc<Mutex<Vec<CapturedCall>>>,
+}
+
+impl FailOnceMock {
+    fn new(fail_stage_id: &str, max_failures: u32, captured_calls: Arc<Mutex<Vec<CapturedCall>>>) -> Self {
+        Self {
+            fail_stage_id: fail_stage_id.to_string(),
+            fail_count: Mutex::new(0),
+            max_failures,
+            captured_calls,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for FailOnceMock {
+    fn name(&self) -> &str {
+        "fail-once-mock"
+    }
+
+    async fn execute(
+        &self,
+        config: &fujin_config::StageConfig,
+        context: &StageContext,
+        _workspace_root: &Path,
+        _progress_tx: Option<mpsc::UnboundedSender<String>>,
+        _cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> CoreResult<AgentOutput> {
+        self.captured_calls.lock().unwrap().push(CapturedCall {
+            rendered_prompt: context.rendered_prompt.clone(),
+            verify_feedback: context.verify_feedback.clone(),
+        });
+
+        if config.id == self.fail_stage_id {
+            let mut count = self.fail_count.lock().unwrap();
+            if *count < self.max_failures {
+                *count += 1;
+                return Err(CoreError::AgentError {
+                    message: "cargo test failed: test_foo FAILED assertion error".to_string(),
+                });
+            }
+        }
+
+        Ok(AgentOutput {
+            response_text: "Done.".to_string(),
+            token_usage: None,
+        })
+    }
+
+    async fn health_check(&self) -> CoreResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_stage_failure_feedback_injected_on_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // Two stages in a retry group, no verify agent. Stage "test" will fail once.
+    let yaml = r#"
+name: stage-failure-feedback
+retry_groups:
+  fix:
+    max_retries: 3
+stages:
+  - id: code
+    name: Write Code
+    model: mock-model
+    system_prompt: "You are helpful."
+    user_prompt: "Write code."
+    retry_group: fix
+  - id: test
+    name: Run Tests
+    model: mock-model
+    system_prompt: "You are helpful."
+    user_prompt: "Run tests."
+    retry_group: fix
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let captured_calls = Arc::new(Mutex::new(Vec::new()));
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    // "test" stage fails once, then succeeds
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(FailOnceMock::new("test", 1, captured_calls.clone())));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed after retry");
+    assert_eq!(results.len(), 2, "Should have 2 completed stages");
+
+    let calls = captured_calls.lock().unwrap();
+
+    // Calls: code(0), test(1)->FAIL, code(2), test(3)->OK
+    // calls[0] = first code run — no feedback
+    assert!(
+        calls[0].verify_feedback.is_none(),
+        "First code run should not have feedback"
+    );
+
+    // calls[2] = second code run (after test failure) — should have the failure error
+    let feedback = calls[2].verify_feedback.as_deref().unwrap_or("");
+    assert!(
+        feedback.contains("cargo test failed"),
+        "Retry code stage should receive stage failure feedback, got: {}",
+        feedback
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Retry count correctness test (off-by-one fix)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_retry_count_matches_max_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // max_retries: 1 means the pipeline should get 1 retry (2 total attempts)
+    let yaml = r#"
+name: retry-count-test
+retry_groups:
+  fix:
+    max_retries: 1
+    verify:
+      system_prompt: "You are a verifier."
+      user_prompt: "Check."
+stages:
+  - id: code
+    name: Write Code
+    model: mock-model
+    system_prompt: "You are helpful."
+    user_prompt: "Write code."
+    retry_group: fix
+  - id: test
+    name: Run Tests
+    model: mock-model
+    system_prompt: "You are helpful."
+    user_prompt: "Test code."
+    retry_group: fix
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    // Always returns FAIL for verify
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("Code is wrong. FAIL")));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let event_handle = tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let PipelineEvent::RetryLimitReached { response_tx, .. } = event {
+                let _ = response_tx.send(false);
+                continue;
+            }
+            events.push(event);
+        }
+        events
+    });
+
+    let result = runner.run(&options).await;
+    assert!(result.is_err(), "Pipeline should fail");
+
+    drop(runner);
+    let events = event_handle.await.unwrap();
+
+    // With max_retries=1:
+    // Attempt 1: verify FAIL → count=1, 1 not > 1, retry (RetryGroupAttempt emitted)
+    // Attempt 2: verify FAIL → count=2, 2 > 1, prompt user → decline
+    // So: 2 VerifyFailed events, 1 RetryGroupAttempt event
+    let verify_failed_count = events
+        .iter()
+        .filter(|e| matches!(e, PipelineEvent::VerifyFailed { .. }))
+        .count();
+    assert_eq!(
+        verify_failed_count, 2,
+        "max_retries=1 should allow 2 total attempts (1 original + 1 retry), got {verify_failed_count}"
+    );
+
+    let retry_attempt_count = events
+        .iter()
+        .filter(|e| matches!(e, PipelineEvent::RetryGroupAttempt { .. }))
+        .count();
+    assert_eq!(
+        retry_attempt_count, 1,
+        "max_retries=1 should produce exactly 1 RetryGroupAttempt, got {retry_attempt_count}"
     );
 }

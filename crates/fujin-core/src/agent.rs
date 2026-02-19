@@ -434,7 +434,33 @@ impl AgentRuntime for ClaudeCodeRuntime {
                 token_usage,
             })
         } else {
-            // Batch mode: wait for full output, with cancellation support
+            // Batch mode: drain stdout/stderr via spawned tasks BEFORE waiting,
+            // to avoid pipe buffer deadlock. If the child produces more output
+            // than the OS pipe buffer (~64KB), it blocks writing. Calling wait()
+            // before draining the pipes would deadlock.
+            let stdout_handle = {
+                let mut out = child.stdout.take();
+                tokio::spawn(async move {
+                    let mut buf = String::new();
+                    if let Some(ref mut stream) = out {
+                        use tokio::io::AsyncReadExt;
+                        let _ = stream.read_to_string(&mut buf).await;
+                    }
+                    buf
+                })
+            };
+            let stderr_handle = {
+                let mut err = child.stderr.take();
+                tokio::spawn(async move {
+                    let mut buf = String::new();
+                    if let Some(ref mut stream) = err {
+                        use tokio::io::AsyncReadExt;
+                        let _ = stream.read_to_string(&mut buf).await;
+                    }
+                    buf
+                })
+            };
+
             let wait_result = if let Some(ref flag) = cancel_flag {
                 tokio::select! {
                     result = child.wait() => Some(result),
@@ -455,17 +481,8 @@ impl AgentRuntime for ClaudeCodeRuntime {
                     message: format!("Failed to wait for claude process: {e}"),
                 })?;
 
-            // Read stdout and stderr after process exits
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-            if let Some(mut out) = child.stdout.take() {
-                use tokio::io::AsyncReadExt;
-                let _ = out.read_to_string(&mut stdout).await;
-            }
-            if let Some(mut err) = child.stderr.take() {
-                use tokio::io::AsyncReadExt;
-                let _ = err.read_to_string(&mut stderr).await;
-            }
+            let stdout = stdout_handle.await.unwrap_or_default();
+            let stderr = stderr_handle.await.unwrap_or_default();
 
             if !status.success() {
                 warn!(

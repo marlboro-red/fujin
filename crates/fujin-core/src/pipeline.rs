@@ -182,7 +182,7 @@ impl PipelineRunner {
         let count = retry_counts.entry(group_name.to_string()).or_insert(0);
         *count += 1;
 
-        if *count >= max_retries {
+        if *count > max_retries {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.emit(PipelineEvent::RetryLimitReached {
                 group_name: group_name.to_string(),
@@ -192,7 +192,9 @@ impl PipelineRunner {
 
             match rx.await {
                 Ok(true) => {
-                    *count = 0;
+                    // User granted another batch of retries. Reset to 1 so the
+                    // RetryGroupAttempt event below reports a sensible number.
+                    *count = 1;
                 }
                 _ => {
                     checkpoint.next_stage_index = stage_idx;
@@ -210,16 +212,17 @@ impl PipelineRunner {
                     return Err(CoreError::AgentError {
                         message: format!(
                             "Retry group '{}' exhausted after {} attempts: {}",
-                            group_name, *count, error_message
+                            group_name, max_retries, error_message
                         ),
                     });
                 }
             }
         }
 
+        let attempt = *count;
         self.emit(PipelineEvent::RetryGroupAttempt {
             group_name: group_name.to_string(),
-            attempt: *retry_counts.get(group_name).unwrap_or(&1),
+            attempt,
             max_retries,
             first_stage_index: first_idx,
             failed_stage_id: stage_id.to_string(),
@@ -360,12 +363,23 @@ impl PipelineRunner {
                             let group_config = self.config.retry_groups.get(group_name);
                             let max_retries = group_config.map_or(5, |g| g.max_retries);
 
+                            // Store the failure error as feedback so the retrying
+                            // agent stages know WHY the previous attempt failed.
+                            let error_msg = e.to_string();
+                            verify_feedback.insert(
+                                group_name.clone(),
+                                format!(
+                                    "Stage '{}' failed with error:\n{}",
+                                    stage_config.id, error_msg
+                                ),
+                            );
+
                             match self.handle_retry_group_failure(
                                 group_name,
                                 first_idx,
                                 stage_idx,
                                 &stage_config.id,
-                                &e.to_string(),
+                                &error_msg,
                                 max_retries,
                                 &mut retry_counts,
                                 &mut checkpoint,
@@ -426,7 +440,25 @@ impl PipelineRunner {
             };
 
             checkpoint.completed_stages.push(stage_result);
-            checkpoint.next_stage_index = stage_idx + 1;
+
+            // Determine if verification is pending before advancing the checkpoint.
+            // If this is the last stage in a retry group with a verify agent, we must
+            // NOT advance next_stage_index until verification passes — otherwise a
+            // crash during verification would skip it on resume.
+            let verify_pending = stage_config.retry_group.as_ref().and_then(|group_name| {
+                let &(_first, last) = retry_group_ranges.get(group_name.as_str())?;
+                if stage_idx != last { return None; }
+                let group_cfg = self.config.retry_groups.get(group_name)?;
+                group_cfg.verify.as_ref().map(|_| ())
+            }).is_some();
+
+            if verify_pending {
+                // Keep next_stage_index pointing at this stage so a crash during
+                // verification re-runs the last stage (and then verify) on resume.
+                checkpoint.next_stage_index = stage_idx;
+            } else {
+                checkpoint.next_stage_index = stage_idx + 1;
+            }
             checkpoint.updated_at = Utc::now();
 
             // 5. Save checkpoint
@@ -460,6 +492,11 @@ impl PipelineRunner {
                                             stage_index: stage_idx,
                                         });
                                         verify_feedback.remove(group_name);
+
+                                        // Verification passed — now safe to advance checkpoint
+                                        checkpoint.next_stage_index = stage_idx + 1;
+                                        checkpoint.updated_at = Utc::now();
+                                        self.checkpoint_manager.save(&checkpoint)?;
                                     } else {
                                         self.emit(PipelineEvent::VerifyFailed {
                                             group_name: group_name.clone(),
@@ -490,6 +527,17 @@ impl PipelineRunner {
                                     }
                                 }
                                 Err(e) => {
+                                    // Check if this is a cancellation — propagate properly
+                                    if matches!(&e, CoreError::Cancelled { .. }) {
+                                        checkpoint.next_stage_index = stage_idx;
+                                        checkpoint.updated_at = Utc::now();
+                                        let _ = self.checkpoint_manager.save(&checkpoint);
+                                        self.emit(PipelineEvent::PipelineCancelled {
+                                            stage_index: stage_idx,
+                                        });
+                                        return Err(e);
+                                    }
+
                                     // Agent execution error — treat as verify failure
                                     let error_msg = e.to_string();
                                     self.emit(PipelineEvent::VerifyFailed {
