@@ -84,7 +84,6 @@ stages:
       You are an expert {{language}} developer.
     user_prompt: |
       Create a project: {{description}}
-    max_turns: 15
     allowed_tools:
       - "write"
       - "read"
@@ -168,7 +167,6 @@ stages:
     user_prompt: |
       Previous stage summary: {{prior_summary}}
       Implement the project based on the architecture doc.
-    max_turns: 30
     allowed_tools: ["write", "read", "bash"]
 
   - id: "docs"
@@ -232,7 +230,7 @@ stages:
       - "cargo clippy -- -D warnings"
 ```
 
-When a stage has `commands`, the agent-specific fields (`system_prompt`, `user_prompt`, `model`, `max_turns`, `allowed_tools`) are ignored. Only `id`, `name`, `timeout_secs`, and `commands` apply.
+When a stage has `commands`, the agent-specific fields (`system_prompt`, `user_prompt`, `model`, `allowed_tools`) are ignored. Only `id`, `name`, `timeout_secs`, and `commands` apply.
 
 ### Conditional Execution
 
@@ -342,6 +340,7 @@ Run `fujin init --list` to see all available templates, or `fujin setup` to inst
 | `runtime` | string | `"claude-code"` | Default agent runtime (`claude-code` or `copilot-cli`) |
 | `variables` | map | `{}` | Template variables for prompts |
 | `summarizer` | object | see below | Inter-stage summarizer settings |
+| `retry_groups` | map | `{}` | Retry group definitions (see [Pipeline Authoring Guide](docs/pipeline-authoring.md)) |
 | `stages` | list | *required* | Pipeline stages (at least 1) |
 
 **Summarizer fields:**
@@ -357,7 +356,7 @@ Run `fujin init --list` to see all available templates, or `fujin setup` to inst
 |-------|------|---------|-------------|
 | `id` | string | *required* | Unique stage identifier |
 | `name` | string | *required* | Human-readable name |
-| `timeout_secs` | integer | `300` | Stage timeout in seconds |
+| `timeout_secs` | integer | — | Stage timeout in seconds (no limit if unset) |
 | `commands` | list | — | Shell commands to run (makes this a command stage) |
 
 **Agent stage fields** (ignored when `commands` is set):
@@ -368,7 +367,6 @@ Run `fujin init --list` to see all available templates, or `fujin setup` to inst
 | `model` | string | `"claude-sonnet-4-6"` | Model to use (names vary by runtime) |
 | `system_prompt` | string | *required* | System prompt for the agent |
 | `user_prompt` | string | *required* | User prompt template |
-| `max_turns` | integer | `10` | Max agentic turns for Claude Code |
 | `allowed_tools` | list | `["read", "write"]` | Tools the agent can use |
 
 **Conditional execution fields:**
@@ -446,13 +444,13 @@ Options:
 Create a new config from a template.
 
 ```
-fujin init [--template <NAME>] [-o <PATH>] [--list] [--global]
+fujin init [--template <NAME>] [-o <PATH>] [--list] [--local]
 
 Options:
   --template <NAME>    Template name (default: "simple")
   -o, --output <PATH>  Output file path (default: "pipeline.yaml")
   --list               List all available templates (built-in + user)
-  --global             Write output to the global configs directory
+  --local              Write output to the current directory instead of the global configs directory
 ```
 
 Templates are loaded from the data directory first (user-customizable), then from built-in defaults. Run `fujin setup` to install built-in templates locally.

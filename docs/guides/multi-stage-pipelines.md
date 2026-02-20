@@ -41,6 +41,8 @@ user_prompt: |
 
 **When to skip it:** When you need the exact wording or full output — use `{{stages.<id>.response}}` instead.
 
+**Auto-injection:** Even if you don't include `{{prior_summary}}` in your prompt template, the agent runtime automatically prepends a "Context from previous stage" section when prior output exists. Using `{{prior_summary}}` explicitly gives you control over _where_ it appears — the runtime detects it's already present and skips the automatic prepend.
+
 ### 2. File artifacts — `{{artifact_list}}` and `{{all_artifacts}}`
 
 Fujin tracks which files each stage creates, modifies, or deletes using `git status`.
@@ -89,11 +91,9 @@ stages:
   - id: "spec"
     name: "Write Spec"
     ...
-
   - id: "implement"
     name: "Implement"
     ...
-
   - id: "review"
     name: "Review"
     user_prompt: |
@@ -126,7 +126,6 @@ stages:
       that handles 10k concurrent WebSocket connections. Document
       the design in docs/architecture.md.
     allowed_tools: ["read", "write"]
-
   - id: "implement"
     name: "Implement Core"
     model: "claude-sonnet-4-6"         # Solid coding, good balance
@@ -137,7 +136,6 @@ stages:
       Architecture: {{prior_summary}}
       Read docs/architecture.md and implement the core modules.
     allowed_tools: ["read", "write", "edit", "bash"]
-    max_turns: 25
 
   - id: "tests"
     name: "Write Tests"
@@ -150,7 +148,6 @@ stages:
       Files: {{artifact_list}}
       Write tests and run them.
     allowed_tools: ["read", "write", "bash"]
-
   - id: "docs"
     name: "Write README"
     model: "claude-sonnet-4-6"         # Documentation doesn't need Opus
@@ -211,17 +208,6 @@ Common tool combinations by stage type:
 | Testing | `read`, `write`, `bash` | Writes test files, runs test commands |
 | Documentation | `read`, `write` | Creates markdown files |
 
-## Tuning max_turns
-
-The `max_turns` field controls how many agentic turns (tool calls + responses) the agent gets before being stopped. Default is 10.
-
-- **Design stages**: 10-15 turns (read some files, think, write a doc)
-- **Implementation stages**: 20-30 turns (create multiple files, run commands, iterate)
-- **Review stages**: 10-15 turns (read files, produce findings)
-- **Simple stages**: 5-10 turns (write one file, verify it)
-
-If a stage consistently runs out of turns, increase it. If an agent spends too many turns going in circles, your prompt may need to be more specific rather than giving it more turns.
-
 ## Mixing command stages and agent stages
 
 Command stages run shell commands directly, without an AI agent. They're perfect for deterministic build and test steps:
@@ -233,14 +219,12 @@ stages:
     system_prompt: "You are a Rust developer."
     user_prompt: "Add pagination to the list endpoint."
     allowed_tools: ["read", "write", "edit", "bash"]
-
   - id: "build"
     name: "Build and Test"
     commands:
       - "cargo build --release 2>&1"
       - "cargo test 2>&1"
       - "cargo clippy -- -D warnings 2>&1"
-
   - id: "fix"
     name: "Fix Issues"
     system_prompt: |
@@ -321,7 +305,6 @@ stages:
       - File upload handling approach
       - List of files to create/modify
     allowed_tools: ["read", "write", "glob", "grep"]
-
   - id: "backend"
     name: "Implement Backend"
     model: "claude-sonnet-4-6"
@@ -342,7 +325,6 @@ stages:
 
       Run `npm test` in server/ when done.
     allowed_tools: ["read", "write", "edit", "bash"]
-    max_turns: 25
 
   - id: "frontend"
     name: "Implement Frontend"
@@ -364,14 +346,12 @@ stages:
 
       Run `npm test` in client/ when done.
     allowed_tools: ["read", "write", "edit", "bash"]
-    max_turns: 25
 
   - id: "integration-test"
     name: "Run Full Test Suite"
     commands:
       - "cd server && npm test 2>&1"
       - "cd client && npm test 2>&1"
-
   - id: "review"
     name: "Code Review"
     model: "claude-opus-4-6"
@@ -389,7 +369,7 @@ stages:
 
       Fix any issues directly. Run the test suite again to verify.
     allowed_tools: ["read", "edit", "bash"]
-    max_turns: 20
+
 ```
 
 Key patterns in this example:
@@ -398,7 +378,7 @@ Key patterns in this example:
 - **`{{stages.plan.summary}}`** used in the frontend stage to reference the plan directly, not just the backend output
 - **Command stage** for integration tests — deterministic, no AI needed
 - **Review stage at the end** catches issues across all implementation stages
-- **Generous `max_turns`** for implementation stages (25) since they need to create multiple files and run tests
+- **Generous `timeout_secs`** can be set for complex implementation stages if you want a safety limit
 
 ## What to read next
 

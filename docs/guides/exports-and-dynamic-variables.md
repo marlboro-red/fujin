@@ -55,7 +55,6 @@ stages:
     allowed_tools: ["read", "glob", "grep"]
     exports:
       keys: [language, framework, pkg_manager, test_cmd]
-
   - id: "implement"
     name: "Add Feature"
     model: "claude-sonnet-4-6"
@@ -65,7 +64,6 @@ stages:
       Add a health check endpoint to this {{framework}} project.
       Follow the existing code patterns.
     allowed_tools: ["read", "write", "edit"]
-
   - id: "test"
     name: "Run Tests"
     commands:
@@ -162,7 +160,6 @@ stages:
       Detect the actual tech stack and write to {{exports_file}}.
     exports:
       keys: [language, framework]
-
   - id: "implement"
     name: "Implement"
     system_prompt: "You are a {{language}} developer using {{framework}}."
@@ -180,13 +177,11 @@ stages:
     exports:
       keys: [language, framework]
     # Writes: {"language": "rust", "framework": "actix-web"}
-
   - id: "analyze"
     exports:
       keys: [framework, db_type]
     # Writes: {"framework": "axum", "db_type": "postgres"}
     # Now framework="axum" (overrides "actix-web"), db_type="postgres"
-
   - id: "implement"
     # Sees: language="rust", framework="axum", db_type="postgres"
 ```
@@ -206,7 +201,6 @@ stages:
       {"build_cmd": "...", "test_cmd": "...", "lint_cmd": "..."}
     exports:
       keys: [build_cmd, test_cmd, lint_cmd]
-
   - id: "build"
     name: "Build and Test"
     commands:
@@ -259,7 +253,6 @@ stages:
     allowed_tools: ["read", "glob", "grep"]
     exports:
       keys: [source_language, source_framework, endpoint_count, db_layer, auth_method, complexity]
-
   - id: "scaffold"
     name: "Scaffold Target Project"
     model: "claude-sonnet-4-6"
@@ -279,7 +272,6 @@ stages:
 
       Don't implement business logic yet — just create the skeleton.
     allowed_tools: ["read", "write", "bash"]
-    max_turns: 20
 
   - id: "migrate"
     name: "Migrate Business Logic"
@@ -299,7 +291,6 @@ stages:
 
       Work through endpoints methodically. Run tests as you go.
     allowed_tools: ["read", "write", "edit", "bash"]
-    max_turns: 30
 
   - id: "verify"
     name: "Verify Migration"
@@ -337,14 +328,12 @@ stages:
     allowed_tools: ["read", "glob"]
     exports:
       keys: [build_cmd, test_cmd, lint_cmd, has_docker, node_version]
-
   - id: "build-and-test"
     name: "Build and Test"
     commands:
       - "{{build_cmd}} 2>&1"
       - "{{test_cmd}} 2>&1"
       - "{{lint_cmd}} 2>&1"
-
   - id: "fix-issues"
     name: "Fix Any Failures"
     system_prompt: |

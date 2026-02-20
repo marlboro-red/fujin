@@ -26,14 +26,12 @@ stages:
       Read the relevant source files, then implement the feature.
       Write tests alongside the implementation.
     allowed_tools: ["read", "write", "edit", "bash", "glob", "grep"]
-    max_turns: 25
 
   - id: "test"
     name: "Run Tests"
     commands:
       - "cargo test 2>&1"
       - "cargo clippy -- -D warnings 2>&1"
-
   - id: "fix"
     name: "Fix Failures"
     model: "claude-sonnet-4-6"
@@ -48,7 +46,7 @@ stages:
       Fix all compilation errors, test failures, and clippy warnings.
       Run `cargo test` and `cargo clippy` after each fix to verify.
     allowed_tools: ["read", "edit", "bash"]
-    max_turns: 15
+
 ```
 
 **When to use:** Any time you want deterministic build/test feedback between implementation and refinement. The command stage is free (no API call) and gives the fix stage exact error messages to work with.
@@ -80,7 +78,6 @@ stages:
       - A usage example in cmd/example/main.go
       - A README.md
     allowed_tools: ["write", "read", "bash"]
-    max_turns: 20
 
   - id: "review"
     name: "Senior Review"
@@ -103,7 +100,6 @@ stages:
 
       Read each file, identify issues, and fix them. Then run the tests.
     allowed_tools: ["read", "edit", "bash"]
-    max_turns: 20
 
   - id: "verify"
     name: "Final Verification"
@@ -149,7 +145,6 @@ stages:
       - Security considerations (token generation, expiration, rate limiting)
       - Migration steps
     allowed_tools: ["read", "write", "glob", "grep"]
-
   - id: "implement"
     name: "Implement from Spec"
     model: "claude-sonnet-4-6"
@@ -168,7 +163,6 @@ stages:
 
       Write tests for each API endpoint. Run the full test suite when done.
     allowed_tools: ["read", "write", "edit", "bash", "glob"]
-    max_turns: 30
 
   - id: "document"
     name: "Write User Docs"
@@ -227,7 +221,6 @@ stages:
     allowed_tools: ["read", "glob", "grep"]
     exports:
       keys: [language, framework, build_cmd, test_cmd, lint_cmd, src_dir, test_dir]
-
   - id: "improve"
     name: "Improve Code Quality"
     model: "claude-sonnet-4-6"
@@ -245,7 +238,6 @@ stages:
       - Simplify overly complex functions
       - Add missing input validation on public APIs
     allowed_tools: ["read", "edit", "glob", "grep"]
-    max_turns: 20
 
   - id: "verify"
     name: "Build and Test"
@@ -281,7 +273,6 @@ stages:
       VERDICT: NEEDS_TESTS — if coverage has significant gaps
       VERDICT: ADEQUATE — if coverage is reasonable
     allowed_tools: ["read", "glob", "grep"]
-
   - id: "write-tests"
     name: "Write Missing Tests"
     when:
@@ -299,7 +290,6 @@ stages:
 
       Write tests to close the gaps. Run them to verify they pass.
     allowed_tools: ["read", "write", "bash"]
-    max_turns: 20
 
   - id: "format"
     name: "Format"
@@ -330,7 +320,6 @@ stages:
       Problem: {{problem}}
       Write a detailed technical design.
     allowed_tools: ["read", "write"]
-
   - id: "approach-b"
     name: "Approach B (Copilot/GPT)"
     runtime: "copilot-cli"
@@ -343,7 +332,6 @@ stages:
       Problem: {{problem}}
       Write a detailed technical design.
     allowed_tools: ["read", "write"]
-
   - id: "evaluate"
     name: "Evaluate and Choose"
     model: "claude-opus-4-6"
@@ -385,7 +373,6 @@ stages:
       - "cargo test 2>&1"
       - "cargo clippy -- -D warnings 2>&1"
       - "cargo fmt --check 2>&1"
-
   - id: "fix"
     name: "Fix Issues"
     model: "claude-sonnet-4-6"
@@ -399,7 +386,6 @@ stages:
       If there are failures, fix them. Then re-run the checks.
       If everything passed, skip to confirming all checks pass.
     allowed_tools: ["read", "edit", "bash"]
-    max_turns: 15
 
   - id: "changelog"
     name: "Write Changelog Entry"
@@ -458,7 +444,6 @@ stages:
     allowed_tools: ["read", "glob", "grep", "write"]
     exports:
       keys: [total_files, total_instances]
-
   - id: "migrate"
     name: "Apply Migration"
     model: "claude-sonnet-4-6"
@@ -477,14 +462,12 @@ stages:
       Read docs/migration-plan.md for the full list.
       Migrate each file. Run the test suite periodically to catch regressions.
     allowed_tools: ["read", "edit", "bash", "glob"]
-    max_turns: 30
 
   - id: "verify"
     name: "Full Verification"
     commands:
       - "npm test 2>&1"
       - "npm run lint 2>&1"
-
   - id: "review"
     name: "Review Migration"
     model: "claude-sonnet-4-6"
@@ -530,7 +513,6 @@ stages:
       prompt: "What refactoring strategy is most appropriate?"
       routes: [extract-module, simplify-logic, dedup, restructure]
       default: simplify-logic
-
   - id: "extract"
     name: "Extract Module"
     on_branch: "extract-module"
@@ -542,7 +524,6 @@ stages:
       Analysis: {{stages.analyze.summary}}
       Extract well-defined modules with clear interfaces.
     allowed_tools: ["read", "write", "edit", "bash"]
-    max_turns: 25
 
   - id: "simplify"
     name: "Simplify Logic"
@@ -555,7 +536,6 @@ stages:
       Analysis: {{stages.analyze.summary}}
       Simplify the complex functions identified in the analysis.
     allowed_tools: ["read", "edit", "bash"]
-    max_turns: 20
 
   - id: "dedup"
     name: "Remove Duplication"
@@ -569,7 +549,6 @@ stages:
       Analysis: {{stages.analyze.summary}}
       Deduplicate the repeated code patterns.
     allowed_tools: ["read", "edit", "bash"]
-    max_turns: 20
 
   - id: "restructure"
     name: "Restructure"
@@ -583,7 +562,6 @@ stages:
       Analysis: {{stages.analyze.summary}}
       Restructure the module. Keep the public API stable.
     allowed_tools: ["read", "write", "edit", "bash"]
-    max_turns: 30
 
   - id: "test"
     name: "Verify Refactor"
@@ -624,7 +602,6 @@ stages:
 
       Create docs/codebase-map.md with your findings.
     allowed_tools: ["read", "glob", "grep", "write"]
-
   - id: "readme"
     name: "Write README"
     model: "claude-sonnet-4-6"
@@ -644,7 +621,6 @@ stages:
       - CLI reference (if applicable)
       - Development setup
     allowed_tools: ["read", "write"]
-
   - id: "api-docs"
     name: "Write API Documentation"
     model: "claude-sonnet-4-6"
@@ -664,7 +640,6 @@ stages:
       - Error cases
       - Code examples
     allowed_tools: ["read", "write", "glob"]
-
   - id: "examples"
     name: "Write Examples"
     model: "claude-sonnet-4-6"

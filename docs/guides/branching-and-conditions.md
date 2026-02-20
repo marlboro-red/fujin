@@ -36,7 +36,6 @@ stages:
       VERDICT: NEEDS_TESTS — if significant gaps exist
       VERDICT: ADEQUATE — if coverage is reasonable
     allowed_tools: ["read", "glob", "grep"]
-
   - id: "write-tests"
     name: "Write Missing Tests"
     when:
@@ -56,7 +55,6 @@ stages:
 
       Run the tests to verify they pass.
     allowed_tools: ["read", "write", "bash"]
-
   - id: "lint"
     name: "Lint and Format"
     commands:
@@ -102,7 +100,6 @@ stages:
       SECURITY_STATUS: PASS — if no CRITICAL or HIGH issues
       SECURITY_STATUS: FAIL — if any CRITICAL or HIGH issues exist
     allowed_tools: ["read", "glob", "grep", "bash"]
-
   - id: "fix-security"
     name: "Fix Security Issues"
     when:
@@ -116,7 +113,6 @@ stages:
       Security audit findings: {{stages.security-scan.summary}}
       Fix all CRITICAL and HIGH severity issues.
     allowed_tools: ["read", "edit", "bash"]
-
   - id: "deploy-prep"
     name: "Prepare Deployment"
     when:
@@ -173,7 +169,6 @@ stages:
         Choose the route that best matches.
       routes: [rust-actix, node-express, python-flask, go-chi]
       default: node-express
-
   - id: "rust-impl"
     name: "Rust Implementation"
     on_branch: "rust-actix"
@@ -188,7 +183,6 @@ stages:
       Use actix-web middleware patterns. Store rate limit state
       in a DashMap or similar concurrent structure.
     allowed_tools: ["read", "write", "edit", "bash"]
-
   - id: "node-impl"
     name: "Node.js Implementation"
     on_branch: "node-express"
@@ -202,7 +196,6 @@ stages:
 
       Use Express middleware patterns with in-memory rate tracking.
     allowed_tools: ["read", "write", "edit", "bash"]
-
   - id: "python-impl"
     name: "Python Implementation"
     on_branch: "python-flask"
@@ -216,7 +209,6 @@ stages:
 
       Use Flask before_request hooks with Redis or in-memory storage.
     allowed_tools: ["read", "write", "edit", "bash"]
-
   - id: "go-impl"
     name: "Go Implementation"
     on_branch: "go-chi"
@@ -230,7 +222,6 @@ stages:
 
       Use chi middleware patterns with sync.Map for rate state.
     allowed_tools: ["read", "write", "edit", "bash"]
-
   - id: "test"
     name: "Run Tests"
     # No on_branch — always runs (convergence point)
@@ -288,13 +279,11 @@ Stages without `on_branch` always run, regardless of which route was selected. P
 
 ```yaml
   # ... branched implementation stages above ...
-
   - id: "test"
     name: "Integration Tests"
     # No on_branch = convergence point
     commands:
       - "npm test"
-
   - id: "review"
     name: "Code Review"
     # Also a convergence point
@@ -337,7 +326,6 @@ stages:
         - deep-review: Touches security, data, or core infrastructure
       routes: [quick-review, standard-review, deep-review]
       default: standard-review
-
   - id: "quick"
     name: "Quick Review"
     on_branch: "quick-review"
@@ -347,7 +335,6 @@ stages:
       Triage: {{stages.triage.summary}}
       Check for obvious issues: typos, formatting, broken links.
     allowed_tools: ["read"]
-
   - id: "standard"
     name: "Standard Review"
     on_branch: "standard-review"
@@ -359,7 +346,6 @@ stages:
       Triage: {{stages.triage.summary}}
       Do a thorough code review. Check test coverage.
     allowed_tools: ["read", "glob", "grep"]
-
   - id: "deep"
     name: "Deep Security Review"
     on_branch: "deep-review"
@@ -372,7 +358,6 @@ stages:
       Triage: {{stages.triage.summary}}
       Do a deep security review of all changes.
     allowed_tools: ["read", "glob", "grep", "bash"]
-    max_turns: 20
 
   - id: "summary"
     name: "Write Review Summary"
@@ -407,7 +392,6 @@ stages:
       If you find issues, end with: STATUS: ISSUES_FOUND
       If the code looks good, end with: STATUS: ALL_CLEAR
     allowed_tools: ["read", "glob", "grep"]
-
   - id: "classify"
     name: "Classify Issues"
     when:
@@ -422,28 +406,24 @@ stages:
       prompt: "What category of fix is primarily needed?"
       routes: [security-fix, performance-fix, refactor]
       default: refactor
-
   - id: "security"
     name: "Fix Security Issues"
     on_branch: "security-fix"
     system_prompt: "You are a security engineer."
     user_prompt: "Fix the security issues: {{stages.check.summary}}"
     allowed_tools: ["read", "edit", "bash"]
-
   - id: "performance"
     name: "Fix Performance"
     on_branch: "performance-fix"
     system_prompt: "You are a performance engineer."
     user_prompt: "Fix the performance issues: {{stages.check.summary}}"
     allowed_tools: ["read", "edit", "bash"]
-
   - id: "refactor"
     name: "Refactor Code"
     on_branch: "refactor"
     system_prompt: "You are a senior developer."
     user_prompt: "Refactor the code smells: {{stages.check.summary}}"
     allowed_tools: ["read", "edit", "bash"]
-
   - id: "verify"
     name: "Run Tests"
     # Convergence point — always runs if we got here

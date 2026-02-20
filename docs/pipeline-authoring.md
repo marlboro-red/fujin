@@ -41,6 +41,10 @@ variables:                         # optional, default: {}
 summarizer:                        # optional, has defaults
   model: "claude-haiku-4-5-20251001"
   max_tokens: 1024
+retry_groups:                      # optional, default: {}
+  group_name:
+    max_retries: 5
+    verify: ...
 stages:                            # REQUIRED — at least one stage
   - ...
 ```
@@ -84,6 +88,10 @@ Controls how the output of each stage is summarized before being passed to the n
 | `max_tokens` | integer | `1024` | Target max tokens for the summary. |
 
 The summarizer calls Claude to condense the previous stage's full output into a concise summary focusing on what was accomplished, files changed, and key decisions.
+
+#### `retry_groups` (optional, map)
+
+Defines named retry groups for automatic retry-on-failure. See [Retry groups](#retry_group-optional-string) in stage fields for usage.
 
 #### `stages` (required, list)
 
@@ -250,6 +258,72 @@ Export files are stored in the platform data directory (not the workspace), so t
 
 If the file doesn't exist or is malformed, a warning is emitted but the pipeline continues — missing variables render as empty strings, matching the existing behavior for undefined template variables.
 
+#### `retry_group` (optional, string)
+
+Assigns the stage to a **retry group**. Stages sharing the same retry group name are re-executed as a unit when any stage in the group fails. Retry groups must be defined at the top level (see below).
+
+---
+
+### Top-level `retry_groups` (optional, map)
+
+Defines retry group configurations. Stages reference these by name via the `retry_group` field.
+
+```yaml
+retry_groups:
+  fix:
+    max_retries: 3
+    verify:
+      model: "claude-haiku-4-5-20251001"
+      system_prompt: "You are a verification agent."
+      user_prompt: |
+        Check whether the implementation is correct.
+        Respond with PASS or FAIL.
+      allowed_tools: ["read", "bash"]
+
+stages:
+  - id: implement
+    name: Implement
+    retry_group: fix
+    system_prompt: |
+      You are a developer. {{verify_feedback}}
+    user_prompt: "Implement the feature."
+    allowed_tools: ["read", "write", "edit", "bash"]
+
+  - id: test
+    name: Run Tests
+    retry_group: fix
+    commands:
+      - "cargo test 2>&1"
+```
+
+#### `RetryGroupConfig` fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_retries` | integer | `5` | Maximum retries before prompting the user to continue |
+| `verify` | object | — | Optional verification agent (see below) |
+
+#### `VerifyConfig` fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model` | string | `"claude-haiku-4-5-20251001"` | Model for the verification agent |
+| `system_prompt` | string | *required* | System prompt for the verify agent |
+| `user_prompt` | string | *required* | User prompt template (supports `{{variables}}`) |
+| `allowed_tools` | list | `["read", "bash"]` | Tools the verify agent can use |
+| `timeout_secs` | integer | — | Optional timeout for the verify agent |
+
+**How retry groups work:**
+
+1. Stages in the same retry group must be consecutive in the stages list
+2. A group must have at least 2 stages (or use a `verify` agent with a single stage)
+3. When any stage in the group fails, the entire group restarts from its first stage
+4. If a `verify` agent is configured, it runs after the last stage in the group succeeds
+5. The verify agent must include `PASS` or `FAIL` in its response
+6. On `FAIL`, the group loops back to its first stage (counting toward `max_retries`)
+7. After `max_retries` exhausted, the user is prompted to continue or abort
+8. The `{{verify_feedback}}` variable contains the verify agent's response on retry, so stages know what went wrong
+
 ---
 
 ## Template variables
@@ -285,8 +359,13 @@ These are automatically injected by fujin and don't need to be defined in `varia
 | `{{stages.<id>.summary}}` | After stage `<id>` completes | Summary of a specific completed stage, referenced by its `id` |
 | `{{stages.<id>.response}}` | After stage `<id>` completes | Full response text of a specific completed stage |
 | `{{exports_file}}` | Stages with `exports` | Path where the agent should write its exports JSON file |
+| `{{stage_id}}` | Command stages | The current stage's `id` value |
+| `{{stage_name}}` | Command stages | The current stage's `name` value |
+| `{{verify_feedback}}` | Retry group stages (on retry) | The verify agent's response from the previous failed attempt |
 
 Using `{{prior_summary}}` in the first stage produces a validation warning since there is no prior stage.
+
+**Note:** Even if you don't use `{{prior_summary}}` in your prompt template, the agent runtime automatically prepends a "Context from previous stage" section to the prompt when prior output exists. Using `{{prior_summary}}` explicitly gives you control over where it appears — the runtime detects this and skips the automatic prepend to avoid duplication.
 
 The `{{stages.<id>.*}}` variables are especially useful in branching pipelines where `{{prior_summary}}` might refer to a skipped stage. You can explicitly reference the stage you care about:
 
@@ -751,7 +830,6 @@ stages:
       Analysis: {{stages.analyze.summary}}
       Build both frontend and backend for: {{description}}
     allowed_tools: ["read", "write", "bash"]
-    max_turns: 30
 
   - id: test
     name: Run Tests
@@ -909,6 +987,12 @@ Fujin validates your pipeline config before execution. The following rules are e
 - `branch.default` (if set) must be one of the defined routes
 - `on_branch` values must match a route defined in an earlier stage's `branch`
 - A stage cannot have both `branch` and `on_branch`
+- `retry_group` must reference a group defined in `retry_groups`
+- Retry group stages must be consecutive in the stages list
+- A retry group must have at least 2 stages (or use a `verify` agent)
+- `verify.system_prompt` and `verify.user_prompt` must not be empty
+- `timeout_secs` must be greater than 0 (if set)
+
 **Warnings** (reported but don't prevent execution):
 - Unknown tool names in `allowed_tools` (valid: `read`, `write`, `bash`, `edit`, `glob`, `grep`, `notebook`)
 - Unknown runtime name (valid: `claude-code`, `copilot-cli`)
@@ -917,6 +1001,8 @@ Fujin validates your pipeline config before execution. The following rules are e
 - `exports` on a command stage (the agent won't have access to `{{exports_file}}`)
 - `exports.keys` lists a key not found in the exports JSON file at runtime
 - Exports JSON file is missing or malformed at runtime
+- Unused retry group (defined but not referenced by any stage)
+- Command stage in a retry group with verify agent (`{{verify_feedback}}` not available in command stages)
 
 Validate without running:
 

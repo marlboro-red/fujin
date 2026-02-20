@@ -8,7 +8,7 @@ Focused guides for writing effective pipelines with fujin.
 Create your first pipeline from scratch. Walks through single-stage, multi-stage, and command stages with a realistic Python CLI project.
 
 ### [Multi-Stage Pipelines](multi-stage-pipelines.md)
-Design effective stage sequences. Covers context passing (`{{prior_summary}}`, artifacts, named stage references), model selection, tool restrictions, max_turns tuning, and mixing command stages with agent stages.
+Design effective stage sequences. Covers context passing (`{{prior_summary}}`, artifacts, named stage references), model selection, tool restrictions, and mixing command stages with agent stages.
 
 ### [Branching and Conditions](branching-and-conditions.md)
 Make stages conditional. Covers `when` (regex gating), `branch`/`on_branch` (AI-driven routing), convergence points, and combining both mechanisms.
