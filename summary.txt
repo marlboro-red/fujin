@@ -1,8 +1,0 @@
-File Summary
-============
-
-1. test-output.txt
-   Contents: hello from fujin
-
-2. copilot-verified.txt
-   Contents: verified by copilot
