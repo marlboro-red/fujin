@@ -801,27 +801,28 @@ impl ExecutionState {
             let cur_group = stage.retry_group.as_deref();
 
             // Emit group header when entering a new retry group
-            if cur_group.is_some() && cur_group != prev_group {
-                // Close previous group if transitioning between different groups
-                if prev_group.is_some() {
-                    lines.push(Line::from(Span::styled(
-                        "  \u{2570}\u{2500}",
-                        Style::default().fg(theme::TEXT_MUTED),
-                    )));
+            if let Some(gname) = cur_group {
+                if cur_group != prev_group {
+                    // Close previous group if transitioning between different groups
+                    if prev_group.is_some() {
+                        lines.push(Line::from(Span::styled(
+                            "  \u{2570}\u{2500}",
+                            Style::default().fg(theme::TEXT_MUTED),
+                        )));
+                    }
+                    let attempt_str = if let Some(&(attempt, max)) = self.retry_attempts.get(gname) {
+                        format!(" (attempt {}/{})", attempt + 1, max)
+                    } else {
+                        String::new()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("  \u{256d}\u{2500} ", Style::default().fg(theme::TEXT_MUTED)),
+                        Span::styled(
+                            format!("{gname}{attempt_str}"),
+                            Style::default().fg(theme::TEXT_MUTED),
+                        ),
+                    ]));
                 }
-                let gname = cur_group.unwrap();
-                let attempt_str = if let Some(&(attempt, max)) = self.retry_attempts.get(gname) {
-                    format!(" (attempt {}/{})", attempt + 1, max)
-                } else {
-                    String::new()
-                };
-                lines.push(Line::from(vec![
-                    Span::styled("  \u{256d}\u{2500} ", Style::default().fg(theme::TEXT_MUTED)),
-                    Span::styled(
-                        format!("{gname}{attempt_str}"),
-                        Style::default().fg(theme::TEXT_MUTED),
-                    ),
-                ]));
             }
 
             let in_group = cur_group.is_some();
@@ -1158,7 +1159,7 @@ impl ExecutionState {
                     if char_width == 0 {
                         1
                     } else {
-                        (char_width + wrap_width - 1) / wrap_width
+                        char_width.div_ceil(wrap_width)
                     }
                 })
                 .sum();
@@ -1996,5 +1997,273 @@ mod tests {
         assert_eq!(format_number(42), "42");
         assert_eq!(format_number(1500), "1,500");
         assert_eq!(format_number(2_500_000), "2.5M");
+    }
+
+    // --- Pipeline event handler tests ---
+
+    fn start_stage(state: &mut ExecutionState, index: usize) {
+        state.handle_pipeline_event(PipelineEvent::StageStarted {
+            stage_index: index,
+            stage_id: format!("s{index}"),
+            stage_name: format!("S{index}"),
+            model: "m".into(),
+            runtime: "claude-code".into(),
+            allowed_tools: vec![],
+            retry_group: None,
+        });
+    }
+
+    #[test]
+    fn test_context_building_sets_status() {
+        let mut state = new_state();
+        start_stage(&mut state, 0);
+        state.handle_pipeline_event(PipelineEvent::ContextBuilding { stage_index: 0 });
+        assert!(matches!(state.stages[0].status, StageStatus::Building));
+    }
+
+    #[test]
+    fn test_stage_context_stores_prompt_and_summary() {
+        let mut state = new_state();
+        start_stage(&mut state, 0);
+        state.handle_pipeline_event(PipelineEvent::StageContext {
+            stage_index: 0,
+            rendered_prompt: "Do the thing".into(),
+            prior_summary: Some("Previously: did stuff".into()),
+        });
+        assert_eq!(state.stages[0].rendered_prompt.as_deref(), Some("Do the thing"));
+        assert_eq!(
+            state.stages[0].prior_summary.as_deref(),
+            Some("Previously: did stuff")
+        );
+    }
+
+    #[test]
+    fn test_agent_running_transitions_to_running() {
+        let mut state = new_state();
+        start_stage(&mut state, 0);
+        state.handle_pipeline_event(PipelineEvent::AgentRunning {
+            stage_index: 0,
+            stage_id: "s0".into(),
+        });
+        assert!(matches!(
+            state.stages[0].status,
+            StageStatus::Running { .. }
+        ));
+    }
+
+    #[test]
+    fn test_agent_tick_updates_elapsed() {
+        let mut state = new_state();
+        start_stage(&mut state, 0);
+        state.handle_pipeline_event(PipelineEvent::AgentRunning {
+            stage_index: 0,
+            stage_id: "s0".into(),
+        });
+        state.handle_pipeline_event(PipelineEvent::AgentTick {
+            stage_index: 0,
+            elapsed: Duration::from_secs(5),
+        });
+        if let StageStatus::Running { elapsed, .. } = &state.stages[0].status {
+            assert_eq!(*elapsed, Duration::from_secs(5));
+        } else {
+            panic!("Expected Running status");
+        }
+    }
+
+    #[test]
+    fn test_command_running_appends_activity() {
+        let mut state = new_state();
+        start_stage(&mut state, 0);
+        state.handle_pipeline_event(PipelineEvent::CommandRunning {
+            stage_index: 0,
+            command_index: 0,
+            command: "echo hello".into(),
+            total_commands: 2,
+        });
+        if let StageStatus::Running { activity_log, .. } = &state.stages[0].status {
+            assert_eq!(activity_log.len(), 1);
+            assert!(activity_log[0].contains("echo hello"));
+            assert!(activity_log[0].contains("[1/2]"));
+        } else {
+            panic!("Expected Running status");
+        }
+    }
+
+    #[test]
+    fn test_command_output_appends_line() {
+        let mut state = new_state();
+        start_stage(&mut state, 0);
+        state.handle_pipeline_event(PipelineEvent::AgentRunning {
+            stage_index: 0,
+            stage_id: "s0".into(),
+        });
+        state.handle_pipeline_event(PipelineEvent::CommandOutput {
+            stage_index: 0,
+            line: "some output".into(),
+        });
+        if let StageStatus::Running { activity_log, .. } = &state.stages[0].status {
+            assert!(activity_log.contains(&"some output".to_string()));
+        } else {
+            panic!("Expected Running status");
+        }
+    }
+
+    #[test]
+    fn test_pipeline_failed_sets_finished() {
+        let mut state = new_state();
+        state.handle_pipeline_event(PipelineEvent::PipelineFailed {
+            error: "something broke".into(),
+        });
+        assert!(state.finished);
+        assert!(state.final_message.as_ref().unwrap().contains("something broke"));
+    }
+
+    #[test]
+    fn test_retry_group_attempt_resets_stages() {
+        let mut state = new_state();
+        // Start and fail stage 0
+        start_stage(&mut state, 0);
+        state.stages[0].retry_group = Some("grp".into());
+        state.stages[1].retry_group = Some("grp".into());
+
+        state.handle_pipeline_event(PipelineEvent::RetryGroupAttempt {
+            group_name: "grp".into(),
+            attempt: 1,
+            max_retries: 3,
+            first_stage_index: 0,
+            failed_stage_id: "s0".into(),
+            error: "oops".into(),
+        });
+        // Failed stage is marked with retry info
+        assert!(matches!(state.stages[0].status, StageStatus::Failed { .. }));
+        // Subsequent stages reset to Pending
+        assert!(matches!(state.stages[1].status, StageStatus::Pending));
+        assert_eq!(state.retry_attempts.get("grp"), Some(&(1, 3)));
+    }
+
+    #[test]
+    fn test_retry_limit_reached_auto_continues() {
+        let mut state = new_state();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.handle_pipeline_event(PipelineEvent::RetryLimitReached {
+            group_name: "grp".into(),
+            total_attempts: 3,
+            response_tx: tx,
+        });
+        // TUI auto-sends true
+        assert_eq!(rx.blocking_recv().unwrap(), true);
+    }
+
+    #[test]
+    fn test_verify_running_sets_state() {
+        let mut state = new_state();
+        start_stage(&mut state, 0);
+        state.handle_pipeline_event(PipelineEvent::VerifyRunning {
+            group_name: "grp".into(),
+            stage_index: 0,
+        });
+        assert!(state.stages[0].verifying);
+        assert!(matches!(
+            state.verify_states.get("grp"),
+            Some(VerifyStatus::Running { .. })
+        ));
+    }
+
+    #[test]
+    fn test_verify_passed_clears_verifying() {
+        let mut state = new_state();
+        start_stage(&mut state, 0);
+        state.stages[0].verifying = true;
+        state.handle_pipeline_event(PipelineEvent::VerifyPassed {
+            group_name: "grp".into(),
+            stage_index: 0,
+        });
+        assert!(!state.stages[0].verifying);
+        assert!(matches!(
+            state.verify_states.get("grp"),
+            Some(VerifyStatus::Passed)
+        ));
+    }
+
+    #[test]
+    fn test_verify_failed_stores_response() {
+        let mut state = new_state();
+        start_stage(&mut state, 0);
+        state.stages[0].verifying = true;
+        state.handle_pipeline_event(PipelineEvent::VerifyFailed {
+            group_name: "grp".into(),
+            stage_index: 0,
+            response: "Tests are failing".into(),
+        });
+        assert!(!state.stages[0].verifying);
+        if let Some(VerifyStatus::Failed { response }) = state.verify_states.get("grp") {
+            assert_eq!(response, "Tests are failing");
+        } else {
+            panic!("Expected VerifyStatus::Failed");
+        }
+    }
+
+    #[test]
+    fn test_verify_activity_appends_to_running() {
+        let mut state = new_state();
+        start_stage(&mut state, 0);
+        state.handle_pipeline_event(PipelineEvent::VerifyRunning {
+            group_name: "grp".into(),
+            stage_index: 0,
+        });
+        state.handle_pipeline_event(PipelineEvent::VerifyActivity {
+            stage_index: 0,
+            activity: "checking tests...".into(),
+        });
+        if let Some(VerifyStatus::Running { activity_log }) = state.verify_states.get("grp") {
+            assert_eq!(activity_log, &["checking tests..."]);
+        } else {
+            panic!("Expected VerifyStatus::Running with activity");
+        }
+    }
+
+    #[test]
+    fn test_stage_started_stores_allowed_tools() {
+        let mut state = new_state();
+        state.handle_pipeline_event(PipelineEvent::StageStarted {
+            stage_index: 0,
+            stage_id: "s0".into(),
+            stage_name: "S0".into(),
+            model: "m".into(),
+            runtime: "copilot-cli".into(),
+            allowed_tools: vec!["read".into(), "write".into()],
+            retry_group: None,
+        });
+        assert_eq!(state.stages[0].runtime, "copilot-cli");
+        assert_eq!(state.stages[0].allowed_tools, vec!["read", "write"]);
+    }
+
+    #[test]
+    fn test_p_key_toggles_prompt_view() {
+        let mut state = new_state();
+        state.finished = true;
+        assert!(!state.show_prompt);
+        state.handle_key(make_key(KeyCode::Char('p')));
+        assert!(state.show_prompt);
+        state.handle_key(make_key(KeyCode::Char('p')));
+        assert!(!state.show_prompt);
+    }
+
+    #[test]
+    fn test_help_key_returns_toggle_help() {
+        let mut state = new_state();
+        state.finished = true;
+        assert!(matches!(
+            state.handle_key(make_key(KeyCode::Char('?'))),
+            ExecutionAction::ToggleHelp
+        ));
+    }
+
+    #[test]
+    fn test_format_runtime_short() {
+        assert_eq!(format_runtime_short("claude-code"), "claude");
+        assert_eq!(format_runtime_short("copilot-cli"), "copilot");
+        assert_eq!(format_runtime_short(""), "claude");
+        assert_eq!(format_runtime_short("custom"), "custom");
     }
 }

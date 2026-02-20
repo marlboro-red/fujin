@@ -233,3 +233,228 @@ impl PipelineConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_minimal_config() {
+        let yaml = r#"
+name: my-pipeline
+stages:
+  - id: s1
+    name: Stage 1
+    system_prompt: "Hello"
+    user_prompt: "World"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.name, "my-pipeline");
+        assert_eq!(config.stages.len(), 1);
+        assert_eq!(config.stages[0].id, "s1");
+    }
+
+    #[test]
+    fn test_defaults_applied() {
+        let yaml = r#"
+name: defaults-test
+stages:
+  - id: s1
+    name: Stage 1
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.runtime, "claude-code");
+        assert_eq!(config.version, "1.0");
+        assert_eq!(config.stages[0].model, "claude-sonnet-4-6");
+        // Default allowed tools: read, write
+        assert_eq!(config.stages[0].allowed_tools, vec!["read", "write"]);
+    }
+
+    #[test]
+    fn test_per_stage_runtime_override() {
+        let yaml = r#"
+name: runtime-override
+stages:
+  - id: s1
+    name: Stage 1
+    runtime: copilot-cli
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.stages[0].runtime, Some("copilot-cli".to_string()));
+    }
+
+    #[test]
+    fn test_command_stage_parsing() {
+        let yaml = r#"
+name: command-pipeline
+stages:
+  - id: setup
+    name: Setup
+    commands:
+      - "cargo build"
+      - "cargo test"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert!(config.stages[0].is_command_stage());
+        let cmds = config.stages[0].commands.as_ref().unwrap();
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0], "cargo build");
+    }
+
+    #[test]
+    fn test_is_command_stage_false_for_agent() {
+        let yaml = r#"
+name: agent-pipeline
+stages:
+  - id: s1
+    name: Stage 1
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert!(!config.stages[0].is_command_stage());
+    }
+
+    #[test]
+    fn test_is_command_stage_false_for_empty_commands() {
+        let yaml = r#"
+name: empty-cmds
+stages:
+  - id: s1
+    name: Stage 1
+    commands: []
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert!(!config.stages[0].is_command_stage());
+    }
+
+    #[test]
+    fn test_variables_parsed() {
+        let yaml = r#"
+name: vars-test
+variables:
+  project_name: my-app
+  language: rust
+stages:
+  - id: s1
+    name: Stage 1
+    system_prompt: "sp"
+    user_prompt: "Build {{project_name}}"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.variables.get("project_name").unwrap(), "my-app");
+        assert_eq!(config.variables.get("language").unwrap(), "rust");
+    }
+
+    #[test]
+    fn test_apply_overrides() {
+        let yaml = r#"
+name: override-test
+variables:
+  env: dev
+stages:
+  - id: s1
+    name: Stage 1
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let mut config = PipelineConfig::from_yaml(yaml).unwrap();
+        let mut overrides = HashMap::new();
+        overrides.insert("env".to_string(), "prod".to_string());
+        overrides.insert("new_var".to_string(), "value".to_string());
+
+        config.apply_overrides(&overrides);
+        assert_eq!(config.variables.get("env").unwrap(), "prod");
+        assert_eq!(config.variables.get("new_var").unwrap(), "value");
+    }
+
+    #[test]
+    fn test_retry_group_config() {
+        let yaml = r#"
+name: retry-test
+retry_groups:
+  fix:
+    max_retries: 3
+    verify:
+      system_prompt: "Verify"
+      user_prompt: "Check"
+stages:
+  - id: s1
+    name: Stage 1
+    system_prompt: "sp"
+    user_prompt: "up"
+    retry_group: fix
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        let group = config.retry_groups.get("fix").unwrap();
+        assert_eq!(group.max_retries, 3);
+        assert!(group.verify.is_some());
+        let verify = group.verify.as_ref().unwrap();
+        assert_eq!(verify.system_prompt, "Verify");
+        assert_eq!(verify.user_prompt, "Check");
+    }
+
+    #[test]
+    fn test_summarizer_defaults() {
+        let yaml = r#"
+name: sum-test
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.summarizer.model, "claude-haiku-4-5-20251001");
+        assert_eq!(config.summarizer.max_tokens, 1024);
+    }
+
+    #[test]
+    fn test_custom_summarizer() {
+        let yaml = r#"
+name: sum-test
+summarizer:
+  model: claude-sonnet-4
+  max_tokens: 512
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.summarizer.model, "claude-sonnet-4");
+        assert_eq!(config.summarizer.max_tokens, 512);
+    }
+
+    #[test]
+    fn test_stage_timeout() {
+        let yaml = r#"
+name: timeout-test
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+    timeout_secs: 300
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.stages[0].timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn test_from_file_nonexistent() {
+        let result = PipelineConfig::from_file(std::path::Path::new("/nonexistent/file.yaml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_yaml() {
+        let result = PipelineConfig::from_yaml("{{{{invalid yaml!!");
+        assert!(result.is_err());
+    }
+}

@@ -291,4 +291,70 @@ mod tests {
             render_template("Build {{project}} in {{language}}", &vars).unwrap();
         assert_eq!(result, "Build my-api in rust");
     }
+
+    #[test]
+    fn test_render_template_html_not_escaped() {
+        let mut vars = HashMap::new();
+        vars.insert("code".to_string(), "<div>hello</div>".to_string());
+        let result = render_template("Output: {{code}}", &vars).unwrap();
+        assert_eq!(result, "Output: <div>hello</div>");
+    }
+
+    #[test]
+    fn test_render_template_invalid_syntax() {
+        let vars = HashMap::new();
+        let result = render_template("Hello {{#if}}", &vars);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_artifact_description_empty() {
+        let artifacts = ArtifactSet::new();
+        let desc = ContextBuilder::build_artifact_description(&artifacts);
+        // Empty artifact set with "no changes" summary should produce a description
+        // containing that summary but no per-file lines
+        assert!(desc.contains("no changes"));
+    }
+
+    #[test]
+    fn test_build_artifact_description_with_changes() {
+        use crate::artifact::{FileChange, FileChangeKind};
+
+        let artifacts = ArtifactSet {
+            changes: vec![
+                FileChange {
+                    path: PathBuf::from("src/main.rs"),
+                    kind: FileChangeKind::Created,
+                    hash: None,
+                    size: Some(100),
+                },
+                FileChange {
+                    path: PathBuf::from("old.txt"),
+                    kind: FileChangeKind::Deleted,
+                    hash: None,
+                    size: None,
+                },
+            ],
+        };
+
+        let desc = ContextBuilder::build_artifact_description(&artifacts);
+        assert!(desc.contains("1 created"));
+        assert!(desc.contains("1 deleted"));
+        assert!(desc.contains("src/main.rs"));
+        assert!(desc.contains("old.txt"));
+        assert!(desc.contains("(created)"));
+        assert!(desc.contains("(deleted)"));
+    }
+
+    #[test]
+    fn test_context_builder_default_runtime() {
+        let cb = ContextBuilder::new();
+        assert_eq!(cb.runtime_name, "claude-code");
+    }
+
+    #[test]
+    fn test_context_builder_custom_runtime() {
+        let cb = ContextBuilder::with_runtime("copilot-cli".to_string());
+        assert_eq!(cb.runtime_name, "copilot-cli");
+    }
 }

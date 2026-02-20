@@ -383,4 +383,173 @@ mod tests {
         assert!(!prompt.contains("<system>"));
         assert_eq!(prompt, "Write hello world");
     }
+
+    #[test]
+    fn test_build_prompt_with_prior_summary() {
+        let config = StageConfig {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            runtime: None,
+            model: "claude-sonnet-4".to_string(),
+            system_prompt: String::new(),
+            user_prompt: "".to_string(),
+            timeout_secs: None,
+            allowed_tools: vec![],
+            commands: None,
+            retry_group: None,
+        };
+        let context = StageContext {
+            rendered_prompt: "Continue the work".to_string(),
+            prior_summary: Some("Previous stage created main.rs".to_string()),
+            changed_files: vec![],
+            verify_feedback: None,
+        };
+
+        let prompt = CopilotCliRuntime::build_prompt(&config, &context);
+        assert!(prompt.contains("Context from previous stage:"));
+        assert!(prompt.contains("Previous stage created main.rs"));
+        assert!(prompt.contains("Continue the work"));
+    }
+
+    #[test]
+    fn test_build_prompt_prior_summary_already_in_prompt() {
+        let config = StageConfig {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            runtime: None,
+            model: "claude-sonnet-4".to_string(),
+            system_prompt: String::new(),
+            user_prompt: "".to_string(),
+            timeout_secs: None,
+            allowed_tools: vec![],
+            commands: None,
+            retry_group: None,
+        };
+        // If prior_summary is already embedded in the rendered prompt, it should not be duplicated
+        let context = StageContext {
+            rendered_prompt: "Do work. Previous stage created main.rs".to_string(),
+            prior_summary: Some("Previous stage created main.rs".to_string()),
+            changed_files: vec![],
+            verify_feedback: None,
+        };
+
+        let prompt = CopilotCliRuntime::build_prompt(&config, &context);
+        assert!(!prompt.contains("Context from previous stage:"));
+    }
+
+    #[test]
+    fn test_build_prompt_with_verify_feedback() {
+        let config = StageConfig {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            runtime: None,
+            model: "claude-sonnet-4".to_string(),
+            system_prompt: String::new(),
+            user_prompt: "".to_string(),
+            timeout_secs: None,
+            allowed_tools: vec![],
+            commands: None,
+            retry_group: None,
+        };
+        let context = StageContext {
+            rendered_prompt: "Fix the issues".to_string(),
+            prior_summary: None,
+            changed_files: vec![],
+            verify_feedback: Some("Missing null checks in foo()".to_string()),
+        };
+
+        let prompt = CopilotCliRuntime::build_prompt(&config, &context);
+        assert!(prompt.contains("Previous verification feedback"));
+        assert!(prompt.contains("Missing null checks in foo()"));
+        assert!(prompt.contains("Fix the issues"));
+    }
+
+    #[test]
+    fn test_build_prompt_with_changed_files() {
+        let config = StageConfig {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            runtime: None,
+            model: "claude-sonnet-4".to_string(),
+            system_prompt: String::new(),
+            user_prompt: "".to_string(),
+            timeout_secs: None,
+            allowed_tools: vec![],
+            commands: None,
+            retry_group: None,
+        };
+        let context = StageContext {
+            rendered_prompt: "Review the files".to_string(),
+            prior_summary: None,
+            changed_files: vec![
+                std::path::PathBuf::from("src/main.rs"),
+                std::path::PathBuf::from("Cargo.toml"),
+            ],
+            verify_feedback: None,
+        };
+
+        let prompt = CopilotCliRuntime::build_prompt(&config, &context);
+        assert!(prompt.contains("Files from previous stages:"));
+        assert!(prompt.contains("src/main.rs"));
+        assert!(prompt.contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn test_build_prompt_all_sections() {
+        let config = StageConfig {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            runtime: None,
+            model: "claude-sonnet-4".to_string(),
+            system_prompt: "Be careful.".to_string(),
+            user_prompt: "".to_string(),
+            timeout_secs: None,
+            allowed_tools: vec![],
+            commands: None,
+            retry_group: None,
+        };
+        let context = StageContext {
+            rendered_prompt: "Do the work".to_string(),
+            prior_summary: Some("Created files".to_string()),
+            changed_files: vec![std::path::PathBuf::from("output.txt")],
+            verify_feedback: Some("Tests failing".to_string()),
+        };
+
+        let prompt = CopilotCliRuntime::build_prompt(&config, &context);
+        // All sections should be present in order
+        let system_pos = prompt.find("<system>").unwrap();
+        let prior_pos = prompt.find("Context from previous stage:").unwrap();
+        let feedback_pos = prompt.find("Previous verification feedback").unwrap();
+        let user_pos = prompt.find("Do the work").unwrap();
+        let files_pos = prompt.find("Files from previous stages:").unwrap();
+
+        assert!(system_pos < prior_pos);
+        assert!(prior_pos < feedback_pos);
+        assert!(feedback_pos < user_pos);
+        assert!(user_pos < files_pos);
+    }
+
+    #[test]
+    fn test_copilot_runtime_name() {
+        let runtime = CopilotCliRuntime::new();
+        assert_eq!(runtime.name(), "copilot-cli");
+    }
+
+    #[test]
+    fn test_copilot_supports_streaming() {
+        let runtime = CopilotCliRuntime::new();
+        assert!(!runtime.supports_streaming());
+    }
+
+    #[test]
+    fn test_copilot_with_binary() {
+        let runtime = CopilotCliRuntime::with_binary("/usr/local/bin/copilot".to_string());
+        assert_eq!(runtime.copilot_bin, "/usr/local/bin/copilot");
+    }
+
+    #[test]
+    fn test_copilot_default() {
+        let runtime = CopilotCliRuntime::default();
+        assert_eq!(runtime.copilot_bin, "copilot");
+    }
 }

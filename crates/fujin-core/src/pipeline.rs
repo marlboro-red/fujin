@@ -168,6 +168,7 @@ impl PipelineRunner {
     ///
     /// Returns `Ok(first_stage_index)` if the group should retry, or `Err` if
     /// the pipeline should abort (user declined or channel dropped).
+    #[allow(clippy::too_many_arguments)]
     async fn handle_retry_group_failure(
         &self,
         group_name: &str,
@@ -752,39 +753,44 @@ impl PipelineRunner {
 
         let mut combined_output = String::new();
 
-        for (cmd_idx, cmd_template) in commands.iter().enumerate() {
-            // Check cancellation
-            if let Some(ref flag) = self.cancel_flag {
-                if flag.load(Ordering::Relaxed) {
-                    tick_handle.abort();
-                    return Err(CoreError::Cancelled {
-                        stage_id: stage_config.id.clone(),
-                    });
+        let result: CoreResult<()> = async {
+            for (cmd_idx, cmd_template) in commands.iter().enumerate() {
+                // Check cancellation
+                if let Some(ref flag) = self.cancel_flag {
+                    if flag.load(Ordering::Relaxed) {
+                        return Err(CoreError::Cancelled {
+                            stage_id: stage_config.id.clone(),
+                        });
+                    }
                 }
+
+                // Render template variables in the command
+                let cmd = render_command_template(cmd_template, &vars)?;
+
+                self.emit(PipelineEvent::CommandRunning {
+                    stage_index: stage_idx,
+                    command_index: cmd_idx,
+                    command: cmd.clone(),
+                    total_commands,
+                });
+
+                let output = self
+                    .execute_command(&cmd, stage_idx, &stage_config.id)
+                    .await?;
+
+                if !combined_output.is_empty() {
+                    combined_output.push_str("\n\n");
+                }
+                combined_output.push_str(&format!("$ {cmd}\n{output}"));
             }
-
-            // Render template variables in the command
-            let cmd = render_command_template(cmd_template, &vars)?;
-
-            self.emit(PipelineEvent::CommandRunning {
-                stage_index: stage_idx,
-                command_index: cmd_idx,
-                command: cmd.clone(),
-                total_commands,
-            });
-
-            let output = self
-                .execute_command(&cmd, stage_idx, &stage_config.id)
-                .await?;
-
-            if !combined_output.is_empty() {
-                combined_output.push_str("\n\n");
-            }
-            combined_output.push_str(&format!("$ {cmd}\n{output}"));
+            Ok(())
         }
+        .await;
 
+        // Always abort the tick task, whether commands succeeded or failed
         tick_handle.abort();
 
+        result?;
         Ok((combined_output, None))
     }
 

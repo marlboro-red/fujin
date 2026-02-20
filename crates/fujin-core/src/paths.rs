@@ -56,3 +56,69 @@ pub fn ensure_dirs() -> CoreResult<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_data_dir_ends_with_fujin() {
+        let dir = data_dir();
+        assert!(
+            dir.ends_with("fujin"),
+            "data_dir should end with 'fujin', got: {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn test_templates_dir_is_under_data_dir() {
+        let templates = templates_dir();
+        let data = data_dir();
+        assert!(templates.starts_with(&data));
+        assert!(templates.ends_with("templates"));
+    }
+
+    #[test]
+    fn test_configs_dir_is_under_data_dir() {
+        let configs = configs_dir();
+        let data = data_dir();
+        assert!(configs.starts_with(&data));
+        assert!(configs.ends_with("configs"));
+    }
+
+    #[test]
+    fn test_checkpoints_dir_uses_hash() {
+        let workspace = Path::new("/tmp/test-workspace");
+        let cp_dir = checkpoints_dir(workspace);
+        assert!(cp_dir.to_string_lossy().contains("checkpoints"));
+        // The hash directory name should be a hex string
+        let hash_component = cp_dir.file_name().unwrap().to_string_lossy();
+        assert!(hash_component.len() == 64, "SHA-256 hash should be 64 hex chars");
+        assert!(hash_component.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_checkpoints_dir_deterministic() {
+        let workspace = Path::new("/tmp/test-workspace");
+        let dir1 = checkpoints_dir(workspace);
+        let dir2 = checkpoints_dir(workspace);
+        assert_eq!(dir1, dir2, "Same workspace should produce same checkpoint dir");
+    }
+
+    #[test]
+    fn test_checkpoints_dir_different_workspaces() {
+        let dir1 = checkpoints_dir(Path::new("/workspace/a"));
+        let dir2 = checkpoints_dir(Path::new("/workspace/b"));
+        assert_ne!(dir1, dir2, "Different workspaces should produce different checkpoint dirs");
+    }
+
+    #[test]
+    fn test_ensure_dirs_creates_directories() {
+        // This creates real directories on the filesystem. They already exist
+        // in normal use, so this is safe.
+        ensure_dirs().expect("ensure_dirs should succeed");
+        assert!(templates_dir().exists());
+        assert!(configs_dir().exists());
+    }
+}

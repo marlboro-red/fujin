@@ -1212,3 +1212,310 @@ stages:
         "max_retries=1 should produce exactly 1 RetryGroupAttempt, got {retry_attempt_count}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Command stage tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_command_stage_runs_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    // Initialize git so workspace tracking works
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: command-stage-pipeline
+stages:
+  - id: setup
+    name: Setup
+    commands:
+      - "echo hello > greeting.txt"
+      - "echo world >> greeting.txt"
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // Command stages don't use the agent runtime, but we still need one
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("should not be called")));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Command stage pipeline should succeed");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].stage_id, "setup");
+
+    // The response_text should contain the combined command output
+    assert!(results[0].response_text.contains("echo hello"));
+
+    // Verify the file was actually created
+    let content = std::fs::read_to_string(dir.path().join("greeting.txt")).unwrap();
+    assert!(content.contains("hello"));
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    // Should have CommandRunning events
+    let command_running_count = events
+        .iter()
+        .filter(|e| matches!(e, PipelineEvent::CommandRunning { .. }))
+        .count();
+    assert_eq!(command_running_count, 2, "Expected 2 CommandRunning events for 2 commands");
+
+    // StageStarted should report model as "commands" for command stages
+    let stage_started = events.iter().find(|e| matches!(e, PipelineEvent::StageStarted { .. }));
+    if let Some(PipelineEvent::StageStarted { model, .. }) = stage_started {
+        assert_eq!(model, "commands", "Command stages should report model as 'commands'");
+    } else {
+        panic!("Expected StageStarted event");
+    }
+}
+
+#[tokio::test]
+async fn test_command_stage_template_variables() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: template-cmd-pipeline
+variables:
+  greeting: "hello from template"
+stages:
+  - id: cmd
+    name: Command with Variables
+    commands:
+      - "echo '{{greeting}}' > output.txt"
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("unused")));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed");
+    assert_eq!(results.len(), 1);
+
+    // Verify template variable was rendered in the command
+    let content = std::fs::read_to_string(dir.path().join("output.txt")).unwrap();
+    assert!(
+        content.contains("hello from template"),
+        "Template variable should be rendered in command, got: {}",
+        content
+    );
+}
+
+#[tokio::test]
+async fn test_command_stage_failure_stops_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: failing-cmd-pipeline
+stages:
+  - id: fail-cmd
+    name: Failing Command
+    commands:
+      - "exit 1"
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("unused")));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    // Drain events in a background task to prevent any potential blocking
+    let event_handle = tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    });
+
+    let result = runner.run(&options).await;
+    assert!(result.is_err(), "Pipeline should fail when command exits non-zero");
+
+    drop(runner);
+    let events = event_handle.await.unwrap();
+
+    let has_stage_failed = events.iter().any(|e| {
+        matches!(
+            e,
+            PipelineEvent::StageFailed { stage_id, .. } if stage_id == "fail-cmd"
+        )
+    });
+    assert!(has_stage_failed, "Expected StageFailed event for fail-cmd");
+}
+
+// ---------------------------------------------------------------------------
+// Per-stage runtime event reporting test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_stage_started_reports_runtime_name() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let yaml = single_stage_yaml();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("done")));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    runner.run(&options).await.expect("Pipeline should succeed");
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    // Verify StageStarted reports the runtime name
+    let stage_started = events.iter().find_map(|e| {
+        if let PipelineEvent::StageStarted { stage_id, runtime, .. } = e {
+            Some((stage_id.clone(), runtime.clone()))
+        } else {
+            None
+        }
+    });
+    assert!(stage_started.is_some(), "Expected StageStarted event");
+    let (_, runtime) = stage_started.unwrap();
+    assert_eq!(runtime, "mock-runtime", "Runtime name should come from the AgentRuntime::name()");
+}
+
+#[tokio::test]
+async fn test_stage_started_reports_allowed_tools() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Stage with custom allowed tools
+    let yaml = r#"
+name: tools-pipeline
+stages:
+  - id: stage-1
+    name: First Stage
+    model: mock-model
+    system_prompt: "You are a test assistant."
+    user_prompt: "Do something."
+    allowed_tools:
+      - read
+      - write
+      - bash
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("done")));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    runner.run(&options).await.expect("Pipeline should succeed");
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    let tools = events.iter().find_map(|e| {
+        if let PipelineEvent::StageStarted { allowed_tools, .. } = e {
+            Some(allowed_tools.clone())
+        } else {
+            None
+        }
+    });
+    assert!(tools.is_some(), "Expected StageStarted event");
+    let tools = tools.unwrap();
+    assert_eq!(tools, vec!["read", "write", "bash"]);
+}
+
+// ---------------------------------------------------------------------------
+// Token usage by model aggregation test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_pipeline_completed_aggregates_tokens_by_model() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let yaml = single_stage_yaml();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(
+            MockRuntime::new("done").with_token_usage(500, 200),
+        ));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    runner.run(&options).await.expect("Pipeline should succeed");
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    let completed = events.iter().find(|e| matches!(e, PipelineEvent::PipelineCompleted { .. }));
+    assert!(completed.is_some(), "Expected PipelineCompleted event");
+
+    if let Some(PipelineEvent::PipelineCompleted { token_usage_by_model, .. }) = completed {
+        assert!(!token_usage_by_model.is_empty(), "Should have token usage by model");
+        let total_input: u64 = token_usage_by_model.iter().map(|(_, u)| u.input_tokens).sum();
+        let total_output: u64 = token_usage_by_model.iter().map(|(_, u)| u.output_tokens).sum();
+        assert_eq!(total_input, 500);
+        assert_eq!(total_output, 200);
+    }
+}

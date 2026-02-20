@@ -701,4 +701,228 @@ mod tests {
             message: None,
         }
     }
+
+    // --- parse_claude_output: streaming format ---
+
+    #[test]
+    fn test_parse_claude_output_stream_format() {
+        // Newline-delimited JSON with multiple lines
+        let output = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Working..."}]}}
+{"type":"result","result":"Done!","usage":{"input_tokens":200,"output_tokens":100}}"#;
+        let (text, usage) = parse_claude_output(output);
+        assert_eq!(text, "Done!");
+        let u = usage.unwrap();
+        assert_eq!(u.input_tokens, 200);
+        assert_eq!(u.output_tokens, 100);
+    }
+
+    #[test]
+    fn test_parse_claude_output_content_field() {
+        let json = r#"{"type":"result","content":"Hello via content!"}"#;
+        let (text, usage) = parse_claude_output(json);
+        assert_eq!(text, "Hello via content!");
+        assert!(usage.is_none());
+    }
+
+    #[test]
+    fn test_parse_claude_output_multiple_results() {
+        let output = r#"{"type":"result","result":"Part 1"}
+{"type":"result","result":"Part 2"}"#;
+        let (text, _) = parse_claude_output(output);
+        assert_eq!(text, "Part 1\nPart 2");
+    }
+
+    #[test]
+    fn test_parse_claude_output_empty_lines_skipped() {
+        let output = r#"{"type":"result","result":"Hello"}
+
+"#;
+        let (text, _) = parse_claude_output(output);
+        assert_eq!(text, "Hello");
+    }
+
+    // --- extract_activity gaps ---
+
+    #[test]
+    fn test_extract_activity_user_tool_result() {
+        let line = StreamLine {
+            msg_type: Some("user".to_string()),
+            message: Some(serde_json::json!({
+                "content": [{"type": "tool_result", "content": "done"}]
+            })),
+            ..default_stream_line()
+        };
+        assert_eq!(
+            extract_activity(&line),
+            Some("Processing tool result...".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_activity_user_no_tool_result() {
+        let line = StreamLine {
+            msg_type: Some("user".to_string()),
+            message: Some(serde_json::json!({
+                "content": [{"type": "text", "text": "hello"}]
+            })),
+            ..default_stream_line()
+        };
+        assert_eq!(extract_activity(&line), None);
+    }
+
+    #[test]
+    fn test_extract_activity_result_no_subtype() {
+        let line = StreamLine {
+            msg_type: Some("result".to_string()),
+            ..default_stream_line()
+        };
+        assert_eq!(
+            extract_activity(&line),
+            Some("Finished (done)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_activity_unknown_type() {
+        let line = StreamLine {
+            msg_type: Some("unknown_type".to_string()),
+            ..default_stream_line()
+        };
+        assert_eq!(extract_activity(&line), None);
+    }
+
+    #[test]
+    fn test_extract_activity_tool_use_with_command() {
+        let line = StreamLine {
+            msg_type: Some("assistant".to_string()),
+            message: Some(serde_json::json!({
+                "content": [{
+                    "type": "tool_use",
+                    "name": "Bash",
+                    "input": {"command": "cargo test"}
+                }]
+            })),
+            ..default_stream_line()
+        };
+        assert_eq!(
+            extract_activity(&line),
+            Some("Tool: Bash \u{2014} cargo test".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_activity_tool_use_with_pattern() {
+        let line = StreamLine {
+            msg_type: Some("assistant".to_string()),
+            message: Some(serde_json::json!({
+                "content": [{
+                    "type": "tool_use",
+                    "name": "Glob",
+                    "input": {"pattern": "**/*.rs"}
+                }]
+            })),
+            ..default_stream_line()
+        };
+        assert_eq!(
+            extract_activity(&line),
+            Some("Tool: Glob \u{2014} **/*.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_activity_tool_use_no_recognized_input() {
+        let line = StreamLine {
+            msg_type: Some("assistant".to_string()),
+            message: Some(serde_json::json!({
+                "content": [{
+                    "type": "tool_use",
+                    "name": "CustomTool",
+                    "input": {"data": "something"}
+                }]
+            })),
+            ..default_stream_line()
+        };
+        assert_eq!(
+            extract_activity(&line),
+            Some("Tool: CustomTool".to_string())
+        );
+    }
+
+    // --- build_tools_flag: more mappings ---
+
+    #[test]
+    fn test_build_tools_flag_all_mappings() {
+        let tools = vec![
+            "edit".to_string(),
+            "glob".to_string(),
+            "grep".to_string(),
+            "notebook".to_string(),
+        ];
+        let flags = ClaudeCodeRuntime::build_tools_flag(&tools);
+        assert_eq!(flags[1], "Edit,Glob,Grep,NotebookEdit");
+    }
+
+    #[test]
+    fn test_build_tools_flag_passthrough() {
+        let tools = vec!["CustomTool".to_string()];
+        let flags = ClaudeCodeRuntime::build_tools_flag(&tools);
+        assert_eq!(flags[1], "CustomTool");
+    }
+
+    // --- build_prompt tests ---
+
+    #[test]
+    fn test_build_prompt_with_prior_summary() {
+        let context = StageContext {
+            rendered_prompt: "Do the task".into(),
+            prior_summary: Some("Previously created files".into()),
+            changed_files: vec![],
+            verify_feedback: None,
+        };
+        let prompt = ClaudeCodeRuntime::build_prompt(&context);
+        assert!(prompt.contains("Context from previous stage:"));
+        assert!(prompt.contains("Previously created files"));
+        assert!(prompt.contains("Do the task"));
+    }
+
+    #[test]
+    fn test_build_prompt_with_verify_feedback() {
+        let context = StageContext {
+            rendered_prompt: "Fix the bug".into(),
+            prior_summary: None,
+            changed_files: vec![],
+            verify_feedback: Some("Tests are still failing".into()),
+        };
+        let prompt = ClaudeCodeRuntime::build_prompt(&context);
+        assert!(prompt.contains("Previous verification feedback"));
+        assert!(prompt.contains("Tests are still failing"));
+        assert!(prompt.contains("Fix the bug"));
+    }
+
+    #[test]
+    fn test_build_prompt_with_changed_files() {
+        let context = StageContext {
+            rendered_prompt: "Review changes".into(),
+            prior_summary: None,
+            changed_files: vec!["src/main.rs".into(), "README.md".into()],
+            verify_feedback: None,
+        };
+        let prompt = ClaudeCodeRuntime::build_prompt(&context);
+        assert!(prompt.contains("Files from previous stages:"));
+        assert!(prompt.contains("src/main.rs"));
+        assert!(prompt.contains("README.md"));
+    }
+
+    #[test]
+    fn test_build_prompt_prior_summary_already_in_prompt() {
+        let context = StageContext {
+            rendered_prompt: "Summary: Previously created files".into(),
+            prior_summary: Some("Previously created files".into()),
+            changed_files: vec![],
+            verify_feedback: None,
+        };
+        let prompt = ClaudeCodeRuntime::build_prompt(&context);
+        // Should NOT prepend since it's already in the prompt
+        assert!(!prompt.contains("Context from previous stage:"));
+    }
 }

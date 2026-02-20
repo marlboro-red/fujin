@@ -109,3 +109,77 @@ impl ArtifactSet {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_change(path: &str, kind: FileChangeKind) -> FileChange {
+        FileChange {
+            path: PathBuf::from(path),
+            kind,
+            hash: None,
+            size: None,
+        }
+    }
+
+    #[test]
+    fn test_empty_artifact_set() {
+        let set = ArtifactSet::new();
+        assert_eq!(set.created_count(), 0);
+        assert_eq!(set.modified_count(), 0);
+        assert_eq!(set.deleted_count(), 0);
+        assert_eq!(set.total_count(), 0);
+        assert!(set.changed_paths().is_empty());
+        assert_eq!(set.summary(), "no changes");
+    }
+
+    #[test]
+    fn test_counts_and_summary() {
+        let set = ArtifactSet {
+            changes: vec![
+                make_change("new.txt", FileChangeKind::Created),
+                make_change("old.txt", FileChangeKind::Modified),
+                make_change("gone.txt", FileChangeKind::Deleted),
+                make_change("another.txt", FileChangeKind::Created),
+            ],
+        };
+        assert_eq!(set.created_count(), 2);
+        assert_eq!(set.modified_count(), 1);
+        assert_eq!(set.deleted_count(), 1);
+        assert_eq!(set.total_count(), 4);
+        assert_eq!(set.summary(), "2 created, 1 modified, 1 deleted");
+    }
+
+    #[test]
+    fn test_changed_paths_excludes_deleted() {
+        let set = ArtifactSet {
+            changes: vec![
+                make_change("keep.txt", FileChangeKind::Created),
+                make_change("gone.txt", FileChangeKind::Deleted),
+                make_change("edit.txt", FileChangeKind::Modified),
+            ],
+        };
+        let paths: Vec<&str> = set
+            .changed_paths()
+            .iter()
+            .map(|p| p.to_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["keep.txt", "edit.txt"]);
+    }
+
+    #[test]
+    fn test_summary_single_type() {
+        let set = ArtifactSet {
+            changes: vec![make_change("a.txt", FileChangeKind::Modified)],
+        };
+        assert_eq!(set.summary(), "1 modified");
+    }
+
+    #[test]
+    fn test_file_change_kind_display() {
+        assert_eq!(format!("{}", FileChangeKind::Created), "created");
+        assert_eq!(format!("{}", FileChangeKind::Modified), "modified");
+        assert_eq!(format!("{}", FileChangeKind::Deleted), "deleted");
+    }
+}

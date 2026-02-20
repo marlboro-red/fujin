@@ -289,4 +289,422 @@ stages:
         assert!(!result.is_valid());
         assert!(result.errors.iter().any(|e| e.contains("Duplicate stage id")));
     }
+
+    #[test]
+    fn test_empty_pipeline_name() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: ""
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("name must not be empty")));
+    }
+
+    #[test]
+    fn test_unknown_pipeline_runtime_warns() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+runtime: "unknown-runtime"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid()); // warnings don't make it invalid
+        assert!(result.warnings.iter().any(|w| w.contains("Unknown pipeline runtime")));
+    }
+
+    #[test]
+    fn test_empty_stage_id() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: ""
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("id must not be empty")));
+    }
+
+    #[test]
+    fn test_empty_stage_name() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: ""
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("name must not be empty")));
+    }
+
+    #[test]
+    fn test_unknown_stage_runtime_warns() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    runtime: "magic-runtime"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid());
+        assert!(result.warnings.iter().any(|w| w.contains("unknown runtime 'magic-runtime'")));
+    }
+
+    #[test]
+    fn test_empty_system_prompt() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: ""
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("system_prompt must not be empty")));
+    }
+
+    #[test]
+    fn test_empty_user_prompt() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: ""
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("user_prompt must not be empty")));
+    }
+
+    #[test]
+    fn test_unknown_tool_warns() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    allowed_tools:
+      - "read"
+      - "teleport"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid());
+        assert!(result.warnings.iter().any(|w| w.contains("unknown tool 'teleport'")));
+    }
+
+    #[test]
+    fn test_timeout_zero_is_error() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    timeout_secs: 0
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("timeout_secs must be greater than 0")));
+    }
+
+    #[test]
+    fn test_command_stage_empty_command() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    commands:
+      - "echo hello"
+      - ""
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("command[1] must not be empty")));
+    }
+
+    #[test]
+    fn test_prior_summary_in_first_stage_warns() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "Check this: {{prior_summary}}"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid());
+        assert!(result.warnings.iter().any(|w| w.contains("prior_summary")));
+    }
+
+    #[test]
+    fn test_retry_group_reference_not_defined() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    retry_group: "nonexistent"
+  - id: "s2"
+    name: "S2"
+    system_prompt: "x"
+    user_prompt: "y"
+    retry_group: "nonexistent"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("not defined in retry_groups")));
+    }
+
+    #[test]
+    fn test_single_stage_retry_group_without_verify_is_error() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+retry_groups:
+  grp:
+    max_retries: 3
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    retry_group: "grp"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("at least 2 stages")));
+    }
+
+    #[test]
+    fn test_single_stage_retry_group_with_verify_is_ok() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+retry_groups:
+  grp:
+    max_retries: 3
+    verify:
+      system_prompt: "Check it"
+      user_prompt: "Is it good?"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    retry_group: "grp"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_non_consecutive_retry_group_stages() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+retry_groups:
+  grp:
+    max_retries: 3
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    retry_group: "grp"
+  - id: "s2"
+    name: "S2"
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "s3"
+    name: "S3"
+    system_prompt: "x"
+    user_prompt: "y"
+    retry_group: "grp"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("must be consecutive")));
+    }
+
+    #[test]
+    fn test_unused_retry_group_warns() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+retry_groups:
+  unused_grp:
+    max_retries: 3
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid());
+        assert!(result.warnings.iter().any(|w| w.contains("not referenced by any stage")));
+    }
+
+    #[test]
+    fn test_verify_empty_prompts() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+retry_groups:
+  grp:
+    max_retries: 3
+    verify:
+      system_prompt: ""
+      user_prompt: ""
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    retry_group: "grp"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("verify.system_prompt must not be empty")));
+        assert!(result.errors.iter().any(|e| e.contains("verify.user_prompt must not be empty")));
+    }
+
+    #[test]
+    fn test_verify_timeout_zero() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+retry_groups:
+  grp:
+    max_retries: 3
+    verify:
+      system_prompt: "check"
+      user_prompt: "verify"
+      timeout_secs: 0
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    retry_group: "grp"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("verify.timeout_secs must be greater than 0")));
+    }
+
+    #[test]
+    fn test_is_valid_with_warnings_only() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+runtime: "unknown-runtime"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    allowed_tools:
+      - "teleport"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid()); // warnings only
+        assert!(!result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_valid_command_stage() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    commands:
+      - "echo hello"
+      - "ls -la"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
 }

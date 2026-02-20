@@ -39,3 +39,30 @@ pub fn create_runtime(name: &str) -> Result<Box<dyn AgentRuntime>, CoreError> {
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_runtime_claude_code() {
+        let runtime = create_runtime("claude-code").unwrap();
+        assert_eq!(runtime.name(), "claude-code");
+    }
+
+    #[test]
+    fn test_create_runtime_copilot_cli() {
+        let runtime = create_runtime("copilot-cli").unwrap();
+        assert_eq!(runtime.name(), "copilot-cli");
+    }
+
+    #[test]
+    fn test_create_runtime_unknown() {
+        let result = create_runtime("unknown-runtime");
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("Unknown runtime"));
+        assert!(msg.contains("unknown-runtime"));
+    }
+}
