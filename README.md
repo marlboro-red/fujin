@@ -33,13 +33,9 @@ Requires [Rust](https://rustup.rs/) and at least one agent runtime:
 - **GitHub Copilot CLI** — `npm install -g @github/copilot` ([docs](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli))
 
 ```bash
-# Clone and build
+# Clone and install
 git clone <repo-url> && cd fujin
-cargo build --release
-
-# The binary is at target/release/fujin
-# Optionally add to PATH:
-cp target/release/fujin ~/.local/bin/
+cargo install --path crates/fujin-cli
 ```
 
 Verify setup:
