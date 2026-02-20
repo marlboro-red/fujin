@@ -28,6 +28,7 @@ pub enum StageStatus {
         activity_log: Vec<String>,
     },
     Failed { error: String },
+    Skipped { reason: String },
 }
 
 /// What the user has selected in the stage list.
@@ -68,6 +69,8 @@ pub struct StageInfo {
     pub verifying: bool,
     /// Retry group this stage belongs to (if any).
     pub retry_group: Option<String>,
+    /// Branch selection info (if this stage ran a branch classifier).
+    pub branch_info: Option<(String, Vec<String>)>,
 }
 
 /// State for the pipeline execution screen.
@@ -150,6 +153,7 @@ impl ExecutionState {
                 prior_summary: None,
                 verifying: false,
                 retry_group,
+                branch_info: None,
             })
             .collect();
         Self {
@@ -178,11 +182,11 @@ impl ExecutionState {
         }
     }
 
-    /// Count how many stages are completed.
+    /// Count how many stages are completed (including skipped).
     fn completed_stages(&self) -> usize {
         self.stages
             .iter()
-            .filter(|s| matches!(s.status, StageStatus::Completed { .. }))
+            .filter(|s| matches!(s.status, StageStatus::Completed { .. } | StageStatus::Skipped { .. }))
             .count()
     }
 
@@ -272,6 +276,7 @@ impl ExecutionState {
                         prior_summary: None,
                         verifying: false,
                         retry_group: None,
+                        branch_info: None,
                     });
                 }
                 let stage = &mut self.stages[stage_index];
@@ -537,6 +542,31 @@ impl ExecutionState {
                         activity_log.push(activity);
                         break;
                     }
+                }
+            }
+
+            PipelineEvent::StageSkipped {
+                stage_index,
+                stage_id: _,
+                reason,
+            } => {
+                if let Some(stage) = self.stages.get_mut(stage_index) {
+                    stage.status = StageStatus::Skipped { reason };
+                }
+            }
+
+            PipelineEvent::BranchEvaluating { .. } => {
+                // No visual change needed; the stage is already shown as completed
+            }
+
+            PipelineEvent::BranchSelected {
+                stage_index,
+                selected_route,
+                available_routes,
+                ..
+            } => {
+                if let Some(stage) = self.stages.get_mut(stage_index) {
+                    stage.branch_info = Some((selected_route, available_routes));
                 }
             }
         }
@@ -870,6 +900,7 @@ impl ExecutionState {
                     }
                 }
                 StageStatus::Failed { .. } => ("\u{2717}", theme::ERROR, "failed".to_string()),
+                StageStatus::Skipped { ref reason } => ("\u{2298}", theme::TEXT_MUTED, format!("skipped \u{00b7} {reason}")),
             };
 
             let is_selected = self.selection == SelectionTarget::Stage(i);
@@ -1249,7 +1280,31 @@ impl ExecutionState {
                     ),
                 ]));
             }
+            StageStatus::Skipped { reason } => {
+                info_lines.push(Line::from(vec![
+                    Span::styled("  Skipped: ", Style::default().fg(theme::TEXT_MUTED)),
+                    Span::styled(
+                        reason.clone(),
+                        Style::default().fg(theme::TEXT_MUTED),
+                    ),
+                ]));
+            }
             _ => {}
+        }
+
+        // Branch selection info
+        if let Some((ref selected_route, ref available_routes)) = stage.branch_info {
+            info_lines.push(Line::from(vec![
+                Span::styled("  Branch: ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(
+                    selected_route.clone(),
+                    Style::default().fg(theme::SUCCESS).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" (from: {})", available_routes.join(", ")),
+                    Style::default().fg(theme::TEXT_MUTED),
+                ),
+            ]));
         }
 
         frame.render_widget(Paragraph::new(info_lines), detail_chunks[0]);
@@ -1260,6 +1315,15 @@ impl ExecutionState {
                 .style(Style::default().fg(theme::ERROR))
                 .wrap(ratatui::widgets::Wrap { trim: false });
             frame.render_widget(error_paragraph, detail_chunks[1]);
+            return;
+        }
+
+        // Skipped detail — show reason and return early
+        if let StageStatus::Skipped { reason } = &stage.status {
+            let skip_paragraph = Paragraph::new(format!("  Skipped: {reason}"))
+                .style(Style::default().fg(theme::TEXT_MUTED))
+                .wrap(ratatui::widgets::Wrap { trim: false });
+            frame.render_widget(skip_paragraph, detail_chunks[1]);
             return;
         }
 

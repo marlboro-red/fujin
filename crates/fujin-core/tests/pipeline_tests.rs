@@ -1519,3 +1519,365 @@ async fn test_pipeline_completed_aggregates_tokens_by_model() {
         assert_eq!(total_output, 200);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Branching: when condition tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_when_condition_true_runs_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: when-true-test
+stages:
+  - id: analyze
+    name: Analyze
+    model: mock-model
+    system_prompt: "You are an analyzer."
+    user_prompt: "Analyze the task"
+  - id: frontend
+    name: Frontend
+    model: mock-model
+    when:
+      stage: analyze
+      output_matches: "FRONTEND"
+    system_prompt: "You are a frontend dev."
+    user_prompt: "Build frontend"
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // MockRuntime response contains "FRONTEND" — when condition should be true
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("Analysis complete: FRONTEND work needed")));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed");
+    assert_eq!(results.len(), 2, "Both stages should run when condition is met");
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    // No stages should be skipped
+    let skipped = events.iter().filter(|e| matches!(e, PipelineEvent::StageSkipped { .. })).count();
+    assert_eq!(skipped, 0, "No stages should be skipped");
+}
+
+#[tokio::test]
+async fn test_when_condition_false_skips_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: when-false-test
+stages:
+  - id: analyze
+    name: Analyze
+    model: mock-model
+    system_prompt: "You are an analyzer."
+    user_prompt: "Analyze the task"
+  - id: frontend
+    name: Frontend
+    model: mock-model
+    when:
+      stage: analyze
+      output_matches: "FRONTEND"
+    system_prompt: "You are a frontend dev."
+    user_prompt: "Build frontend"
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // MockRuntime response does NOT contain "FRONTEND" — when condition should be false
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("Analysis complete: BACKEND work needed")));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed");
+    assert_eq!(results.len(), 1, "Only analyze stage should complete; frontend skipped");
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    // Frontend stage should be skipped
+    let skipped: Vec<_> = events
+        .iter()
+        .filter_map(|e| {
+            if let PipelineEvent::StageSkipped { stage_id, .. } = e {
+                Some(stage_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(skipped, vec!["frontend"], "Frontend stage should be skipped");
+}
+
+// ---------------------------------------------------------------------------
+// Branching: on_branch skip tests
+// ---------------------------------------------------------------------------
+
+/// A mock runtime that returns different text based on stage ID.
+/// For branch classifier stages (id starts with "__branch_classifier_"),
+/// it returns the route name from the configured mapping.
+struct BranchMockRuntime {
+    stage_responses: std::collections::HashMap<String, String>,
+    default_response: String,
+}
+
+impl BranchMockRuntime {
+    fn new(responses: Vec<(&str, &str)>, default: &str) -> Self {
+        Self {
+            stage_responses: responses
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            default_response: default.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for BranchMockRuntime {
+    fn name(&self) -> &str {
+        "branch-mock"
+    }
+
+    async fn execute(
+        &self,
+        config: &fujin_config::StageConfig,
+        _context: &StageContext,
+        _workspace_root: &Path,
+        _progress_tx: Option<mpsc::UnboundedSender<String>>,
+        _cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> CoreResult<AgentOutput> {
+        let response = self
+            .stage_responses
+            .get(&config.id)
+            .cloned()
+            .unwrap_or_else(|| self.default_response.clone());
+
+        Ok(AgentOutput {
+            response_text: response,
+            token_usage: None,
+        })
+    }
+
+    async fn health_check(&self) -> CoreResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_on_branch_skips_unmatched_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: branch-test
+stages:
+  - id: analyze
+    name: Analyze
+    model: mock-model
+    system_prompt: "Analyze"
+    user_prompt: "Analyze"
+    branch:
+      prompt: "Classify"
+      routes: [frontend, backend]
+      default: frontend
+  - id: frontend-impl
+    name: Frontend
+    model: mock-model
+    on_branch: frontend
+    system_prompt: "Frontend"
+    user_prompt: "Build frontend"
+  - id: backend-impl
+    name: Backend
+    model: mock-model
+    on_branch: backend
+    system_prompt: "Backend"
+    user_prompt: "Build backend"
+  - id: review
+    name: Review
+    model: mock-model
+    system_prompt: "Review"
+    user_prompt: "Review"
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // Branch classifier (stage id __branch_classifier_0) returns "frontend"
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(BranchMockRuntime::new(
+            vec![("__branch_classifier_0", "frontend")],
+            "stage work done",
+        )));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed");
+    // analyze + frontend-impl + review = 3 completed (backend-impl skipped)
+    assert_eq!(results.len(), 3, "Should have 3 completed stages (backend skipped)");
+
+    let completed_ids: Vec<&str> = results.iter().map(|r| r.stage_id.as_str()).collect();
+    assert_eq!(completed_ids, vec!["analyze", "frontend-impl", "review"]);
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    // Backend should be skipped
+    let skipped: Vec<_> = events
+        .iter()
+        .filter_map(|e| {
+            if let PipelineEvent::StageSkipped { stage_id, .. } = e {
+                Some(stage_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(skipped, vec!["backend-impl"], "Backend stage should be skipped");
+
+    // Branch selected event
+    let branch_selected: Vec<_> = events
+        .iter()
+        .filter_map(|e| {
+            if let PipelineEvent::BranchSelected { selected_route, .. } = e {
+                Some(selected_route.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(branch_selected, vec!["frontend"], "Frontend route should be selected");
+}
+
+#[tokio::test]
+async fn test_convergence_stage_runs_after_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: convergence-test
+stages:
+  - id: analyze
+    name: Analyze
+    model: mock-model
+    system_prompt: "Analyze"
+    user_prompt: "Analyze"
+    branch:
+      prompt: "Classify"
+      routes: [a, b]
+      default: a
+  - id: route-a
+    name: Route A
+    model: mock-model
+    on_branch: a
+    system_prompt: "A"
+    user_prompt: "Do A"
+  - id: route-b
+    name: Route B
+    model: mock-model
+    on_branch: b
+    system_prompt: "B"
+    user_prompt: "Do B"
+  - id: final
+    name: Final
+    model: mock-model
+    system_prompt: "Final"
+    user_prompt: "Wrap up"
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // Classifier selects route "b"
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(BranchMockRuntime::new(
+            vec![("__branch_classifier_0", "b")],
+            "done",
+        )));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed");
+    // analyze + route-b + final = 3 (route-a skipped)
+    assert_eq!(results.len(), 3);
+
+    let completed_ids: Vec<&str> = results.iter().map(|r| r.stage_id.as_str()).collect();
+    assert_eq!(completed_ids, vec!["analyze", "route-b", "final"]);
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    let skipped: Vec<_> = events
+        .iter()
+        .filter_map(|e| {
+            if let PipelineEvent::StageSkipped { stage_id, .. } = e {
+                Some(stage_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(skipped, vec!["route-a"]);
+}

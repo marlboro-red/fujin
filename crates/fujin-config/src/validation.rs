@@ -202,6 +202,109 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
         }
     }
 
+    // Validate branching: when, branch, on_branch
+    {
+        // Collect stage IDs in order for forward-reference checking
+        let stage_ids: Vec<&str> = config.stages.iter().map(|s| s.id.as_str()).collect();
+
+        // Collect all routes defined by branch configs: maps branch_stage_id -> routes
+        let mut defined_routes: std::collections::HashMap<&str, &Vec<String>> =
+            std::collections::HashMap::new();
+        for stage in &config.stages {
+            if let Some(ref branch) = stage.branch {
+                defined_routes.insert(stage.id.as_str(), &branch.routes);
+            }
+        }
+
+        for (i, stage) in config.stages.iter().enumerate() {
+            let prefix = format!("Stage {} ('{}')", i, stage.id);
+
+            // A stage cannot have both branch and on_branch
+            if stage.branch.is_some() && stage.on_branch.is_some() {
+                result.errors.push(format!(
+                    "{prefix}: cannot have both 'branch' and 'on_branch'"
+                ));
+            }
+
+            // Validate 'when' condition
+            if let Some(ref when) = stage.when {
+                // when.stage must reference an earlier stage
+                let ref_pos = stage_ids.iter().position(|id| *id == when.stage);
+                match ref_pos {
+                    None => {
+                        result.errors.push(format!(
+                            "{prefix}: when.stage '{}' does not reference a defined stage",
+                            when.stage
+                        ));
+                    }
+                    Some(pos) if pos >= i => {
+                        result.errors.push(format!(
+                            "{prefix}: when.stage '{}' must reference an earlier stage",
+                            when.stage
+                        ));
+                    }
+                    _ => {}
+                }
+
+                // output_matches must be a valid regex
+                if regex::Regex::new(&when.output_matches).is_err() {
+                    result.errors.push(format!(
+                        "{prefix}: when.output_matches '{}' is not a valid regex",
+                        when.output_matches
+                    ));
+                }
+            }
+
+            // Validate 'branch' config
+            if let Some(ref branch) = stage.branch {
+                if branch.routes.is_empty() {
+                    result.errors.push(format!(
+                        "{prefix}: branch.routes must not be empty"
+                    ));
+                }
+
+                // branch.default must be one of the routes
+                if let Some(ref default) = branch.default {
+                    if !branch.routes.contains(default) {
+                        result.errors.push(format!(
+                            "{prefix}: branch.default '{}' is not in branch.routes",
+                            default
+                        ));
+                    }
+                }
+
+                // Check that at least one downstream stage uses on_branch with a matching route
+                let has_downstream = config.stages[i + 1..].iter().any(|s| {
+                    s.on_branch.as_ref().is_some_and(|branches| {
+                        branches.iter().any(|b| branch.routes.contains(b))
+                    })
+                });
+                if !has_downstream && !branch.routes.is_empty() {
+                    result.warnings.push(format!(
+                        "{prefix}: branch defines routes {:?} but no downstream stage uses on_branch with any of them",
+                        branch.routes
+                    ));
+                }
+            }
+
+            // Validate 'on_branch' values
+            if let Some(ref on_branch) = stage.on_branch {
+                // Each on_branch value must match a route in an earlier stage's branch
+                for branch_name in on_branch {
+                    let found = config.stages[..i].iter().any(|s| {
+                        s.branch.as_ref().is_some_and(|b| b.routes.contains(branch_name))
+                    });
+                    if !found {
+                        result.errors.push(format!(
+                            "{prefix}: on_branch '{}' does not match any route in an earlier stage's branch",
+                            branch_name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     // Validate retry group verify configs
     for (group_name, group_config) in &config.retry_groups {
         if let Some(ref verify) = group_config.verify {
@@ -701,6 +804,222 @@ stages:
     commands:
       - "echo hello"
       - "ls -la"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
+
+    // --- Branching validation tests ---
+
+    #[test]
+    fn test_when_references_nonexistent_stage() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    when:
+      stage: "nonexistent"
+      output_matches: ".*"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("does not reference a defined stage")));
+    }
+
+    #[test]
+    fn test_when_references_later_stage() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    when:
+      stage: "s2"
+      output_matches: ".*"
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "s2"
+    name: "S2"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("must reference an earlier stage")));
+    }
+
+    #[test]
+    fn test_when_invalid_regex() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "s2"
+    name: "S2"
+    when:
+      stage: "s1"
+      output_matches: "[invalid"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("not a valid regex")));
+    }
+
+    #[test]
+    fn test_when_valid() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "analyze"
+    name: "Analyze"
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "frontend"
+    name: "Frontend"
+    when:
+      stage: "analyze"
+      output_matches: "FRONTEND|FULLSTACK"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_branch_empty_routes() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    branch:
+      prompt: "classify"
+      routes: []
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("branch.routes must not be empty")));
+    }
+
+    #[test]
+    fn test_branch_default_not_in_routes() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    branch:
+      prompt: "classify"
+      routes: [frontend, backend]
+      default: fullstack
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("branch.default 'fullstack' is not in branch.routes")));
+    }
+
+    #[test]
+    fn test_on_branch_without_matching_branch() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    on_branch: frontend
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("does not match any route")));
+    }
+
+    #[test]
+    fn test_stage_with_both_branch_and_on_branch() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    branch:
+      prompt: "classify"
+      routes: [a, b]
+    on_branch: a
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("cannot have both 'branch' and 'on_branch'")));
+    }
+
+    #[test]
+    fn test_valid_branch_pipeline() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "analyze"
+    name: "Analyze"
+    system_prompt: "x"
+    user_prompt: "y"
+    branch:
+      prompt: "classify"
+      routes: [frontend, backend]
+      default: frontend
+  - id: "frontend-impl"
+    name: "Frontend"
+    on_branch: frontend
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "backend-impl"
+    name: "Backend"
+    on_branch: backend
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "review"
+    name: "Review"
+    system_prompt: "x"
+    user_prompt: "y"
 "#,
         )
         .unwrap();

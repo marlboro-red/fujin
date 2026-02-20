@@ -309,6 +309,52 @@ impl PipelineRunner {
 
             let stage_config = &self.config.stages[stage_idx];
 
+            // CHECK 1: on_branch gating — skip if no matching branch is active
+            if let Some(ref required_branches) = stage_config.on_branch {
+                let branch_active = required_branches.iter().any(|b| {
+                    checkpoint.active_branches.values().any(|selected| selected == b)
+                });
+                if !branch_active {
+                    let reason = format!(
+                        "branch {:?} not active (active: {:?})",
+                        required_branches,
+                        checkpoint.active_branches.values().collect::<Vec<_>>()
+                    );
+                    self.emit(PipelineEvent::StageSkipped {
+                        stage_index: stage_idx,
+                        stage_id: stage_config.id.clone(),
+                        reason,
+                    });
+                    checkpoint.skipped_stages.push(stage_config.id.clone());
+                    checkpoint.next_stage_index = stage_idx + 1;
+                    checkpoint.updated_at = Utc::now();
+                    let _ = self.checkpoint_manager.save(&checkpoint);
+                    stage_idx += 1;
+                    continue;
+                }
+            }
+
+            // CHECK 2: when condition — skip if regex doesn't match prior stage output
+            if let Some(ref when) = stage_config.when {
+                if !evaluate_when_condition(when, &checkpoint.completed_stages) {
+                    let reason = format!(
+                        "when condition not met (stage '{}' output !~ /{}/ )",
+                        when.stage, when.output_matches
+                    );
+                    self.emit(PipelineEvent::StageSkipped {
+                        stage_index: stage_idx,
+                        stage_id: stage_config.id.clone(),
+                        reason,
+                    });
+                    checkpoint.skipped_stages.push(stage_config.id.clone());
+                    checkpoint.next_stage_index = stage_idx + 1;
+                    checkpoint.updated_at = Utc::now();
+                    let _ = self.checkpoint_manager.save(&checkpoint);
+                    stage_idx += 1;
+                    continue;
+                }
+            }
+
             let stage_runtime = self.runtime_for_stage(stage_config);
             self.emit(PipelineEvent::StageStarted {
                 stage_index: stage_idx,
@@ -432,6 +478,26 @@ impl PipelineRunner {
                 artifacts: artifacts.clone(),
                 token_usage: token_usage.clone(),
             });
+
+            // 3. Run branch classifier if this stage has a `branch` config
+            if let Some(ref branch_config) = stage_config.branch {
+                self.emit(PipelineEvent::BranchEvaluating {
+                    stage_index: stage_idx,
+                    stage_id: stage_config.id.clone(),
+                });
+                let selected = self.run_branch_classifier(
+                    branch_config,
+                    &response_text,
+                    stage_idx,
+                ).await?;
+                checkpoint.active_branches.insert(stage_config.id.clone(), selected.clone());
+                self.emit(PipelineEvent::BranchSelected {
+                    stage_index: stage_idx,
+                    stage_id: stage_config.id.clone(),
+                    selected_route: selected,
+                    available_routes: branch_config.routes.clone(),
+                });
+            }
 
             // 4. Build stage result
             let stage_result = StageResult {
@@ -631,7 +697,7 @@ impl PipelineRunner {
         let prior_result = checkpoint.completed_stages.last();
         let context = self
             .context_builder
-            .build(&self.config, stage_config, prior_result, &self.workspace, verify_feedback)
+            .build(&self.config, stage_config, prior_result, &self.workspace, verify_feedback, &checkpoint.completed_stages)
             .await?;
 
         self.emit(PipelineEvent::StageContext {
@@ -815,13 +881,16 @@ impl PipelineRunner {
             allowed_tools: verify_cfg.allowed_tools.clone(),
             commands: None,
             retry_group: None,
+            when: None,
+            branch: None,
+            on_branch: None,
         };
 
         // Build context (includes prior stage results and changed files)
         let prior_result = checkpoint.completed_stages.last();
         let context = self
             .context_builder
-            .build(&self.config, &verify_stage, prior_result, &self.workspace, None)
+            .build(&self.config, &verify_stage, prior_result, &self.workspace, None, &checkpoint.completed_stages)
             .await?;
 
         // Create a progress channel that bridges verify agent activity to PipelineEvent
@@ -865,6 +934,63 @@ impl PipelineRunner {
         };
 
         Ok(agent_result?.response_text)
+    }
+
+    /// Run the branch classifier for a stage.
+    ///
+    /// Builds a classifier prompt from the branch config and stage output,
+    /// executes it via the runtime, and parses the response for a route name.
+    async fn run_branch_classifier(
+        &self,
+        branch_config: &fujin_config::BranchConfig,
+        stage_output: &str,
+        stage_idx: usize,
+    ) -> CoreResult<String> {
+        let routes_list = branch_config.routes.join(", ");
+        let classifier_prompt = format!(
+            "{}\n\nStage output:\n---\n{}\n---\n\nYou must respond with exactly one of these routes: {}\n\nRespond with just the route name.",
+            branch_config.prompt, stage_output, routes_list
+        );
+
+        // Build a synthetic StageConfig for the classifier
+        let classifier_stage = StageConfig {
+            id: format!("__branch_classifier_{}", stage_idx),
+            name: "Branch Classifier".to_string(),
+            runtime: None,
+            model: branch_config.model.clone(),
+            system_prompt: "You are a classifier. Read the stage output and select the most appropriate route. Respond with exactly one route name.".to_string(),
+            user_prompt: classifier_prompt.clone(),
+            timeout_secs: Some(60),
+            allowed_tools: Vec::new(),
+            commands: None,
+            retry_group: None,
+            when: None,
+            branch: None,
+            on_branch: None,
+        };
+
+        // Build a minimal context (no prior summary needed)
+        let context = crate::context::StageContext {
+            rendered_prompt: classifier_prompt,
+            prior_summary: None,
+            changed_files: Vec::new(),
+            verify_feedback: None,
+        };
+
+        // Execute via the default runtime
+        let agent_result = self.runtime.execute(
+            &classifier_stage,
+            &context,
+            self.workspace.root(),
+            None,
+            self.cancel_flag.clone(),
+        ).await?;
+
+        Ok(parse_branch_route(
+            &agent_result.response_text,
+            &branch_config.routes,
+            branch_config.default.as_deref(),
+        ))
     }
 
     /// Execute a single shell command and return its output.
@@ -1009,9 +1135,66 @@ fn parse_verify_verdict(response: &str) -> bool {
     }
 }
 
+/// Evaluate a `when` condition against completed stage results.
+///
+/// Returns `true` if the referenced stage's `response_text` matches the
+/// `output_matches` regex pattern (case-insensitive).
+fn evaluate_when_condition(
+    when: &fujin_config::WhenCondition,
+    completed_stages: &[crate::stage::StageResult],
+) -> bool {
+    let Some(referenced) = completed_stages.iter().find(|s| s.stage_id == when.stage) else {
+        return false;
+    };
+
+    let pattern = format!("(?i){}", when.output_matches);
+    match regex::Regex::new(&pattern) {
+        Ok(re) => re.is_match(&referenced.response_text),
+        Err(_) => false,
+    }
+}
+
+/// Parse a branch classifier's response for a route name.
+///
+/// Scans the response for the last whole-word occurrence of each route name
+/// (case-insensitive). Returns the route with the highest position.
+/// Falls back to `default` if provided, or the first route as a last resort.
+fn parse_branch_route(response: &str, routes: &[String], default: Option<&str>) -> String {
+    let response_lower = response.to_lowercase();
+
+    let mut best_route: Option<(&str, usize)> = None;
+
+    for route in routes {
+        let route_lower = route.to_lowercase();
+        // Find last whole-word occurrence
+        for (pos, _) in response_lower.match_indices(&route_lower) {
+            let bytes = response_lower.as_bytes();
+            let before_ok = pos == 0 || !bytes[pos - 1].is_ascii_alphanumeric();
+            let after_pos = pos + route_lower.len();
+            let after_ok = after_pos >= bytes.len() || !bytes[after_pos].is_ascii_alphanumeric();
+            if before_ok && after_ok
+                && best_route.is_none_or(|(_, best_pos)| pos > best_pos)
+            {
+                best_route = Some((route.as_str(), pos));
+            }
+        }
+    }
+
+    if let Some((route, _)) = best_route {
+        return route.to_string();
+    }
+
+    // Fallback
+    if let Some(d) = default {
+        return d.to_string();
+    }
+    routes.first().cloned().unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_verdict_pass() {
@@ -1056,5 +1239,136 @@ mod tests {
         assert!(parse_verify_verdict("BYPASS but PASS"));
         assert!(!parse_verify_verdict("PASSING is not enough"));
         assert!(!parse_verify_verdict("FAILED hard"));
+    }
+
+    // --- Branch route parsing tests ---
+
+    #[test]
+    fn test_branch_route_exact_match() {
+        let routes = vec!["frontend".to_string(), "backend".to_string(), "fullstack".to_string()];
+        assert_eq!(parse_branch_route("frontend", &routes, None), "frontend");
+        assert_eq!(parse_branch_route("backend", &routes, None), "backend");
+    }
+
+    #[test]
+    fn test_branch_route_case_insensitive() {
+        let routes = vec!["frontend".to_string(), "backend".to_string()];
+        assert_eq!(parse_branch_route("FRONTEND", &routes, None), "frontend");
+        assert_eq!(parse_branch_route("Frontend", &routes, None), "frontend");
+    }
+
+    #[test]
+    fn test_branch_route_in_sentence() {
+        let routes = vec!["frontend".to_string(), "backend".to_string()];
+        assert_eq!(
+            parse_branch_route("Based on the analysis, I select: frontend", &routes, None),
+            "frontend"
+        );
+    }
+
+    #[test]
+    fn test_branch_route_last_wins() {
+        let routes = vec!["frontend".to_string(), "backend".to_string()];
+        assert_eq!(
+            parse_branch_route("frontend initially, but actually backend", &routes, None),
+            "backend"
+        );
+    }
+
+    #[test]
+    fn test_branch_route_fallback_to_default() {
+        let routes = vec!["frontend".to_string(), "backend".to_string()];
+        assert_eq!(
+            parse_branch_route("no matching route here", &routes, Some("frontend")),
+            "frontend"
+        );
+    }
+
+    #[test]
+    fn test_branch_route_fallback_to_first() {
+        let routes = vec!["frontend".to_string(), "backend".to_string()];
+        assert_eq!(
+            parse_branch_route("no matching route here", &routes, None),
+            "frontend"
+        );
+    }
+
+    #[test]
+    fn test_branch_route_ignores_substrings() {
+        let routes = vec!["end".to_string(), "backend".to_string()];
+        // "frontend" contains "end" but not as a whole word
+        assert_eq!(
+            parse_branch_route("frontend stuff", &routes, Some("backend")),
+            "backend"
+        );
+    }
+
+    // --- When condition evaluation tests ---
+
+    #[test]
+    fn test_when_condition_match() {
+        let stages = vec![crate::stage::StageResult {
+            stage_id: "analyze".to_string(),
+            model: String::new(),
+            response_text: "The result is FRONTEND work".to_string(),
+            artifacts: crate::artifact::ArtifactSet::new(),
+            summary: None,
+            duration: Duration::from_secs(1),
+            completed_at: Utc::now(),
+            token_usage: None,
+        }];
+        let when = fujin_config::WhenCondition {
+            stage: "analyze".to_string(),
+            output_matches: "FRONTEND|FULLSTACK".to_string(),
+        };
+        assert!(evaluate_when_condition(&when, &stages));
+    }
+
+    #[test]
+    fn test_when_condition_no_match() {
+        let stages = vec![crate::stage::StageResult {
+            stage_id: "analyze".to_string(),
+            model: String::new(),
+            response_text: "The result is BACKEND work".to_string(),
+            artifacts: crate::artifact::ArtifactSet::new(),
+            summary: None,
+            duration: Duration::from_secs(1),
+            completed_at: Utc::now(),
+            token_usage: None,
+        }];
+        let when = fujin_config::WhenCondition {
+            stage: "analyze".to_string(),
+            output_matches: "FRONTEND|FULLSTACK".to_string(),
+        };
+        assert!(!evaluate_when_condition(&when, &stages));
+    }
+
+    #[test]
+    fn test_when_condition_missing_stage() {
+        let stages = vec![];
+        let when = fujin_config::WhenCondition {
+            stage: "nonexistent".to_string(),
+            output_matches: ".*".to_string(),
+        };
+        assert!(!evaluate_when_condition(&when, &stages));
+    }
+
+    #[test]
+    fn test_when_condition_case_insensitive() {
+        let stages = vec![crate::stage::StageResult {
+            stage_id: "s1".to_string(),
+            model: String::new(),
+            response_text: "frontend".to_string(),
+            artifacts: crate::artifact::ArtifactSet::new(),
+            summary: None,
+            duration: Duration::from_secs(1),
+            completed_at: Utc::now(),
+            token_usage: None,
+        }];
+        let when = fujin_config::WhenCondition {
+            stage: "s1".to_string(),
+            output_matches: "FRONTEND".to_string(),
+        };
+        assert!(evaluate_when_condition(&when, &stages));
     }
 }

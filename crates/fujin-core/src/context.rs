@@ -50,6 +50,9 @@ impl ContextBuilder {
     }
 
     /// Build the context for a stage, incorporating prior results.
+    ///
+    /// Per-stage template variables like `{{stages.<id>.summary}}` are
+    /// populated for every completed stage in `all_completed`.
     pub async fn build(
         &self,
         config: &PipelineConfig,
@@ -57,9 +60,22 @@ impl ContextBuilder {
         prior_result: Option<&StageResult>,
         workspace: &Workspace,
         verify_feedback: Option<&str>,
+        all_completed: &[StageResult],
     ) -> CoreResult<StageContext> {
         // Build template variables
         let mut vars: HashMap<String, String> = config.variables.clone();
+
+        // Per-stage template variables: {{stages.<id>.summary}} and {{stages.<id>.response}}
+        for result in all_completed {
+            vars.insert(
+                format!("stages.{}.summary", result.stage_id),
+                result.summary.clone().unwrap_or_default(),
+            );
+            vars.insert(
+                format!("stages.{}.response", result.stage_id),
+                result.response_text.clone(),
+            );
+        }
 
         // Add prior_summary
         let prior_summary = if let Some(prior) = prior_result {

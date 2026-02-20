@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 /// Top-level pipeline configuration parsed from YAML.
@@ -109,6 +109,30 @@ pub struct VerifyConfig {
     pub timeout_secs: Option<u64>,
 }
 
+/// Condition for gating stage execution based on a prior stage's output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhenCondition {
+    /// Stage ID whose `response_text` to check.
+    pub stage: String,
+    /// Regex pattern (case-insensitive) to match against the stage's output.
+    pub output_matches: String,
+}
+
+/// AI-driven branch classifier that runs after a stage completes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchConfig {
+    /// Model for the classifier (defaults to summarizer model).
+    #[serde(default = "default_summarizer_model")]
+    pub model: String,
+    /// Prompt sent to the classifier along with the stage's output.
+    pub prompt: String,
+    /// Valid route names the classifier can select.
+    pub routes: Vec<String>,
+    /// Fallback route if classifier output doesn't match any route.
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
 /// Configuration for a single pipeline stage.
 ///
 /// A stage is either an **agent stage** (uses an AI agent with prompts) or a
@@ -160,6 +184,20 @@ pub struct StageConfig {
     /// re-executed as a unit when any stage in the group fails.
     #[serde(default)]
     pub retry_group: Option<String>,
+
+    /// Condition for skipping this stage based on a prior stage's output.
+    #[serde(default)]
+    pub when: Option<WhenCondition>,
+
+    /// AI-driven branch classifier that runs after this stage completes.
+    #[serde(default)]
+    pub branch: Option<BranchConfig>,
+
+    /// Only run this stage if a matching branch route was selected.
+    /// Accepts a single string or a list of strings (OR semantics).
+    /// `None` means the stage always runs (no branch gating).
+    #[serde(default, deserialize_with = "deserialize_on_branch")]
+    pub on_branch: Option<Vec<String>>,
 }
 
 impl StageConfig {
@@ -206,6 +244,25 @@ fn default_verify_model() -> String {
 
 fn default_verify_tools() -> Vec<String> {
     vec!["read".to_string(), "bash".to_string()]
+}
+
+/// Deserialize `on_branch` from either a single string or a list of strings.
+fn deserialize_on_branch<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+
+    let value: Option<StringOrVec> = Option::deserialize(deserializer)?;
+    Ok(value.map(|v| match v {
+        StringOrVec::Single(s) => vec![s],
+        StringOrVec::Multiple(v) => v,
+    }))
 }
 
 impl PipelineConfig {
@@ -456,5 +513,101 @@ stages:
     fn test_invalid_yaml() {
         let result = PipelineConfig::from_yaml("{{{{invalid yaml!!");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_when_condition_parsing() {
+        let yaml = r#"
+name: when-test
+stages:
+  - id: analyze
+    name: Analyze
+    system_prompt: "sp"
+    user_prompt: "up"
+  - id: frontend
+    name: Frontend
+    when:
+      stage: analyze
+      output_matches: "FRONTEND|FULLSTACK"
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert!(config.stages[0].when.is_none());
+        let when = config.stages[1].when.as_ref().unwrap();
+        assert_eq!(when.stage, "analyze");
+        assert_eq!(when.output_matches, "FRONTEND|FULLSTACK");
+    }
+
+    #[test]
+    fn test_branch_config_parsing() {
+        let yaml = r#"
+name: branch-test
+stages:
+  - id: analyze
+    name: Analyze
+    system_prompt: "sp"
+    user_prompt: "up"
+    branch:
+      prompt: "Classify the work"
+      routes: [frontend, backend, fullstack]
+      default: fullstack
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        let branch = config.stages[0].branch.as_ref().unwrap();
+        assert_eq!(branch.prompt, "Classify the work");
+        assert_eq!(branch.routes, vec!["frontend", "backend", "fullstack"]);
+        assert_eq!(branch.default, Some("fullstack".to_string()));
+        assert_eq!(branch.model, "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn test_on_branch_single_string() {
+        let yaml = r#"
+name: on-branch-test
+stages:
+  - id: s1
+    name: S1
+    on_branch: frontend
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert_eq!(
+            config.stages[0].on_branch,
+            Some(vec!["frontend".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_on_branch_list() {
+        let yaml = r#"
+name: on-branch-list-test
+stages:
+  - id: s1
+    name: S1
+    on_branch: [frontend, fullstack]
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert_eq!(
+            config.stages[0].on_branch,
+            Some(vec!["frontend".to_string(), "fullstack".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_on_branch_absent() {
+        let yaml = r#"
+name: no-on-branch
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert!(config.stages[0].on_branch.is_none());
     }
 }

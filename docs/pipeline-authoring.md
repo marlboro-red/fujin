@@ -184,6 +184,53 @@ Restricting tools is useful for safety and focus:
 - A "build and test" stage needs `bash` to run compilers and test suites
 - A "review" stage might only need `read` to inspect code
 
+#### `when` (optional, object)
+
+Gates stage execution on a prior stage's output. If the condition is not met, the stage is skipped entirely.
+
+```yaml
+when:
+  stage: "analyze"              # ID of a previously completed stage
+  output_matches: "NEEDS_TESTS" # regex pattern (case-insensitive)
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `stage` | string | Stage ID whose response text to check. Must reference an earlier stage. |
+| `output_matches` | string | Regex pattern matched case-insensitively against the referenced stage's full response text. |
+
+#### `branch` (optional, object)
+
+Adds an AI-driven branch classifier that runs after the stage completes. The classifier reads the stage's output and selects one of the named routes. Downstream stages with matching `on_branch` values will execute; others are skipped.
+
+```yaml
+branch:
+  model: "claude-haiku-4-5-20251001"  # optional, defaults to summarizer model
+  prompt: "Classify the work needed"
+  routes: [frontend, backend, fullstack]
+  default: fullstack                   # optional fallback
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model` | string | summarizer model | Model for the classifier call. |
+| `prompt` | string | *required* | Prompt sent to the classifier along with the stage's output. |
+| `routes` | list | *required* | Valid route names the classifier can select. Must be non-empty. |
+| `default` | string | — | Fallback route if the classifier output doesn't match any route name. |
+
+A stage cannot have both `branch` and `on_branch`.
+
+#### `on_branch` (optional, string or list)
+
+Restricts the stage to only execute when a matching branch route was selected by an upstream `branch` classifier. Accepts a single string or a list (OR semantics):
+
+```yaml
+on_branch: frontend                    # runs if "frontend" was selected
+on_branch: [frontend, fullstack]       # runs if either was selected
+```
+
+Stages without `on_branch` always run, making them natural convergence points after branched sections.
+
 ---
 
 ## Template variables
@@ -216,8 +263,18 @@ These are automatically injected by fujin and don't need to be defined in `varia
 | `{{prior_summary}}` | Stage 2+ | Summarized output from the previous stage |
 | `{{artifact_list}}` | Stage 2+ | Newline-separated list of file paths changed by the previous stage |
 | `{{all_artifacts}}` | Stage 2+ | Full content of files changed by the previous stage, formatted as `=== path ===\n<content>` blocks |
+| `{{stages.<id>.summary}}` | After stage `<id>` completes | Summary of a specific completed stage, referenced by its `id` |
+| `{{stages.<id>.response}}` | After stage `<id>` completes | Full response text of a specific completed stage |
 
 Using `{{prior_summary}}` in the first stage produces a validation warning since there is no prior stage.
+
+The `{{stages.<id>.*}}` variables are especially useful in branching pipelines where `{{prior_summary}}` might refer to a skipped stage. You can explicitly reference the stage you care about:
+
+```yaml
+user_prompt: |
+  Based on the analysis: {{stages.analyze.summary}}
+  Build the frontend components.
+```
 
 ### Runtime overrides
 
@@ -246,6 +303,119 @@ All stages share the same working directory (the directory where `fujin` was inv
 ### 3. Artifact variables
 
 `{{artifact_list}}` gives you a simple list of changed file paths. `{{all_artifacts}}` gives you the full content of those files inlined into the prompt. Use these when you want the next stage to explicitly see what the previous stage produced without needing to read files.
+
+---
+
+## Conditional execution
+
+By default, every stage in a pipeline executes sequentially. **Conditional execution** lets you skip stages based on prior results, enabling branching workflows while preserving the linear execution model — stages are still iterated top-to-bottom, but some may be skipped.
+
+There are two complementary mechanisms:
+
+### `when` — regex gating
+
+The simplest form of conditional execution. A `when` condition checks a prior stage's response text against a regex pattern. If it doesn't match, the stage is skipped.
+
+```yaml
+stages:
+  - id: analyze
+    name: Analyze Codebase
+    system_prompt: "You are a code analyzer."
+    user_prompt: |
+      Analyze the codebase and determine if it has adequate test coverage.
+      End your response with exactly one of:
+      VERDICT: NEEDS_TESTS
+      VERDICT: TESTS_OK
+
+  - id: write-tests
+    name: Write Missing Tests
+    when:
+      stage: analyze
+      output_matches: "NEEDS_TESTS"
+    system_prompt: "You are a test engineer."
+    user_prompt: |
+      Based on the analysis: {{stages.analyze.summary}}
+      Write tests for the uncovered code paths.
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: lint
+    name: Lint and Format
+    # No `when` — always runs regardless of the analyze verdict
+    system_prompt: "You are a code quality engineer."
+    user_prompt: "Run linting and formatting on the project."
+    commands:
+      - "cargo fmt"
+      - "cargo clippy -- -D warnings"
+```
+
+Key points:
+- `when.stage` must reference a stage that appears *earlier* in the stages list
+- `when.output_matches` is a regex matched case-insensitively against the stage's full response text
+- Skipped stages don't produce output — `{{prior_summary}}` in the next stage refers to the last *executed* stage
+- Use `{{stages.<id>.summary}}` to explicitly reference a specific stage's output
+
+### `branch`/`on_branch` — AI-driven routing
+
+For more sophisticated routing, `branch` uses an AI classifier to pick a named route after a stage completes. Downstream stages tagged with `on_branch` only run if their route was selected.
+
+```yaml
+stages:
+  - id: analyze
+    name: Analyze Requirements
+    system_prompt: "You are a senior engineer."
+    user_prompt: "Analyze the requirements in SPEC.md"
+    branch:
+      prompt: "Based on the analysis, classify the primary work needed"
+      routes: [frontend, backend, fullstack]
+      default: fullstack
+
+  - id: frontend-impl
+    name: Frontend Development
+    on_branch: frontend
+    system_prompt: "You are a frontend developer."
+    user_prompt: |
+      Analysis: {{stages.analyze.summary}}
+      Build the frontend components.
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: backend-impl
+    name: Backend Development
+    on_branch: backend
+    system_prompt: "You are a backend developer."
+    user_prompt: |
+      Analysis: {{stages.analyze.summary}}
+      Build the backend services.
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: fullstack-impl
+    name: Full Stack Development
+    on_branch: fullstack
+    system_prompt: "You are a full-stack developer."
+    user_prompt: |
+      Analysis: {{stages.analyze.summary}}
+      Build both frontend and backend.
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: review
+    name: Code Review
+    # No on_branch = always runs (convergence point)
+    system_prompt: "You are a code reviewer."
+    user_prompt: |
+      Review all changes made in this pipeline.
+    allowed_tools: ["read"]
+```
+
+Key points:
+- The `branch` classifier runs as a separate AI call after the stage completes — it reads the stage's output and selects a route
+- `on_branch` accepts a single string (`on_branch: frontend`) or a list (`on_branch: [frontend, fullstack]`) with OR semantics
+- Stages without `on_branch` always execute — use them as convergence points after branched sections
+- A stage cannot have both `branch` and `on_branch`
+- `branch.default` provides a fallback if the classifier output is ambiguous
+- Branch selections are saved in checkpoints, so `--resume` correctly replays the same routing decisions
+
+### Combining `when` and `branch`
+
+You can use both mechanisms in the same pipeline. `when` is best for simple binary decisions based on structured output (like a PASS/FAIL verdict), while `branch`/`on_branch` is better for multi-way routing where you want an AI to make the classification decision.
 
 ---
 
@@ -474,6 +644,104 @@ stages:
       - "bash"
 ```
 
+### Branching pipeline with AI routing
+
+A pipeline that analyzes requirements and routes to different implementation paths:
+
+```yaml
+name: "Smart Project Builder"
+variables:
+  description: "Build a dashboard for monitoring API performance"
+
+summarizer:
+  model: "claude-haiku-4-5-20251001"
+  max_tokens: 1024
+
+stages:
+  - id: analyze
+    name: Analyze Requirements
+    model: "claude-sonnet-4-6"
+    system_prompt: |
+      You are a senior software architect. Analyze requirements
+      and determine the best implementation approach.
+    user_prompt: |
+      Analyze these requirements: {{description}}
+      Determine the primary work needed.
+    allowed_tools: ["read"]
+    branch:
+      prompt: "Based on the analysis, what type of work is primarily needed?"
+      routes: [frontend, backend, fullstack]
+      default: fullstack
+
+  - id: frontend-impl
+    name: Frontend Development
+    on_branch: frontend
+    system_prompt: "You are a frontend developer specializing in React and TypeScript."
+    user_prompt: |
+      Analysis: {{stages.analyze.summary}}
+      Build the frontend components for: {{description}}
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: backend-impl
+    name: Backend Development
+    on_branch: backend
+    system_prompt: "You are a backend developer specializing in APIs and databases."
+    user_prompt: |
+      Analysis: {{stages.analyze.summary}}
+      Build the backend services for: {{description}}
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: fullstack-impl
+    name: Full Stack Development
+    on_branch: fullstack
+    model: "claude-opus-4-6"
+    system_prompt: "You are a full-stack developer."
+    user_prompt: |
+      Analysis: {{stages.analyze.summary}}
+      Build both frontend and backend for: {{description}}
+    allowed_tools: ["read", "write", "bash"]
+    max_turns: 30
+
+  - id: test
+    name: Run Tests
+    # No on_branch — always runs after the implementation stage
+    commands:
+      - "npm test"
+```
+
+### Conditional stage with `when`
+
+A pipeline that conditionally writes tests based on analysis:
+
+```yaml
+name: "Conditional Test Writer"
+stages:
+  - id: analyze
+    name: Analyze Coverage
+    system_prompt: "You are a test coverage analyzer."
+    user_prompt: |
+      Analyze the test coverage of this project.
+      End your response with exactly:
+      VERDICT: NEEDS_TESTS or VERDICT: ADEQUATE
+    allowed_tools: ["read", "bash"]
+
+  - id: write-tests
+    name: Write Tests
+    when:
+      stage: analyze
+      output_matches: "NEEDS_TESTS"
+    system_prompt: "You are a test engineer."
+    user_prompt: |
+      Coverage analysis: {{stages.analyze.summary}}
+      Write tests to improve coverage.
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: format
+    name: Format Code
+    commands:
+      - "cargo fmt"
+```
+
 ### Review and refactor pipeline
 
 A pipeline that generates code and then reviews/improves it:
@@ -544,11 +812,18 @@ Fujin validates your pipeline config before execution. The following rules are e
 - `stages` must contain at least one stage
 - All stage `id` values must be unique
 - Each stage must have non-empty `id`, `name`, `system_prompt`, and `user_prompt`
+- `when.stage` must reference a stage ID that appears earlier in the stages list
+- `when.output_matches` must be a valid regex
+- `branch.routes` must be non-empty
+- `branch.default` (if set) must be one of the defined routes
+- `on_branch` values must match a route defined in an earlier stage's `branch`
+- A stage cannot have both `branch` and `on_branch`
 
 **Warnings** (reported but don't prevent execution):
 - Unknown tool names in `allowed_tools` (valid: `read`, `write`, `bash`, `edit`, `glob`, `grep`, `notebook`)
 - Unknown runtime name (valid: `claude-code`, `copilot-cli`)
 - First stage references `{{prior_summary}}` (will be empty)
+- A `branch` route has no downstream `on_branch` stage that references it
 
 Validate without running:
 
@@ -601,3 +876,9 @@ fujin run -c pipeline.yaml --dry-run
 **Choose the right runtime.** Claude Code provides richer integration (streaming progress, token tracking), while Copilot CLI gives access to models like GPT-5 through a GitHub Copilot subscription. You can mix runtimes in the same pipeline — use per-stage `runtime` overrides to leverage the strengths of each.
 
 **Use runtime-appropriate model names.** Claude Code and Copilot CLI use different model name formats. Double-check that the `model` field matches the runtime that will execute that stage.
+
+**Use `when` for simple binary gates.** If a stage should only run when the previous output contains a specific keyword or verdict, `when` with a regex is simpler and cheaper than `branch` (no extra AI call). Reserve `branch`/`on_branch` for multi-way routing where you want the AI to make a nuanced classification.
+
+**Design convergence points after branches.** Stages without `on_branch` always run, making them natural points where branched paths converge. Place review, testing, or deployment stages after your branch section without `on_branch` so they run regardless of which route was taken.
+
+**Use `{{stages.<id>.summary}}` in branching pipelines.** When stages can be skipped, `{{prior_summary}}` might not refer to the stage you expect. Use the explicit `{{stages.<id>.summary}}` or `{{stages.<id>.response}}` variables to reference specific stages by ID.

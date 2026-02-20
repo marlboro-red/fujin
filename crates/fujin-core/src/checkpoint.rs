@@ -3,6 +3,7 @@ use crate::stage::StageResult;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -27,6 +28,14 @@ pub struct Checkpoint {
 
     /// When this checkpoint was last updated.
     pub updated_at: DateTime<Utc>,
+
+    /// Active branch selections: maps stage_id (that has `branch`) to the selected route name.
+    #[serde(default)]
+    pub active_branches: HashMap<String, String>,
+
+    /// Stage IDs that were skipped (for resume correctness).
+    #[serde(default)]
+    pub skipped_stages: Vec<String>,
 }
 
 /// Manages checkpoint persistence in `<data_dir>/checkpoints/<hash>/`.
@@ -66,6 +75,8 @@ impl CheckpointManager {
             completed_stages: Vec::new(),
             created_at: now,
             updated_at: now,
+            active_branches: HashMap::new(),
+            skipped_stages: Vec::new(),
         }
     }
 

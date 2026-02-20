@@ -159,4 +159,25 @@ pub enum PipelineEvent {
         stage_index: usize,
         activity: String,
     },
+
+    /// A stage was skipped due to a `when` condition or `on_branch` mismatch.
+    StageSkipped {
+        stage_index: usize,
+        stage_id: String,
+        reason: String,
+    },
+
+    /// A branch classifier is evaluating which route to take.
+    BranchEvaluating {
+        stage_index: usize,
+        stage_id: String,
+    },
+
+    /// A branch route was selected by the classifier.
+    BranchSelected {
+        stage_index: usize,
+        stage_id: String,
+        selected_route: String,
+        available_routes: Vec<String>,
+    },
 }

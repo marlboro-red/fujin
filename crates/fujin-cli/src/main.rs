@@ -530,6 +530,43 @@ fn spawn_cli_display(mut rx: mpsc::UnboundedReceiver<PipelineEvent>) {
                     );
                 }
 
+                PipelineEvent::StageSkipped {
+                    stage_index,
+                    stage_id,
+                    reason,
+                } => {
+                    if let Some(ref s) = spinner {
+                        s.finish_and_clear();
+                        spinner = None;
+                    }
+                    println!(
+                        "\n{} Stage {}: {} {}",
+                        style("⊘").dim(),
+                        stage_index + 1,
+                        style(&stage_id).dim(),
+                        style(format!("({})", reason)).dim()
+                    );
+                }
+
+                PipelineEvent::BranchEvaluating { .. } => {
+                    if let Some(ref s) = spinner {
+                        s.set_message("Evaluating branch classifier...");
+                    }
+                }
+
+                PipelineEvent::BranchSelected {
+                    selected_route,
+                    available_routes,
+                    ..
+                } => {
+                    println!(
+                        "  {} Branch selected: {} (from: {})",
+                        style("⑂").cyan().bold(),
+                        style(&selected_route).green().bold(),
+                        style(available_routes.join(", ")).dim()
+                    );
+                }
+
                 // Tick / activity / context-building are handled by the spinner
                 _ => {}
             }

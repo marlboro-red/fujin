@@ -234,6 +234,68 @@ stages:
 
 When a stage has `commands`, the agent-specific fields (`system_prompt`, `user_prompt`, `model`, `max_turns`, `allowed_tools`) are ignored. Only `id`, `name`, `timeout_secs`, and `commands` apply.
 
+### Conditional Execution
+
+Stages normally execute sequentially. With **conditional execution**, stages can be skipped based on prior results — enabling branching workflows without breaking the linear execution model.
+
+#### `when` — regex gating
+
+Skip a stage unless a prior stage's output matches a regex pattern:
+
+```yaml
+stages:
+  - id: analyze
+    name: Analyze Task
+    system_prompt: "You are an analyzer."
+    user_prompt: "Analyze this code. End with VERDICT: NEEDS_TESTS or SKIP_TESTS"
+
+  - id: write-tests
+    name: Write Tests
+    when:
+      stage: analyze
+      output_matches: "NEEDS_TESTS"
+    system_prompt: "You are a test engineer."
+    user_prompt: "Write tests for the project."
+```
+
+#### `branch`/`on_branch` — AI-driven routing
+
+A `branch` classifier picks a named route after a stage completes. Downstream stages with `on_branch` only run if their route was selected:
+
+```yaml
+stages:
+  - id: analyze
+    name: Analyze Task
+    system_prompt: "You are an analyzer."
+    user_prompt: "Analyze the requirements"
+    branch:
+      prompt: "Classify the work needed"
+      routes: [frontend, backend, fullstack]
+      default: fullstack
+
+  - id: frontend-impl
+    name: Frontend Work
+    on_branch: frontend
+    system_prompt: "You are a frontend developer."
+    user_prompt: "Build the frontend using {{stages.analyze.summary}}"
+
+  - id: backend-impl
+    name: Backend Work
+    on_branch: backend
+    system_prompt: "You are a backend developer."
+    user_prompt: "Build the backend using {{stages.analyze.summary}}"
+
+  - id: review
+    name: Code Review
+    # no on_branch = always runs (convergence point)
+    system_prompt: "You are a code reviewer."
+    user_prompt: "Review all changes"
+```
+
+`on_branch` accepts a single string or a list: `on_branch: [frontend, fullstack]` runs if either route was selected.
+
+See the [Pipeline Authoring Guide](docs/pipeline-authoring.md) for full details.
+
 Run `fujin init --list` to see all available templates, or `fujin setup` to install them locally where you can customize them.
 
 ### Config Reference
@@ -276,6 +338,14 @@ Run `fujin init --list` to see all available templates, or `fujin setup` to inst
 | `max_turns` | integer | `10` | Max agentic turns for Claude Code |
 | `allowed_tools` | list | `["read", "write"]` | Tools the agent can use |
 
+**Conditional execution fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `when` | object | — | Gate execution on a prior stage's output (see [Conditional Execution](#conditional-execution)) |
+| `branch` | object | — | AI-driven route classifier (see [Conditional Execution](#conditional-execution)) |
+| `on_branch` | string or list | — | Only run if the named branch route was selected |
+
 **Allowed tools:** `read`, `write`, `edit`, `bash`, `glob`, `grep`, `notebook`
 
 Tool names are the same across runtimes — fujin maps them to runtime-specific names automatically (e.g., `bash` maps to `Bash` in Claude Code and `shell` in Copilot CLI).
@@ -290,6 +360,8 @@ Prompts and commands use [Handlebars](https://handlebarsjs.com/) syntax. Availab
 | `{{prior_summary}}` | Summary of the previous stage's output |
 | `{{artifact_list}}` | Newline-separated list of files changed by prior stages |
 | `{{all_artifacts}}` | Changed file paths with their full content |
+| `{{stages.<id>.summary}}` | Summary of a specific completed stage (by stage ID) |
+| `{{stages.<id>.response}}` | Full response text of a specific completed stage |
 
 Variables can be overridden from the CLI:
 
