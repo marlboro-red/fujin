@@ -16,6 +16,9 @@ Make stages conditional. Covers `when` (regex gating), `branch`/`on_branch` (AI-
 ### [Exports and Dynamic Variables](exports-and-dynamic-variables.md)
 Let agents discover information at runtime and pass it to downstream stages. Covers the exports feature, prompt patterns, fallback defaults, and adaptive pipeline design.
 
+### [Retry Groups](retry-groups.md)
+Automatic retry-on-failure with optional verification agents. Covers retry group configuration, verify agents, `{{verify_feedback}}`, and self-correcting pipeline patterns.
+
 ### [Pipeline Patterns](pipeline-patterns.md)
 Copy-pasteable pipeline recipes for common workflows: implement-test-fix loops, code review, spec-driven development, adaptive analysis, conditional testing, multi-model brainstorming, PR preparation, migrations, refactoring, and documentation generation.
 

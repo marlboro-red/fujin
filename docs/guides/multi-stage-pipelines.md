@@ -384,4 +384,5 @@ Key patterns in this example:
 
 - **[Branching and Conditions](branching-and-conditions.md)** — Skip stages or route to different paths based on prior output
 - **[Exports and Dynamic Variables](exports-and-dynamic-variables.md)** — Let agents set variables at runtime for downstream stages
+- **[Retry Groups](retry-groups.md)** — Automatic retry-on-failure with verification agents
 - **[Pipeline Patterns](pipeline-patterns.md)** — Ready-to-use patterns for common workflows

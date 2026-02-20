@@ -260,69 +260,41 @@ If the file doesn't exist or is malformed, a warning is emitted but the pipeline
 
 #### `retry_group` (optional, string)
 
-Assigns the stage to a **retry group**. Stages sharing the same retry group name are re-executed as a unit when any stage in the group fails. Retry groups must be defined at the top level (see below).
-
----
-
-### Top-level `retry_groups` (optional, map)
-
-Defines retry group configurations. Stages reference these by name via the `retry_group` field.
+Assigns the stage to a **retry group**. Stages sharing the same retry group name are re-executed as a unit when any stage in the group fails. An optional verify agent can judge whether the group's output is correct.
 
 ```yaml
 retry_groups:
-  fix:
+  build:
     max_retries: 3
     verify:
       model: "claude-haiku-4-5-20251001"
       system_prompt: "You are a verification agent."
-      user_prompt: |
-        Check whether the implementation is correct.
-        Respond with PASS or FAIL.
+      user_prompt: "Check the implementation. Respond with PASS or FAIL."
       allowed_tools: ["read", "bash"]
 
 stages:
   - id: implement
-    name: Implement
-    retry_group: fix
-    system_prompt: |
-      You are a developer. {{verify_feedback}}
-    user_prompt: "Implement the feature."
-    allowed_tools: ["read", "write", "edit", "bash"]
-
+    retry_group: build
+    ...
   - id: test
-    name: Run Tests
-    retry_group: fix
-    commands:
-      - "cargo test 2>&1"
+    retry_group: build
+    commands: ["cargo test 2>&1"]
 ```
 
-#### `RetryGroupConfig` fields
-
-| Field | Type | Default | Description |
+| Field (`RetryGroupConfig`) | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_retries` | integer | `5` | Maximum retries before prompting the user to continue |
-| `verify` | object | — | Optional verification agent (see below) |
+| `max_retries` | integer | `5` | Retries before prompting the user |
+| `verify` | object | — | Optional verification agent |
 
-#### `VerifyConfig` fields
-
-| Field | Type | Default | Description |
+| Field (`VerifyConfig`) | Type | Default | Description |
 |-------|------|---------|-------------|
-| `model` | string | `"claude-haiku-4-5-20251001"` | Model for the verification agent |
-| `system_prompt` | string | *required* | System prompt for the verify agent |
-| `user_prompt` | string | *required* | User prompt template (supports `{{variables}}`) |
-| `allowed_tools` | list | `["read", "bash"]` | Tools the verify agent can use |
-| `timeout_secs` | integer | — | Optional timeout for the verify agent |
+| `model` | string | `"claude-haiku-4-5-20251001"` | Model for verification |
+| `system_prompt` | string | *required* | Verifier system prompt |
+| `user_prompt` | string | *required* | What to verify |
+| `allowed_tools` | list | `["read", "bash"]` | Verifier tools |
+| `timeout_secs` | integer | — | Optional timeout |
 
-**How retry groups work:**
-
-1. Stages in the same retry group must be consecutive in the stages list
-2. A group must have at least 2 stages (or use a `verify` agent with a single stage)
-3. When any stage in the group fails, the entire group restarts from its first stage
-4. If a `verify` agent is configured, it runs after the last stage in the group succeeds
-5. The verify agent must include `PASS` or `FAIL` in its response
-6. On `FAIL`, the group loops back to its first stage (counting toward `max_retries`)
-7. After `max_retries` exhausted, the user is prompted to continue or abort
-8. The `{{verify_feedback}}` variable contains the verify agent's response on retry, so stages know what went wrong
+See the **[Retry Groups Guide](guides/retry-groups.md)** for detailed usage, verify agent patterns, `{{verify_feedback}}`, and realistic examples.
 
 ---
 

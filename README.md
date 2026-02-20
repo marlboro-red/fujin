@@ -325,6 +325,7 @@ See the [Pipeline Authoring Guide](docs/pipeline-authoring.md) for the full fiel
 - **[Multi-Stage Pipelines](docs/guides/multi-stage-pipelines.md)** — Context passing, model selection, and stage composition
 - **[Branching and Conditions](docs/guides/branching-and-conditions.md)** — Conditional execution with `when` and `branch`/`on_branch`
 - **[Exports and Dynamic Variables](docs/guides/exports-and-dynamic-variables.md)** — Let agents set variables at runtime
+- **[Retry Groups](docs/guides/retry-groups.md)** — Automatic retry-on-failure with verification agents
 - **[Pipeline Patterns](docs/guides/pipeline-patterns.md)** — Ready-to-use recipes for common workflows
 
 Run `fujin init --list` to see all available templates, or `fujin setup` to install them locally where you can customize them.
