@@ -60,7 +60,7 @@ fn scan_directory(
 
         // Canonicalize to deduplicate
         let canonical = match std::fs::canonicalize(&path) {
-            Ok(p) => p,
+            Ok(p) => strip_win_prefix(p),
             Err(_) => path.clone(),
         };
 
@@ -85,4 +85,17 @@ fn scan_directory(
             raw_yaml,
         });
     }
+}
+
+/// Strip the `\\?\` extended-length path prefix that `std::fs::canonicalize`
+/// adds on Windows so that displayed paths look clean (e.g. `C:\Users\...`).
+fn strip_win_prefix(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    p
 }
