@@ -15,16 +15,15 @@ cd /path/to/your/project
 fujin run -c pipeline.yaml
 
 For each stage:
-  1. Snapshot current directory (SHA-256 hash all files)
-  2. Build context: summarize prior stage output + collect file diffs
-  3. Spawn `claude` CLI subprocess with stage config
-  4. Claude Code executes — reads/writes files in the current directory
-  5. Diff directory against snapshot → track artifacts
-  6. Save checkpoint (JSON)
-  7. Next stage
+  1. Build context: summarize prior stage output + collect file diffs
+  2. Spawn agent subprocess with stage config
+  3. Agent executes — reads/writes files in the current directory
+  4. Detect changes via git status → track artifacts
+  5. Save checkpoint (JSON)
+  6. Next stage
 ```
 
-Claude Code handles all file I/O, bash execution, and tool use natively. The pipeline doesn't parse code blocks or manage file writes — it just tracks what changed. Models always run in the directory where `fujin` was invoked.
+Agents handle all file I/O, bash execution, and tool use natively. The pipeline doesn't parse code blocks or manage file writes — it uses `git status` to track what changed. Models always run in the directory where `fujin` was invoked.
 
 ## Installation
 
