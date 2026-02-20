@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, LineGauge, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, LineGauge, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame,
 };
 use std::time::{Duration, Instant};
@@ -57,6 +57,10 @@ pub struct StageInfo {
     pub id: String,
     pub name: String,
     pub model: String,
+    /// Runtime name (e.g. "claude-code", "copilot-cli").
+    pub runtime: String,
+    /// Allowed tools for this stage.
+    pub allowed_tools: Vec<String>,
     pub status: StageStatus,
     pub rendered_prompt: Option<String>,
     pub prior_summary: Option<String>,
@@ -139,6 +143,8 @@ impl ExecutionState {
                 id,
                 name,
                 model,
+                runtime: String::new(),
+                allowed_tools: Vec::new(),
                 status: StageStatus::Pending,
                 rendered_prompt: None,
                 prior_summary: None,
@@ -248,6 +254,8 @@ impl ExecutionState {
                 stage_id,
                 stage_name,
                 model,
+                runtime,
+                allowed_tools,
                 retry_group,
             } => {
                 // Ensure stages vec is large enough
@@ -257,6 +265,8 @@ impl ExecutionState {
                         id: String::new(),
                         name: String::new(),
                         model: String::new(),
+                        runtime: String::new(),
+                        allowed_tools: Vec::new(),
                         status: StageStatus::Pending,
                         rendered_prompt: None,
                         prior_summary: None,
@@ -267,6 +277,8 @@ impl ExecutionState {
                 let stage = &mut self.stages[stage_index];
                 stage.id = stage_id;
                 stage.name = stage_name;
+                stage.runtime = runtime;
+                stage.allowed_tools = allowed_tools;
                 stage.model = model.clone();
                 stage.retry_group = retry_group;
                 // Immediately transition to Running so the TUI shows progress
@@ -876,11 +888,20 @@ impl ExecutionState {
 
             let detail_gutter = if in_group { "  \u{2502}   " } else { "    " };
 
-            // Model label for the detail line
-            let model_short = if !stage.model.is_empty() && stage.model != "commands" {
-                format!(" [{}]", theme::shorten_model(&stage.model))
+            // Runtime + model label for the detail line
+            let (model_short, model_short_color) = if !stage.model.is_empty() && stage.model != "commands" {
+                let rt_label = format_runtime_short(&stage.runtime);
+                let tools_label = if stage.allowed_tools.is_empty() {
+                    String::new()
+                } else {
+                    format!(" tools: {}", stage.allowed_tools.join(", "))
+                };
+                (
+                    format!(" [{} · {}]{}", rt_label, theme::shorten_model(&stage.model), tools_label),
+                    runtime_color(&stage.runtime),
+                )
             } else {
-                String::new()
+                (String::new(), theme::TOKEN_LABEL)
             };
 
             lines.push(Line::from(vec![
@@ -893,7 +914,7 @@ impl ExecutionState {
             lines.push(Line::from(vec![
                 Span::styled(detail_gutter, Style::default().fg(theme::TEXT_MUTED)),
                 Span::styled(format!("  {detail}"), Style::default().fg(theme::TEXT_MUTED)),
-                Span::styled(model_short, Style::default().fg(theme::TOKEN_LABEL)),
+                Span::styled(model_short, Style::default().fg(model_short_color)),
             ]));
 
             // Emit verify step + group footer after the last stage in a group
@@ -1128,7 +1149,19 @@ impl ExecutionState {
             }
 
             let visible_height = inner.height as usize;
-            let total_lines = lines.len();
+            let wrap_width = inner.width.max(1) as usize;
+            // Estimate wrapped line count: each logical line may span multiple visual lines.
+            let total_lines: usize = lines
+                .iter()
+                .map(|line| {
+                    let char_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
+                    if char_width == 0 {
+                        1
+                    } else {
+                        (char_width + wrap_width - 1) / wrap_width
+                    }
+                })
+                .sum();
             self.detail_content_height = total_lines;
 
             let scroll = if self.detail_scroll_pinned {
@@ -1138,7 +1171,9 @@ impl ExecutionState {
                 0
             };
 
-            let paragraph = Paragraph::new(lines).scroll((scroll, 0));
+            let paragraph = Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0));
             frame.render_widget(paragraph, inner);
 
             // Scrollbar
@@ -1164,15 +1199,33 @@ impl ExecutionState {
             .split(inner);
 
         // Stage info header
-        let model_display = if stage.model == "commands" {
-            "type: commands".to_string()
+        let mut info_lines = if stage.model == "commands" {
+            vec![Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled("type: commands", Style::default().fg(theme::TOKEN_LABEL)),
+            ])]
         } else {
-            format!("model: {}", theme::shorten_model(&stage.model))
+            let rt_color = runtime_color(&stage.runtime);
+            let mut header_spans = vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    format_runtime_short(&stage.runtime),
+                    Style::default().fg(rt_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" · ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(
+                    theme::shorten_model(&stage.model),
+                    Style::default().fg(theme::TOKEN_LABEL),
+                ),
+            ];
+            if !stage.allowed_tools.is_empty() {
+                header_spans.push(Span::styled(
+                    format!("  tools: {}", stage.allowed_tools.join(", ")),
+                    Style::default().fg(theme::TEXT_MUTED),
+                ));
+            }
+            vec![Line::from(header_spans)]
         };
-        let mut info_lines = vec![Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(model_display, Style::default().fg(theme::TOKEN_LABEL)),
-        ])];
 
         match &stage.status {
             StageStatus::Running { elapsed, .. } => {
@@ -1545,6 +1598,23 @@ fn format_number(n: u64) -> String {
     }
 }
 
+/// Short display label for a runtime name.
+fn format_runtime_short(runtime: &str) -> &str {
+    match runtime {
+        "claude-code" | "" => "claude",
+        "copilot-cli" => "copilot",
+        other => other,
+    }
+}
+
+/// Color for a runtime label.
+fn runtime_color(runtime: &str) -> ratatui::style::Color {
+    match runtime {
+        "copilot-cli" => ratatui::style::Color::Rgb(110, 200, 250), // light blue
+        _ => theme::TOKEN_LABEL, // purple for claude-code / default
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1719,6 +1789,8 @@ mod tests {
             stage_id: "build".into(),
             stage_name: "Build Code".into(),
             model: "sonnet".into(),
+            runtime: "claude-code".into(),
+            allowed_tools: vec![],
             retry_group: None,
         });
 
@@ -1736,6 +1808,8 @@ mod tests {
             stage_id: "s0".into(),
             stage_name: "S0".into(),
             model: "m".into(),
+            runtime: "claude-code".into(),
+            allowed_tools: vec![],
             retry_group: None,
         });
         state.stages[0].status = StageStatus::Running {
@@ -1768,6 +1842,8 @@ mod tests {
             stage_id: "s0".into(),
             stage_name: "S0".into(),
             model: "m".into(),
+            runtime: "claude-code".into(),
+            allowed_tools: vec![],
             retry_group: None,
         });
 
@@ -1804,6 +1880,8 @@ mod tests {
             stage_id: "s1".into(),
             stage_name: "S1".into(),
             model: "m".into(),
+            runtime: "claude-code".into(),
+            allowed_tools: vec![],
             retry_group: None,
         });
 
@@ -1821,6 +1899,8 @@ mod tests {
             stage_id: "s0".into(),
             stage_name: "S0".into(),
             model: "m".into(),
+            runtime: "claude-code".into(),
+            allowed_tools: vec![],
             retry_group: None,
         });
         state.handle_pipeline_event(PipelineEvent::AgentRunning {
@@ -1853,6 +1933,8 @@ mod tests {
             stage_id: "s0".into(),
             stage_name: "S0".into(),
             model: "m".into(),
+            runtime: "claude-code".into(),
+            allowed_tools: vec![],
             retry_group: None,
         });
         state.handle_pipeline_event(PipelineEvent::AgentRunning {

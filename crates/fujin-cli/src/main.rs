@@ -210,13 +210,20 @@ fn spawn_cli_display(mut rx: mpsc::UnboundedReceiver<PipelineEvent>) {
                 PipelineEvent::PipelineStarted {
                     pipeline_name,
                     total_stages,
+                    runtime,
                     ..
                 } => {
+                    let rt_label = match runtime.as_str() {
+                        "copilot-cli" => "copilot",
+                        "claude-code" => "claude",
+                        other => other,
+                    };
                     println!(
-                        "\n{} {} ({})",
+                        "\n{} {} ({}, {})",
                         style("Pipeline:").bold().cyan(),
                         style(&pipeline_name).bold(),
-                        style(format!("{total_stages} stages")).dim()
+                        style(format!("{total_stages} stages")).dim(),
+                        style(rt_label).dim()
                     );
                     println!("{}", style("─".repeat(60)).dim());
                 }
@@ -239,12 +246,19 @@ fn spawn_cli_display(mut rx: mpsc::UnboundedReceiver<PipelineEvent>) {
                     stage_index,
                     stage_name,
                     model,
+                    runtime,
+                    allowed_tools,
                     ..
                 } => {
                     // Clear any existing spinner
                     if let Some(ref s) = spinner {
                         s.finish_and_clear();
                     }
+                    let rt_label = match runtime.as_str() {
+                        "copilot-cli" => "copilot",
+                        "claude-code" => "claude",
+                        other => other,
+                    };
                     println!(
                         "\n{} Stage {}: {}",
                         style("▶").green().bold(),
@@ -252,10 +266,18 @@ fn spawn_cli_display(mut rx: mpsc::UnboundedReceiver<PipelineEvent>) {
                         style(&stage_name).bold()
                     );
                     println!(
-                        "  {} model={}",
+                        "  {} {} · model={}",
                         style("⚙").dim(),
+                        style(rt_label).magenta().bold(),
                         style(&model).cyan()
                     );
+                    if !allowed_tools.is_empty() {
+                        println!(
+                            "  {} tools: {}",
+                            style("⚙").dim(),
+                            style(allowed_tools.join(", ")).dim()
+                        );
+                    }
                 }
 
                 PipelineEvent::AgentRunning { stage_id, .. } => {

@@ -7,7 +7,6 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -157,15 +156,17 @@ impl AgentRuntime for CopilotCliRuntime {
 
         let mut cmd = Command::new(&self.copilot_bin);
 
-        // Programmatic mode with silent output
-        cmd.arg("-p").arg("-"); // Read prompt from stdin
-        cmd.arg("-s"); // Silent mode: clean output for scripting
+        // Programmatic mode: -p takes the prompt as a string argument.
+        // -s (silent) outputs only the agent response without usage stats.
+        // --no-ask-user prevents the agent from prompting interactively.
+        cmd.arg("-p").arg(&prompt);
+        cmd.arg("-s");
+        cmd.arg("--no-ask-user");
 
         cmd.arg("--model").arg(&config.model);
 
         // Skip interactive permission prompts (equivalent to Claude's
-        // --dangerously-skip-permissions). Without this, Copilot CLI may
-        // prompt for tool confirmation and hang on piped stdin.
+        // --dangerously-skip-permissions).
         cmd.arg("--yolo");
 
         // Add tool permissions
@@ -175,7 +176,6 @@ impl AgentRuntime for CopilotCliRuntime {
         }
 
         cmd.current_dir(workspace_root)
-            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -184,16 +184,6 @@ impl AgentRuntime for CopilotCliRuntime {
         let mut child = cmd.spawn().map_err(|e| CoreError::AgentError {
             message: format!("Failed to spawn copilot process: {e}"),
         })?;
-
-        // Pipe the prompt via stdin
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(prompt.as_bytes()).await.map_err(|e| {
-                CoreError::AgentError {
-                    message: format!("Failed to write prompt to stdin: {e}"),
-                }
-            })?;
-            // Drop stdin to close it, signaling EOF
-        }
 
         // Emit a generic activity message since Copilot CLI doesn't stream tool use
         if let Some(ref tx) = progress_tx {

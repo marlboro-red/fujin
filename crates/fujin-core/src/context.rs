@@ -1,3 +1,4 @@
+use crate::artifact::ArtifactSet;
 use crate::error::{CoreError, CoreResult};
 use crate::stage::StageResult;
 use crate::util::truncate_chars;
@@ -65,9 +66,17 @@ impl ContextBuilder {
             let summary = if let Some(ref s) = prior.summary {
                 s.clone()
             } else {
-                // Summarize the prior stage output
-                self.summarize(&config.summarizer, &prior.response_text)
-                    .await?
+                // Build text to summarize: agent response + artifact info.
+                // Some runtimes (e.g. Copilot CLI) produce little/no useful
+                // text output, so we always append artifact details to give
+                // the summarizer concrete facts to work with.
+                let mut text = prior.response_text.clone();
+                let artifact_desc = Self::build_artifact_description(&prior.artifacts);
+                if !artifact_desc.is_empty() {
+                    text.push_str("\n\nFile changes from this stage:\n");
+                    text.push_str(&artifact_desc);
+                }
+                self.summarize(&config.summarizer, &text).await?
             };
             vars.insert("prior_summary".to_string(), summary.clone());
             Some(summary)
@@ -114,7 +123,7 @@ impl ContextBuilder {
     ///
     /// Dispatches to the appropriate CLI tool based on the runtime name:
     /// - `claude-code`: uses `claude --print --model <model>`
-    /// - `copilot-cli`: uses `copilot -p - -s --model <model>`
+    /// - `copilot-cli`: uses `copilot -p /dev/stdin --model <model>`
     async fn summarize(&self, config: &SummarizerConfig, text: &str) -> CoreResult<String> {
         if text.trim().is_empty() {
             return Ok(String::new());
@@ -127,19 +136,22 @@ impl ContextBuilder {
         );
 
         let summarize_prompt = format!(
-            "Summarize the following AI agent output concisely. Focus on what was accomplished, \
-             what files were created/modified, and any important decisions or results. \
+            "Summarize the following AI agent output concisely. Focus on what was accomplished \
+             and what files were created/modified. If the agent's text response is generic or \
+             unhelpful, focus on the file changes listed at the end. Do NOT ask for more \
+             information — just summarize whatever is available. \
              Keep it under {} tokens.\n\n---\n\n{}",
             config.max_tokens, text
         );
 
         let mut child = match self.runtime_name.as_str() {
             "copilot-cli" => {
+                // Copilot CLI: -p takes prompt as a string arg, -s for clean output
                 Command::new("copilot")
-                    .arg("-p").arg("-")
+                    .arg("-p").arg(&summarize_prompt)
                     .arg("-s")
+                    .arg("--no-ask-user")
                     .arg("--model").arg(&config.model)
-                    .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()
@@ -148,7 +160,7 @@ impl ContextBuilder {
                     })?
             }
             _ => {
-                // Default: claude-code
+                // Claude Code: --print reads prompt from stdin
                 Command::new("claude")
                     .arg("--print")
                     .arg("--model").arg(&config.model)
@@ -162,6 +174,7 @@ impl ContextBuilder {
             }
         };
 
+        // Claude Code reads from stdin; Copilot CLI takes prompt as -p arg
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             stdin.write_all(summarize_prompt.as_bytes()).await.map_err(|e| {
@@ -169,7 +182,6 @@ impl ContextBuilder {
                     message: format!("Failed to write prompt to summarizer stdin: {e}"),
                 }
             })?;
-            // Drop stdin to close it, signaling EOF
         }
 
         let output = child.wait_with_output().await.map_err(|e| CoreError::ContextError {
@@ -187,6 +199,22 @@ impl ContextBuilder {
         let summary = String::from_utf8_lossy(&output.stdout).trim().to_string();
         debug!(summary_len = summary.len(), "Generated summary");
         Ok(summary)
+    }
+
+    /// Build a text description of artifacts for summarization fallback.
+    ///
+    /// Used when the agent's response text is too short for the summarizer
+    /// to produce a meaningful summary (e.g. Copilot CLI silent mode).
+    fn build_artifact_description(artifacts: &ArtifactSet) -> String {
+        let mut parts = Vec::new();
+        let summary = artifacts.summary();
+        if !summary.is_empty() {
+            parts.push(format!("Files changed: {summary}"));
+        }
+        for change in &artifacts.changes {
+            parts.push(format!("  {} ({})", change.path.display(), change.kind));
+        }
+        parts.join("\n")
     }
 
     /// Build the {{all_artifacts}} variable: file paths with their content.

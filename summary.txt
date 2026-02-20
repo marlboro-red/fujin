@@ -1,0 +1,16 @@
+FILE SUMMARY
+=============
+
+1. test-output.txt
+   Status: EXISTS
+   Contents:
+   ---
+   hello from fujin
+   ---
+
+2. copilot-verified.txt
+   Status: EXISTS
+   Contents:
+   ---
+   verified by copilot
+   ---

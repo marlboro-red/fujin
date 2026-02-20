@@ -14,6 +14,8 @@ pub enum PipelineEvent {
         pipeline_name: String,
         total_stages: usize,
         run_id: String,
+        /// Default runtime name for the pipeline.
+        runtime: String,
     },
 
     /// Resuming from a checkpoint.
@@ -29,6 +31,10 @@ pub enum PipelineEvent {
         stage_id: String,
         stage_name: String,
         model: String,
+        /// Runtime name for this stage (e.g. "claude-code", "copilot-cli").
+        runtime: String,
+        /// Allowed tools for this stage.
+        allowed_tools: Vec<String>,
         retry_group: Option<String>,
     },
 

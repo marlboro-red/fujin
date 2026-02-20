@@ -10,6 +10,16 @@ pub enum FileChangeKind {
     Deleted,
 }
 
+impl std::fmt::Display for FileChangeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Created => write!(f, "created"),
+            Self::Modified => write!(f, "modified"),
+            Self::Deleted => write!(f, "deleted"),
+        }
+    }
+}
+
 /// A single file change detected between workspace snapshots.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChange {

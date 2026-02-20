@@ -273,6 +273,7 @@ impl PipelineRunner {
             pipeline_name: self.config.name.clone(),
             total_stages,
             run_id: checkpoint.run_id.clone(),
+            runtime: self.config.runtime.clone(),
         });
 
         if options.dry_run {
@@ -307,6 +308,7 @@ impl PipelineRunner {
 
             let stage_config = &self.config.stages[stage_idx];
 
+            let stage_runtime = self.runtime_for_stage(stage_config);
             self.emit(PipelineEvent::StageStarted {
                 stage_index: stage_idx,
                 stage_id: stage_config.id.clone(),
@@ -316,6 +318,8 @@ impl PipelineRunner {
                 } else {
                     stage_config.model.clone()
                 },
+                runtime: stage_runtime.name().to_string(),
+                allowed_tools: stage_config.allowed_tools.clone(),
                 retry_group: stage_config.retry_group.clone(),
             });
 
