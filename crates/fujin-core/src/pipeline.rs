@@ -240,6 +240,145 @@ impl PipelineRunner {
         Ok(first_idx)
     }
 
+    /// Run the verify agent for a retry group's last stage.
+    ///
+    /// Called when the last stage in a retry group finishes (either executed or
+    /// skipped).  When the trigger is a *skipped* stage we only verify if at
+    /// least one earlier stage in the group actually completed — otherwise
+    /// there is nothing to verify.
+    ///
+    /// Returns `Some(jump_idx)` when verification fails and a retry is needed,
+    /// or `None` when verification passed (or was not applicable).
+    #[allow(clippy::too_many_arguments)]
+    async fn maybe_run_group_verify(
+        &self,
+        stage_idx: usize,
+        triggered_by_skip: bool,
+        retry_group_ranges: &HashMap<&str, (usize, usize)>,
+        verify_feedback: &mut HashMap<String, String>,
+        retry_counts: &mut HashMap<String, u32>,
+        checkpoint: &mut crate::checkpoint::Checkpoint,
+    ) -> CoreResult<Option<usize>> {
+        let stage_config = &self.config.stages[stage_idx];
+        let group_name = match stage_config.retry_group.as_ref() {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        let &(first_idx, last_idx) = match retry_group_ranges.get(group_name.as_str()) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if stage_idx != last_idx {
+            return Ok(None);
+        }
+
+        // When triggered by a skip, only verify if the group did real work.
+        if triggered_by_skip {
+            let group_has_completed = self.config.stages[first_idx..=last_idx]
+                .iter()
+                .any(|s| checkpoint.completed_stages.iter().any(|sr| sr.stage_id == s.id));
+            if !group_has_completed {
+                return Ok(None);
+            }
+        }
+
+        let group_config = self.config.retry_groups.get(group_name);
+        let verify_cfg = match group_config.and_then(|g| g.verify.as_ref()) {
+            Some(cfg) => cfg,
+            None => {
+                // No verify configured — clear retry counter and advance.
+                retry_counts.remove(group_name.as_str());
+                if triggered_by_skip {
+                    checkpoint.next_stage_index = stage_idx + 1;
+                    checkpoint.updated_at = Utc::now();
+                    self.checkpoint_manager.save(checkpoint)?;
+                }
+                return Ok(None);
+            }
+        };
+
+        // Hold checkpoint at this stage for crash-safety during verify.
+        if triggered_by_skip {
+            checkpoint.next_stage_index = stage_idx;
+            checkpoint.updated_at = Utc::now();
+            self.checkpoint_manager.save(checkpoint)?;
+        }
+
+        self.emit(PipelineEvent::VerifyRunning {
+            group_name: group_name.clone(),
+            stage_index: stage_idx,
+        });
+
+        let verdict = self.run_verify_agent(verify_cfg, stage_idx, checkpoint).await;
+
+        match verdict {
+            Ok(verify_response) => {
+                let passed = parse_verify_verdict(&verify_response);
+                if passed {
+                    self.emit(PipelineEvent::VerifyPassed {
+                        group_name: group_name.clone(),
+                        stage_index: stage_idx,
+                    });
+                    verify_feedback.remove(group_name);
+                    retry_counts.remove(group_name.as_str());
+                    checkpoint.next_stage_index = stage_idx + 1;
+                    checkpoint.updated_at = Utc::now();
+                    self.checkpoint_manager.save(checkpoint)?;
+                    Ok(None)
+                } else {
+                    self.emit(PipelineEvent::VerifyFailed {
+                        group_name: group_name.clone(),
+                        stage_index: stage_idx,
+                        response: verify_response.clone(),
+                    });
+                    verify_feedback.insert(group_name.clone(), verify_response.clone());
+                    let max_retries = group_config.map_or(5, |g| g.max_retries);
+                    let jump_idx = self.handle_retry_group_failure(
+                        group_name,
+                        first_idx,
+                        stage_idx,
+                        &stage_config.id,
+                        &verify_response,
+                        max_retries,
+                        retry_counts,
+                        checkpoint,
+                    ).await?;
+                    Ok(Some(jump_idx))
+                }
+            }
+            Err(e) => {
+                if matches!(&e, CoreError::Cancelled { .. }) {
+                    checkpoint.next_stage_index = stage_idx;
+                    checkpoint.updated_at = Utc::now();
+                    let _ = self.checkpoint_manager.save(checkpoint);
+                    self.emit(PipelineEvent::PipelineCancelled {
+                        stage_index: stage_idx,
+                    });
+                    return Err(e);
+                }
+                let error_msg = e.to_string();
+                self.emit(PipelineEvent::VerifyFailed {
+                    group_name: group_name.clone(),
+                    stage_index: stage_idx,
+                    response: error_msg.clone(),
+                });
+                verify_feedback.insert(group_name.clone(), error_msg.clone());
+                let max_retries = group_config.map_or(5, |g| g.max_retries);
+                let jump_idx = self.handle_retry_group_failure(
+                    group_name,
+                    first_idx,
+                    stage_idx,
+                    &stage_config.id,
+                    &error_msg,
+                    max_retries,
+                    retry_counts,
+                    checkpoint,
+                ).await?;
+                Ok(Some(jump_idx))
+            }
+        }
+    }
+
     /// Run the pipeline.
     pub async fn run(&self, options: &RunOptions) -> CoreResult<Vec<StageResult>> {
         // Ensure workspace exists
@@ -329,6 +468,17 @@ impl PipelineRunner {
                     checkpoint.next_stage_index = stage_idx + 1;
                     checkpoint.updated_at = Utc::now();
                     let _ = self.checkpoint_manager.save(&checkpoint);
+
+                    // If this skipped stage is the last in a retry group,
+                    // run verify against the work done by earlier stages.
+                    if let Some(jump_idx) = self.maybe_run_group_verify(
+                        stage_idx, true, &retry_group_ranges,
+                        &mut verify_feedback, &mut retry_counts, &mut checkpoint,
+                    ).await? {
+                        stage_idx = jump_idx;
+                        continue;
+                    }
+
                     stage_idx += 1;
                     continue;
                 }
@@ -350,6 +500,17 @@ impl PipelineRunner {
                     checkpoint.next_stage_index = stage_idx + 1;
                     checkpoint.updated_at = Utc::now();
                     let _ = self.checkpoint_manager.save(&checkpoint);
+
+                    // If this skipped stage is the last in a retry group,
+                    // run verify against the work done by earlier stages.
+                    if let Some(jump_idx) = self.maybe_run_group_verify(
+                        stage_idx, true, &retry_group_ranges,
+                        &mut verify_feedback, &mut retry_counts, &mut checkpoint,
+                    ).await? {
+                        stage_idx = jump_idx;
+                        continue;
+                    }
+
                     stage_idx += 1;
                     continue;
                 }
@@ -536,114 +697,13 @@ impl PipelineRunner {
             // 5. Save checkpoint
             self.checkpoint_manager.save(&checkpoint)?;
 
-            // Clear retry counter on successful completion of a retry group's last stage
-            if let Some(ref group_name) = stage_config.retry_group {
-                if let Some(&(first_idx, last_idx)) = retry_group_ranges.get(group_name.as_str()) {
-                    if stage_idx == last_idx {
-                        // Run verification agent if configured
-                        let group_config = self.config.retry_groups.get(group_name);
-                        if let Some(verify_cfg) = group_config.and_then(|g| g.verify.as_ref()) {
-                            self.emit(PipelineEvent::VerifyRunning {
-                                group_name: group_name.clone(),
-                                stage_index: stage_idx,
-                            });
-
-                            let verdict = self.run_verify_agent(
-                                verify_cfg,
-                                stage_idx,
-                                &checkpoint,
-                            ).await;
-
-                            match verdict {
-                                Ok(verify_response) => {
-                                    let passed = parse_verify_verdict(&verify_response);
-
-                                    if passed {
-                                        self.emit(PipelineEvent::VerifyPassed {
-                                            group_name: group_name.clone(),
-                                            stage_index: stage_idx,
-                                        });
-                                        verify_feedback.remove(group_name);
-
-                                        // Verification passed — now safe to advance checkpoint
-                                        checkpoint.next_stage_index = stage_idx + 1;
-                                        checkpoint.updated_at = Utc::now();
-                                        self.checkpoint_manager.save(&checkpoint)?;
-                                    } else {
-                                        self.emit(PipelineEvent::VerifyFailed {
-                                            group_name: group_name.clone(),
-                                            stage_index: stage_idx,
-                                            response: verify_response.clone(),
-                                        });
-
-                                        // Store feedback so the first stage gets it on retry
-                                        verify_feedback.insert(group_name.clone(), verify_response.clone());
-
-                                        let max_retries = group_config.map_or(5, |g| g.max_retries);
-                                        match self.handle_retry_group_failure(
-                                            group_name,
-                                            first_idx,
-                                            stage_idx,
-                                            &stage_config.id,
-                                            &verify_response,
-                                            max_retries,
-                                            &mut retry_counts,
-                                            &mut checkpoint,
-                                        ).await {
-                                            Ok(jump_idx) => {
-                                                stage_idx = jump_idx;
-                                                continue;
-                                            }
-                                            Err(abort_err) => return Err(abort_err),
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    // Check if this is a cancellation — propagate properly
-                                    if matches!(&e, CoreError::Cancelled { .. }) {
-                                        checkpoint.next_stage_index = stage_idx;
-                                        checkpoint.updated_at = Utc::now();
-                                        let _ = self.checkpoint_manager.save(&checkpoint);
-                                        self.emit(PipelineEvent::PipelineCancelled {
-                                            stage_index: stage_idx,
-                                        });
-                                        return Err(e);
-                                    }
-
-                                    // Agent execution error — treat as verify failure
-                                    let error_msg = e.to_string();
-                                    self.emit(PipelineEvent::VerifyFailed {
-                                        group_name: group_name.clone(),
-                                        stage_index: stage_idx,
-                                        response: error_msg.clone(),
-                                    });
-
-                                    verify_feedback.insert(group_name.clone(), error_msg.clone());
-
-                                    let max_retries = group_config.map_or(5, |g| g.max_retries);
-                                    match self.handle_retry_group_failure(
-                                        group_name,
-                                        first_idx,
-                                        stage_idx,
-                                        &stage_config.id,
-                                        &error_msg,
-                                        max_retries,
-                                        &mut retry_counts,
-                                        &mut checkpoint,
-                                    ).await {
-                                        Ok(jump_idx) => {
-                                            stage_idx = jump_idx;
-                                            continue;
-                                        }
-                                        Err(abort_err) => return Err(abort_err),
-                                    }
-                                }
-                            }
-                        }
-
-                        retry_counts.remove(group_name.as_str());
-                    }
-                }
+            // Run verify for this retry group if this is the last stage
+            if let Some(jump_idx) = self.maybe_run_group_verify(
+                stage_idx, false, &retry_group_ranges,
+                &mut verify_feedback, &mut retry_counts, &mut checkpoint,
+            ).await? {
+                stage_idx = jump_idx;
+                continue;
             }
 
             info!(

@@ -1881,3 +1881,112 @@ stages:
         .collect();
     assert_eq!(skipped, vec!["route-a"]);
 }
+
+#[tokio::test]
+async fn test_verify_runs_when_last_group_stage_skipped_by_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // The branch routes to "alpha", so beta-impl (the last stage in the
+    // retry group by index) is skipped.  Verify should still fire after
+    // alpha-impl completes because the group did real work.
+    let yaml = r#"
+name: branch-verify-test
+retry_groups:
+  grp:
+    max_retries: 2
+    verify:
+      model: mock-model
+      system_prompt: "Verify"
+      user_prompt: "Check it"
+      allowed_tools: ["bash"]
+stages:
+  - id: classify
+    name: Classify
+    model: mock-model
+    system_prompt: "Classify"
+    user_prompt: "Classify"
+    branch:
+      prompt: "Pick alpha or beta"
+      routes: [alpha, beta]
+      default: alpha
+  - id: alpha-impl
+    name: Alpha
+    model: mock-model
+    on_branch: alpha
+    retry_group: grp
+    system_prompt: "Alpha"
+    user_prompt: "Do alpha"
+  - id: beta-impl
+    name: Beta
+    model: mock-model
+    on_branch: beta
+    retry_group: grp
+    system_prompt: "Beta"
+    user_prompt: "Do beta"
+  - id: done
+    name: Done
+    model: mock-model
+    system_prompt: "Done"
+    user_prompt: "Wrap up"
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // Branch classifier returns "alpha"; verify agent returns "PASS"
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(BranchMockRuntime::new(
+            vec![("__branch_classifier_0", "alpha")],
+            "All good. PASS",
+        )));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed");
+    // classify + alpha-impl + done = 3 (beta-impl skipped)
+    assert_eq!(results.len(), 3);
+
+    let completed_ids: Vec<&str> = results.iter().map(|r| r.stage_id.as_str()).collect();
+    assert_eq!(completed_ids, vec!["classify", "alpha-impl", "done"]);
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    // beta-impl should be skipped
+    let skipped: Vec<_> = events
+        .iter()
+        .filter_map(|e| {
+            if let PipelineEvent::StageSkipped { stage_id, .. } = e {
+                Some(stage_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(skipped, vec!["beta-impl"]);
+
+    // Verify should have run and passed even though the last group stage was skipped
+    let has_verify_running = events
+        .iter()
+        .any(|e| matches!(e, PipelineEvent::VerifyRunning { .. }));
+    assert!(has_verify_running, "Verify should run when last group stage is skipped by branch");
+
+    let has_verify_passed = events
+        .iter()
+        .any(|e| matches!(e, PipelineEvent::VerifyPassed { .. }));
+    assert!(has_verify_passed, "Verify should pass");
+}
