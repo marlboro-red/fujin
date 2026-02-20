@@ -180,4 +180,19 @@ pub enum PipelineEvent {
         selected_route: String,
         available_routes: Vec<String>,
     },
+
+    /// Variables were successfully loaded from an exports file.
+    ExportsLoaded {
+        stage_index: usize,
+        stage_id: String,
+        /// The key-value pairs that were merged into pipeline variables.
+        variables: Vec<(String, String)>,
+    },
+
+    /// A warning occurred while processing stage exports.
+    ExportsWarning {
+        stage_index: usize,
+        stage_id: String,
+        message: String,
+    },
 }

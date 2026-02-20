@@ -346,6 +346,7 @@ mod tests {
             when: None,
             branch: None,
             on_branch: None,
+            exports: None,
         };
         let context = StageContext {
             rendered_prompt: "Write hello world".to_string(),
@@ -377,6 +378,7 @@ mod tests {
             when: None,
             branch: None,
             on_branch: None,
+            exports: None,
         };
         let context = StageContext {
             rendered_prompt: "Write hello world".to_string(),
@@ -406,6 +408,7 @@ mod tests {
             when: None,
             branch: None,
             on_branch: None,
+            exports: None,
         };
         let context = StageContext {
             rendered_prompt: "Continue the work".to_string(),
@@ -436,6 +439,7 @@ mod tests {
             when: None,
             branch: None,
             on_branch: None,
+            exports: None,
         };
         // If prior_summary is already embedded in the rendered prompt, it should not be duplicated
         let context = StageContext {
@@ -465,6 +469,7 @@ mod tests {
             when: None,
             branch: None,
             on_branch: None,
+            exports: None,
         };
         let context = StageContext {
             rendered_prompt: "Fix the issues".to_string(),
@@ -495,6 +500,7 @@ mod tests {
             when: None,
             branch: None,
             on_branch: None,
+            exports: None,
         };
         let context = StageContext {
             rendered_prompt: "Review the files".to_string(),
@@ -528,6 +534,7 @@ mod tests {
             when: None,
             branch: None,
             on_branch: None,
+            exports: None,
         };
         let context = StageContext {
             rendered_prompt: "Do the work".to_string(),

@@ -4,6 +4,7 @@ use crate::context::ContextBuilder;
 use crate::create_runtime;
 use crate::error::{CoreError, CoreResult};
 use crate::event::PipelineEvent;
+use crate::paths::exports_dir;
 use crate::stage::StageResult;
 use crate::workspace::Workspace;
 use chrono::Utc;
@@ -432,6 +433,9 @@ impl PipelineRunner {
         // Store verify agent feedback per retry group for injection into stage context on retry
         let mut verify_feedback: HashMap<String, String> = HashMap::new();
 
+        // Accumulate variables exported by stages via their `exports` config
+        let mut exported_vars: HashMap<String, String> = HashMap::new();
+
         let mut stage_idx = start_index;
 
         while stage_idx < total_stages {
@@ -533,9 +537,30 @@ impl PipelineRunner {
 
             let stage_start = Instant::now();
 
+            // Compute the exports file path and inject {{exports_file}} for stages with exports
+            let export_file_path = if stage_config.exports.is_some() {
+                let export_path = exports_dir(self.workspace.root())
+                    .join(&checkpoint.run_id)
+                    .join(format!("{}.json", stage_config.id));
+                // Create the parent directory so the agent can write to it
+                if let Some(parent) = export_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| CoreError::WorkspaceError {
+                        path: parent.to_path_buf(),
+                        message: format!("Failed to create exports directory: {e}"),
+                    })?;
+                }
+                exported_vars.insert(
+                    "exports_file".to_string(),
+                    export_path.display().to_string(),
+                );
+                Some(export_path)
+            } else {
+                None
+            };
+
             // 1. Execute stage (command or agent)
             let stage_exec_result = if stage_config.is_command_stage() {
-                self.run_command_stage(stage_idx, stage_config, &stage_start)
+                self.run_command_stage(stage_idx, stage_config, &stage_start, &exported_vars)
                     .await
             } else {
                 // Look up verify feedback for this stage's retry group
@@ -551,6 +576,7 @@ impl PipelineRunner {
                     &checkpoint,
                     &stage_start,
                     feedback,
+                    &exported_vars,
                 )
                 .await
             };
@@ -674,6 +700,66 @@ impl PipelineRunner {
 
             checkpoint.completed_stages.push(stage_result);
 
+            // 4b. Process exports: read JSON file from data dir and merge into pipeline variables
+            if let Some(ref exports) = stage_config.exports {
+                let export_path = export_file_path.as_ref().unwrap();
+                match std::fs::read_to_string(export_path) {
+                    Ok(contents) => {
+                        match serde_json::from_str::<HashMap<String, String>>(&contents) {
+                            Ok(vars) => {
+                                // Warn about missing expected keys
+                                for key in &exports.keys {
+                                    if !vars.contains_key(key) {
+                                        self.emit(PipelineEvent::ExportsWarning {
+                                            stage_index: stage_idx,
+                                            stage_id: stage_config.id.clone(),
+                                            message: format!(
+                                                "Expected key '{}' not found in exports",
+                                                key
+                                            ),
+                                        });
+                                    }
+                                }
+
+                                let loaded: Vec<(String, String)> =
+                                    vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+                                // Merge into accumulated exported variables
+                                for (k, v) in vars {
+                                    exported_vars.insert(k, v);
+                                }
+
+                                self.emit(PipelineEvent::ExportsLoaded {
+                                    stage_index: stage_idx,
+                                    stage_id: stage_config.id.clone(),
+                                    variables: loaded,
+                                });
+                            }
+                            Err(e) => {
+                                self.emit(PipelineEvent::ExportsWarning {
+                                    stage_index: stage_idx,
+                                    stage_id: stage_config.id.clone(),
+                                    message: format!(
+                                        "Failed to parse exports file: {}",
+                                        e
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.emit(PipelineEvent::ExportsWarning {
+                            stage_index: stage_idx,
+                            stage_id: stage_config.id.clone(),
+                            message: format!(
+                                "Failed to read exports file {}: {}",
+                                export_path.display(), e
+                            ),
+                        });
+                    }
+                }
+            }
+
             // Determine if verification is pending before advancing the checkpoint.
             // If this is the last stage in a retry group with a verify agent, we must
             // NOT advance next_stage_index until verification passes — otherwise a
@@ -749,6 +835,7 @@ impl PipelineRunner {
         checkpoint: &crate::checkpoint::Checkpoint,
         stage_start: &Instant,
         verify_feedback: Option<&str>,
+        exported_vars: &HashMap<String, String>,
     ) -> CoreResult<(String, Option<crate::stage::TokenUsage>)> {
         // Build context
         self.emit(PipelineEvent::ContextBuilding {
@@ -757,7 +844,7 @@ impl PipelineRunner {
         let prior_result = checkpoint.completed_stages.last();
         let context = self
             .context_builder
-            .build(&self.config, stage_config, prior_result, &self.workspace, verify_feedback, &checkpoint.completed_stages)
+            .build(&self.config, stage_config, prior_result, &self.workspace, verify_feedback, &checkpoint.completed_stages, exported_vars)
             .await?;
 
         self.emit(PipelineEvent::StageContext {
@@ -848,6 +935,7 @@ impl PipelineRunner {
         stage_idx: usize,
         stage_config: &StageConfig,
         stage_start: &Instant,
+        exported_vars: &HashMap<String, String>,
     ) -> CoreResult<(String, Option<crate::stage::TokenUsage>)> {
         let commands = stage_config.commands.as_ref().unwrap();
         let total_commands = commands.len();
@@ -872,8 +960,11 @@ impl PipelineRunner {
             }
         });
 
-        // Render command templates with pipeline variables
+        // Render command templates with pipeline variables + exported variables
         let mut vars = self.config.variables.clone();
+        for (k, v) in exported_vars {
+            vars.insert(k.clone(), v.clone());
+        }
         vars.insert("stage_id".to_string(), stage_config.id.clone());
         vars.insert("stage_name".to_string(), stage_config.name.clone());
 
@@ -944,13 +1035,16 @@ impl PipelineRunner {
             when: None,
             branch: None,
             on_branch: None,
+            exports: None,
         };
 
         // Build context (includes prior stage results and changed files)
+        // Verify agents don't need exported vars — pass an empty map
+        let empty_vars = HashMap::new();
         let prior_result = checkpoint.completed_stages.last();
         let context = self
             .context_builder
-            .build(&self.config, &verify_stage, prior_result, &self.workspace, None, &checkpoint.completed_stages)
+            .build(&self.config, &verify_stage, prior_result, &self.workspace, None, &checkpoint.completed_stages, &empty_vars)
             .await?;
 
         // Create a progress channel that bridges verify agent activity to PipelineEvent
@@ -1027,6 +1121,7 @@ impl PipelineRunner {
             when: None,
             branch: None,
             on_branch: None,
+            exports: None,
         };
 
         // Build a minimal context (no prior summary needed)

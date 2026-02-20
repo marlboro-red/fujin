@@ -1990,3 +1990,351 @@ stages:
         .any(|e| matches!(e, PipelineEvent::VerifyPassed { .. }));
     assert!(has_verify_passed, "Verify should pass");
 }
+
+// ---------------------------------------------------------------------------
+// Exports: agent-set variables (stored in platform data dir, not workspace)
+// ---------------------------------------------------------------------------
+
+/// A mock runtime that simulates an agent writing an exports JSON file.
+///
+/// When executing a stage whose ID is in `stage_exports`, the mock finds the
+/// pre-created exports directory on the filesystem (created by the pipeline
+/// runner) and writes the JSON content to `<stage_id>.json` inside it.
+struct ExportWriterMock {
+    stage_exports: std::collections::HashMap<String, String>,
+    default_response: String,
+}
+
+impl ExportWriterMock {
+    fn new(exports: Vec<(&str, &str)>, default_response: &str) -> Self {
+        Self {
+            stage_exports: exports
+                .into_iter()
+                .map(|(id, json)| (id.to_string(), json.to_string()))
+                .collect(),
+            default_response: default_response.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for ExportWriterMock {
+    fn name(&self) -> &str {
+        "export-writer-mock"
+    }
+
+    async fn execute(
+        &self,
+        config: &fujin_config::StageConfig,
+        _context: &StageContext,
+        workspace_root: &Path,
+        _progress_tx: Option<mpsc::UnboundedSender<String>>,
+        _cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> CoreResult<AgentOutput> {
+        // If this stage should write exports, find the pre-created directory
+        // and write the JSON file there. The pipeline runner creates
+        // <exports_dir>/<run_id>/ before executing the stage.
+        if let Some(json_content) = self.stage_exports.get(&config.id) {
+            let ws_exports_dir = fujin_core::paths::exports_dir(workspace_root);
+            if ws_exports_dir.exists() {
+                // Find the run_id subdirectory (the pipeline pre-creates it)
+                if let Ok(entries) = std::fs::read_dir(&ws_exports_dir) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                            let target = entry.path().join(format!("{}.json", config.id));
+                            std::fs::write(&target, json_content).map_err(|e| {
+                                CoreError::AgentError {
+                                    message: format!(
+                                        "Mock failed to write exports to {}: {e}",
+                                        target.display()
+                                    ),
+                                }
+                            })?;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(AgentOutput {
+            response_text: self.default_response.clone(),
+            token_usage: None,
+        })
+    }
+
+    async fn health_check(&self) -> CoreResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_exports_loads_variables_for_downstream_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: exports-test
+stages:
+  - id: analyze
+    name: Analyze
+    model: mock-model
+    system_prompt: "You are an analyzer."
+    user_prompt: "Analyze the project. Write findings to {{exports_file}}"
+    exports:
+      keys: [language, framework]
+  - id: implement
+    name: Implement
+    model: mock-model
+    system_prompt: "You are a developer."
+    user_prompt: "Build in {{language}} using {{framework}}."
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // Mock writes exports JSON when executing the "analyze" stage
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(ExportWriterMock::new(
+            vec![("analyze", r#"{"language": "rust", "framework": "actix"}"#)],
+            "done",
+        )));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed");
+    assert_eq!(results.len(), 2);
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    // Should have an ExportsLoaded event
+    let exports_loaded = events.iter().find_map(|e| {
+        if let PipelineEvent::ExportsLoaded { stage_id, variables, .. } = e {
+            Some((stage_id.clone(), variables.clone()))
+        } else {
+            None
+        }
+    });
+    assert!(exports_loaded.is_some(), "Expected ExportsLoaded event");
+    let (stage_id, variables) = exports_loaded.unwrap();
+    assert_eq!(stage_id, "analyze");
+    assert!(variables.contains(&("language".to_string(), "rust".to_string())));
+    assert!(variables.contains(&("framework".to_string(), "actix".to_string())));
+
+    // The rendered prompt for the implement stage should contain the exported values
+    let stage_context = events.iter().find_map(|e| {
+        if let PipelineEvent::StageContext { stage_index, rendered_prompt, .. } = e {
+            if *stage_index == 1 {
+                Some(rendered_prompt.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+    assert!(stage_context.is_some(), "Expected StageContext for stage 1");
+    let prompt = stage_context.unwrap();
+    assert!(
+        prompt.contains("rust") && prompt.contains("actix"),
+        "Exported variables should be rendered in downstream prompt, got: {}",
+        prompt
+    );
+
+    // Verify exports file is NOT in the workspace directory
+    assert!(
+        !dir.path().join(".fujin/exports").exists(),
+        "Exports should NOT be stored in the workspace"
+    );
+}
+
+#[tokio::test]
+async fn test_exports_missing_file_emits_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // Mock does NOT write any exports file — agent "forgot" to write it
+
+    let yaml = r#"
+name: exports-missing-test
+stages:
+  - id: analyze
+    name: Analyze
+    model: mock-model
+    system_prompt: "You are an analyzer."
+    user_prompt: "Analyze the project."
+    exports: {}
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("done")));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    // Pipeline should still succeed — exports warnings are non-fatal
+    let results = runner.run(&options).await.expect("Pipeline should succeed despite missing exports");
+    assert_eq!(results.len(), 1);
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    // Should have an ExportsWarning event
+    let has_warning = events.iter().any(|e| {
+        matches!(e, PipelineEvent::ExportsWarning { message, .. } if message.contains("Failed to read"))
+    });
+    assert!(has_warning, "Expected ExportsWarning for missing file");
+}
+
+#[tokio::test]
+async fn test_exports_missing_keys_emits_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: exports-keys-test
+stages:
+  - id: analyze
+    name: Analyze
+    model: mock-model
+    system_prompt: "You are an analyzer."
+    user_prompt: "Analyze the project. Write to {{exports_file}}"
+    exports:
+      keys: [language, framework, db]
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // Mock writes exports with only "language" key — framework and db are missing
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(ExportWriterMock::new(
+            vec![("analyze", r#"{"language": "rust"}"#)],
+            "done",
+        )));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed");
+    assert_eq!(results.len(), 1);
+
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    // Should have ExportsLoaded (for the key that was present)
+    let has_loaded = events.iter().any(|e| matches!(e, PipelineEvent::ExportsLoaded { .. }));
+    assert!(has_loaded, "Expected ExportsLoaded event");
+
+    // Should have warnings for missing keys
+    let warnings: Vec<_> = events
+        .iter()
+        .filter_map(|e| {
+            if let PipelineEvent::ExportsWarning { message, .. } = e {
+                Some(message.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(warnings.len(), 2, "Expected 2 warnings for missing keys (framework, db)");
+    assert!(warnings.iter().any(|w| w.contains("framework")));
+    assert!(warnings.iter().any(|w| w.contains("db")));
+}
+
+#[tokio::test]
+async fn test_exports_available_in_command_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: exports-cmd-test
+stages:
+  - id: analyze
+    name: Analyze
+    model: mock-model
+    system_prompt: "You are an analyzer."
+    user_prompt: "Analyze. Write to {{exports_file}}"
+    exports: {}
+  - id: build
+    name: Build
+    commands:
+      - "echo {{build_target}} > build_mode.txt"
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    // Mock writes exports JSON with build_target when executing "analyze"
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(ExportWriterMock::new(
+            vec![("analyze", r#"{"build_target": "release"}"#)],
+            "done",
+        )));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed");
+    assert_eq!(results.len(), 2);
+
+    // Verify the exported variable was rendered in the command
+    let content = std::fs::read_to_string(dir.path().join("build_mode.txt")).unwrap();
+    assert!(
+        content.contains("release"),
+        "Exported variable should be rendered in command stage, got: {}",
+        content
+    );
+}

@@ -569,6 +569,23 @@ impl ExecutionState {
                     stage.branch_info = Some((selected_route, available_routes));
                 }
             }
+
+            PipelineEvent::ExportsLoaded { stage_index, variables, .. } => {
+                if let Some(stage) = self.stages.get_mut(stage_index) {
+                    if let StageStatus::Completed { activity_log, .. } = &mut stage.status {
+                        let names: Vec<&str> = variables.iter().map(|(k, _)| k.as_str()).collect();
+                        activity_log.push(format!("Exported variables: {}", names.join(", ")));
+                    }
+                }
+            }
+
+            PipelineEvent::ExportsWarning { stage_index, message, .. } => {
+                if let Some(stage) = self.stages.get_mut(stage_index) {
+                    if let StageStatus::Completed { activity_log, .. } = &mut stage.status {
+                        activity_log.push(format!("Export warning: {}", message));
+                    }
+                }
+            }
         }
     }
 

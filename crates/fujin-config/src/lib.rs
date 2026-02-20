@@ -1,7 +1,7 @@
 mod pipeline_config;
 mod validation;
 
-pub use pipeline_config::{BranchConfig, PipelineConfig, RetryGroupConfig, StageConfig, SummarizerConfig, VerifyConfig, WhenCondition, KNOWN_RUNTIMES};
+pub use pipeline_config::{BranchConfig, ExportsConfig, PipelineConfig, RetryGroupConfig, StageConfig, SummarizerConfig, VerifyConfig, WhenCondition, KNOWN_RUNTIMES};
 pub use validation::{validate, ValidationResult};
 
 #[derive(Debug, thiserror::Error)]

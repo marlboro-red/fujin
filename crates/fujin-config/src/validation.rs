@@ -114,6 +114,19 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
                 .errors
                 .push(format!("{prefix}: timeout_secs must be greater than 0"));
         }
+
+        // Validate exports config
+        if let Some(ref exports) = stage.exports {
+            if stage.is_command_stage() {
+                result.warnings.push(format!(
+                    "{prefix}: exports on a command stage — the agent won't have \
+                     access to {{{{exports_file}}}}"
+                ));
+            }
+            // keys is optional; no further validation needed since the
+            // export file path is auto-computed by the pipeline runner
+            let _ = exports;
+        }
     }
 
     // Check for {{prior_summary}} usage in first stage
@@ -1025,5 +1038,46 @@ stages:
         .unwrap();
         let result = validate(&config);
         assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
+
+    // --- Exports validation tests ---
+
+    #[test]
+    fn test_exports_valid() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    exports:
+      keys: [language, framework]
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_exports_on_command_stage_warns() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    commands:
+      - "echo hi"
+    exports:
+      keys: [language]
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid()); // warning, not error
+        assert!(result.warnings.iter().any(|w| w.contains("exports on a command stage")));
     }
 }

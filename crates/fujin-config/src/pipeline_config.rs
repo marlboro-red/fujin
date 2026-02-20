@@ -109,6 +109,20 @@ pub struct VerifyConfig {
     pub timeout_secs: Option<u64>,
 }
 
+/// Configuration for exporting agent-set variables from a stage.
+///
+/// After a stage completes, the pipeline runner reads a JSON file from the
+/// platform data directory and merges its key-value pairs into the pipeline's
+/// template variables. The export file path is auto-computed and injected as
+/// `{{exports_file}}` — the agent writes to that path, and the runner reads it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportsConfig {
+    /// Optional list of expected keys. If specified, the runner emits a warning
+    /// for any keys that are missing from the file.
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
 /// Condition for gating stage execution based on a prior stage's output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhenCondition {
@@ -198,6 +212,12 @@ pub struct StageConfig {
     /// `None` means the stage always runs (no branch gating).
     #[serde(default, deserialize_with = "deserialize_on_branch")]
     pub on_branch: Option<Vec<String>>,
+
+    /// Export agent-set variables from this stage.
+    /// After the stage completes, the runner reads the specified JSON file
+    /// and merges its key-value pairs into the pipeline's template variables.
+    #[serde(default)]
+    pub exports: Option<ExportsConfig>,
 }
 
 impl StageConfig {
@@ -609,5 +629,52 @@ stages:
 "#;
         let config = PipelineConfig::from_yaml(yaml).unwrap();
         assert!(config.stages[0].on_branch.is_none());
+    }
+
+    #[test]
+    fn test_exports_config_with_keys() {
+        let yaml = r#"
+name: exports-test
+stages:
+  - id: analyze
+    name: Analyze
+    system_prompt: "sp"
+    user_prompt: "up"
+    exports:
+      keys: [language, framework]
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        let exports = config.stages[0].exports.as_ref().unwrap();
+        assert_eq!(exports.keys, vec!["language", "framework"]);
+    }
+
+    #[test]
+    fn test_exports_config_empty() {
+        let yaml = r#"
+name: exports-test
+stages:
+  - id: analyze
+    name: Analyze
+    system_prompt: "sp"
+    user_prompt: "up"
+    exports: {}
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        let exports = config.stages[0].exports.as_ref().unwrap();
+        assert!(exports.keys.is_empty());
+    }
+
+    #[test]
+    fn test_exports_absent_by_default() {
+        let yaml = r#"
+name: no-exports
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert!(config.stages[0].exports.is_none());
     }
 }

@@ -231,6 +231,25 @@ on_branch: [frontend, fullstack]       # runs if either was selected
 
 Stages without `on_branch` always run, making them natural convergence points after branched sections.
 
+#### `exports` (optional, object)
+
+Declares that this stage exports variables for downstream stages. The pipeline runner auto-generates a unique file path for the exports and injects it as `{{exports_file}}`. After the stage completes, the runner reads that file and merges its key-value pairs into the pipeline's template variables.
+
+```yaml
+exports:
+  keys: [language, framework]             # optional: expected keys (for validation)
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `keys` | list | `[]` | Optional list of expected keys. If any are missing from the file, a warning is emitted (pipeline continues). |
+
+The agent is responsible for writing the JSON file during execution. Use `{{exports_file}}` in your `user_prompt` to tell the agent where to write. After the stage completes, the runner reads the file, parses it, and merges the key-value pairs into the pipeline's variables. Downstream stages can reference exported values with `{{variable_name}}`.
+
+Export files are stored in the platform data directory (not the workspace), so they don't pollute the repository. The path is unique per workspace and per run.
+
+If the file doesn't exist or is malformed, a warning is emitted but the pipeline continues — missing variables render as empty strings, matching the existing behavior for undefined template variables.
+
 ---
 
 ## Template variables
@@ -265,6 +284,7 @@ These are automatically injected by fujin and don't need to be defined in `varia
 | `{{all_artifacts}}` | Stage 2+ | Full content of files changed by the previous stage, formatted as `=== path ===\n<content>` blocks |
 | `{{stages.<id>.summary}}` | After stage `<id>` completes | Summary of a specific completed stage, referenced by its `id` |
 | `{{stages.<id>.response}}` | After stage `<id>` completes | Full response text of a specific completed stage |
+| `{{exports_file}}` | Stages with `exports` | Path where the agent should write its exports JSON file |
 
 Using `{{prior_summary}}` in the first stage produces a validation warning since there is no prior stage.
 
@@ -275,6 +295,37 @@ user_prompt: |
   Based on the analysis: {{stages.analyze.summary}}
   Build the frontend components.
 ```
+
+### Agent-exported variables
+
+Stages with an `exports` config can set variables at runtime. The pipeline injects `{{exports_file}}` with a unique path for the agent to write to. After the stage completes, the runner reads the file and merges its key-value pairs into the template variables for all subsequent stages:
+
+```yaml
+stages:
+  - id: analyze
+    name: Analyze Project
+    system_prompt: "You are a project analyzer."
+    user_prompt: |
+      Analyze the project and determine the primary language and framework.
+      Write your findings as a flat JSON object to {{exports_file}}:
+      {"language": "...", "framework": "..."}
+    exports:
+      keys: [language, framework]
+
+  - id: implement
+    name: Implement
+    system_prompt: "You are an expert {{language}} developer."
+    user_prompt: "Build a REST API using {{framework}}."
+```
+
+Key points:
+- Use `{{exports_file}}` in your prompt to tell the agent where to write — the pipeline computes the path automatically
+- Export files are stored in the platform data directory, not in the workspace/repository
+- The JSON file must contain a flat object with string values: `{"key": "value"}`
+- Exported variables override YAML-defined variables with the same name
+- Multiple stages can export variables; later exports override earlier ones for the same key
+- If the file is missing or malformed, a warning is emitted but the pipeline continues
+- Exported variables are available in both agent stages and command stages
 
 ### Runtime overrides
 
@@ -742,6 +793,46 @@ stages:
       - "cargo fmt"
 ```
 
+### Dynamic variables with exports
+
+A pipeline where the first stage discovers project properties and exports them for downstream stages:
+
+```yaml
+name: "Auto-Detect and Build"
+stages:
+  - id: analyze
+    name: Analyze Project
+    model: "claude-sonnet-4-6"
+    system_prompt: |
+      You are a project analyzer. Examine the codebase to determine
+      the technology stack.
+    user_prompt: |
+      Analyze this project and determine:
+      - Primary programming language
+      - Web framework (if any)
+      - Package manager
+
+      Write your findings as a flat JSON object to {{exports_file}} like:
+      {"language": "rust", "framework": "actix-web", "pkg_manager": "cargo"}
+    allowed_tools: ["read", "glob", "bash"]
+    exports:
+      keys: [language, framework, pkg_manager]
+
+  - id: implement
+    name: Implement Feature
+    model: "claude-sonnet-4-6"
+    system_prompt: |
+      You are an expert {{language}} developer familiar with {{framework}}.
+    user_prompt: |
+      Add a health check endpoint to this {{framework}} project.
+    allowed_tools: ["read", "write", "edit"]
+
+  - id: test
+    name: Run Tests
+    commands:
+      - "{{pkg_manager}} test"
+```
+
 ### Review and refactor pipeline
 
 A pipeline that generates code and then reviews/improves it:
@@ -818,12 +909,14 @@ Fujin validates your pipeline config before execution. The following rules are e
 - `branch.default` (if set) must be one of the defined routes
 - `on_branch` values must match a route defined in an earlier stage's `branch`
 - A stage cannot have both `branch` and `on_branch`
-
 **Warnings** (reported but don't prevent execution):
 - Unknown tool names in `allowed_tools` (valid: `read`, `write`, `bash`, `edit`, `glob`, `grep`, `notebook`)
 - Unknown runtime name (valid: `claude-code`, `copilot-cli`)
 - First stage references `{{prior_summary}}` (will be empty)
 - A `branch` route has no downstream `on_branch` stage that references it
+- `exports` on a command stage (the agent won't have access to `{{exports_file}}`)
+- `exports.keys` lists a key not found in the exports JSON file at runtime
+- Exports JSON file is missing or malformed at runtime
 
 Validate without running:
 

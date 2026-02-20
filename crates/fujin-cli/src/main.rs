@@ -567,6 +567,38 @@ fn spawn_cli_display(mut rx: mpsc::UnboundedReceiver<PipelineEvent>) {
                     );
                 }
 
+                PipelineEvent::ExportsLoaded {
+                    variables,
+                    ..
+                } => {
+                    println!(
+                        "  {} Exported {} variable{}",
+                        style("↗").cyan().bold(),
+                        variables.len(),
+                        if variables.len() == 1 { "" } else { "s" }
+                    );
+                    for (key, value) in &variables {
+                        println!(
+                            "    {} = {}",
+                            style(key).bold(),
+                            style(truncate_chars(value, 60)).dim()
+                        );
+                    }
+                }
+
+                PipelineEvent::ExportsWarning {
+                    stage_id,
+                    message,
+                    ..
+                } => {
+                    eprintln!(
+                        "  {} exports (stage '{}'): {}",
+                        style("⚠").yellow(),
+                        stage_id,
+                        message
+                    );
+                }
+
                 // Tick / activity / context-building are handled by the spinner
                 _ => {}
             }

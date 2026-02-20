@@ -53,6 +53,10 @@ impl ContextBuilder {
     ///
     /// Per-stage template variables like `{{stages.<id>.summary}}` are
     /// populated for every completed stage in `all_completed`.
+    ///
+    /// `extra_vars` contains variables exported by earlier stages (via `exports`).
+    /// These are merged after config variables, so exports override YAML defaults.
+    #[allow(clippy::too_many_arguments)]
     pub async fn build(
         &self,
         config: &PipelineConfig,
@@ -61,9 +65,15 @@ impl ContextBuilder {
         workspace: &Workspace,
         verify_feedback: Option<&str>,
         all_completed: &[StageResult],
+        extra_vars: &HashMap<String, String>,
     ) -> CoreResult<StageContext> {
         // Build template variables
         let mut vars: HashMap<String, String> = config.variables.clone();
+
+        // Merge exported variables (from prior stages' exports files)
+        for (k, v) in extra_vars {
+            vars.insert(k.clone(), v.clone());
+        }
 
         // Per-stage template variables: {{stages.<id>.summary}} and {{stages.<id>.response}}
         for result in all_completed {

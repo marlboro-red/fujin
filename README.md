@@ -294,7 +294,40 @@ stages:
 
 `on_branch` accepts a single string or a list: `on_branch: [frontend, fullstack]` runs if either route was selected.
 
-See the [Pipeline Authoring Guide](docs/pipeline-authoring.md) for full details.
+### Exports
+
+Stages can export variables at runtime for downstream stages to use. The pipeline runner auto-generates a unique file path for each stage with `exports` and injects it as `{{exports_file}}`. The agent writes a flat JSON object to that path, and the runner merges its values into the template variables:
+
+```yaml
+stages:
+  - id: analyze
+    name: Analyze
+    system_prompt: "You are a project analyzer."
+    user_prompt: |
+      Analyze the project. Write findings as a flat JSON object to {{exports_file}}:
+      {"language": "...", "framework": "..."}
+    exports:
+      keys: [language, framework]    # optional: warns if keys are missing
+
+  - id: implement
+    name: Implement
+    system_prompt: "You are a {{language}} developer."
+    user_prompt: "Build a REST API using {{framework}}."
+```
+
+After the `analyze` stage completes, the runner reads the exports file and makes `{{language}}` and `{{framework}}` available to all subsequent stages — including command stages. If the file is missing or malformed, a warning is emitted but the pipeline continues.
+
+Export files are stored in the platform data directory (not the workspace), so they don't pollute the repository.
+
+See the [Pipeline Authoring Guide](docs/pipeline-authoring.md) for the full field reference.
+
+### Guides
+
+- **[Getting Started](docs/guides/getting-started.md)** — Create your first pipeline from scratch
+- **[Multi-Stage Pipelines](docs/guides/multi-stage-pipelines.md)** — Context passing, model selection, and stage composition
+- **[Branching and Conditions](docs/guides/branching-and-conditions.md)** — Conditional execution with `when` and `branch`/`on_branch`
+- **[Exports and Dynamic Variables](docs/guides/exports-and-dynamic-variables.md)** — Let agents set variables at runtime
+- **[Pipeline Patterns](docs/guides/pipeline-patterns.md)** — Ready-to-use recipes for common workflows
 
 Run `fujin init --list` to see all available templates, or `fujin setup` to install them locally where you can customize them.
 
@@ -345,6 +378,7 @@ Run `fujin init --list` to see all available templates, or `fujin setup` to inst
 | `when` | object | — | Gate execution on a prior stage's output (see [Conditional Execution](#conditional-execution)) |
 | `branch` | object | — | AI-driven route classifier (see [Conditional Execution](#conditional-execution)) |
 | `on_branch` | string or list | — | Only run if the named branch route was selected |
+| `exports` | object | — | Export agent-set variables for downstream stages (see [Exports](#exports)) |
 
 **Allowed tools:** `read`, `write`, `edit`, `bash`, `glob`, `grep`, `notebook`
 
@@ -362,6 +396,7 @@ Prompts and commands use [Handlebars](https://handlebarsjs.com/) syntax. Availab
 | `{{all_artifacts}}` | Changed file paths with their full content |
 | `{{stages.<id>.summary}}` | Summary of a specific completed stage (by stage ID) |
 | `{{stages.<id>.response}}` | Full response text of a specific completed stage |
+| `{{exports_file}}` | Path where the agent should write exports JSON (only for stages with `exports`) |
 
 Variables can be overridden from the CLI:
 
