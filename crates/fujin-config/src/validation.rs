@@ -1,6 +1,6 @@
 use crate::pipeline_config::KNOWN_RUNTIMES;
 use crate::PipelineConfig;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Validation result containing all issues found.
 #[derive(Debug, Default)]
@@ -241,22 +241,17 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
 
             // Validate 'when' condition
             if let Some(ref when) = stage.when {
-                // when.stage must reference an earlier stage
-                let ref_pos = stage_ids.iter().position(|id| *id == when.stage);
-                match ref_pos {
-                    None => {
-                        result.errors.push(format!(
-                            "{prefix}: when.stage '{}' does not reference a defined stage",
-                            when.stage
-                        ));
-                    }
-                    Some(pos) if pos >= i => {
-                        result.errors.push(format!(
-                            "{prefix}: when.stage '{}' must reference an earlier stage",
-                            when.stage
-                        ));
-                    }
-                    _ => {}
+                // when.stage must reference a defined stage (not self)
+                if !stage_ids.contains(&when.stage.as_str()) {
+                    result.errors.push(format!(
+                        "{prefix}: when.stage '{}' does not reference a defined stage",
+                        when.stage
+                    ));
+                } else if when.stage == stage.id {
+                    result.errors.push(format!(
+                        "{prefix}: when.stage '{}' cannot reference itself",
+                        when.stage
+                    ));
                 }
 
                 // output_matches must be a valid regex
@@ -312,6 +307,183 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
                             "{prefix}: on_branch '{}' does not match any route in an earlier stage's branch",
                             branch_name
                         ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Validate depends_on
+    {
+        let stage_id_set: HashSet<&str> = config.stages.iter().map(|s| s.id.as_str()).collect();
+
+        for (i, stage) in config.stages.iter().enumerate() {
+            let prefix = format!("Stage {} ('{}')", i, stage.id);
+
+            if let Some(ref deps) = stage.depends_on {
+                for dep in deps {
+                    // Each depends_on must reference a defined stage
+                    if !stage_id_set.contains(dep.as_str()) {
+                        result.errors.push(format!(
+                            "{prefix}: depends_on references undefined stage '{dep}'"
+                        ));
+                    }
+
+                    // No self-references
+                    if dep == &stage.id {
+                        result.errors.push(format!(
+                            "{prefix}: depends_on cannot reference itself"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Build resolved dependency graph for cycle detection and transitive checks.
+        // This mirrors DAG::from_config() logic: None = depend on previous, Some([]) = no deps.
+        let mut resolved_deps: HashMap<&str, HashSet<&str>> = HashMap::new();
+        let mut dependents: HashMap<&str, HashSet<&str>> = HashMap::new();
+
+        for (i, stage) in config.stages.iter().enumerate() {
+            let deps: HashSet<&str> = match &stage.depends_on {
+                Some(deps) => deps.iter().map(|s| s.as_str()).collect(),
+                None => {
+                    if i > 0 {
+                        let mut s = HashSet::new();
+                        s.insert(config.stages[i - 1].id.as_str());
+                        s
+                    } else {
+                        HashSet::new()
+                    }
+                }
+            };
+            for dep in &deps {
+                dependents.entry(dep).or_default().insert(stage.id.as_str());
+            }
+            resolved_deps.insert(stage.id.as_str(), deps);
+        }
+
+        // Cycle detection via topological sort (Kahn's algorithm)
+        let mut in_degree: HashMap<&str, usize> = HashMap::new();
+        for stage in &config.stages {
+            in_degree.insert(
+                stage.id.as_str(),
+                resolved_deps.get(stage.id.as_str()).map_or(0, |d| d.len()),
+            );
+        }
+
+        let mut queue: VecDeque<&str> = VecDeque::new();
+        for (&id, &deg) in &in_degree {
+            if deg == 0 {
+                queue.push_back(id);
+            }
+        }
+
+        let mut sorted_count = 0usize;
+        while let Some(id) = queue.pop_front() {
+            sorted_count += 1;
+            if let Some(children) = dependents.get(id) {
+                for child in children {
+                    let deg = in_degree.get_mut(child).unwrap();
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+
+        if sorted_count != config.stages.len() {
+            let cycle_stages: Vec<&str> = config
+                .stages
+                .iter()
+                .filter(|s| in_degree.get(s.id.as_str()).copied().unwrap_or(0) > 0)
+                .map(|s| s.id.as_str())
+                .collect();
+            result.errors.push(format!(
+                "Circular dependency detected among stages: {:?}",
+                cycle_stages
+            ));
+        }
+
+        // Helper: check if `ancestor` is a transitive dependency of `stage_id`
+        let is_transitive_dep = |stage_id: &str, ancestor: &str| -> bool {
+            let mut visited = HashSet::new();
+            let mut q = VecDeque::new();
+            q.push_back(stage_id);
+            while let Some(current) = q.pop_front() {
+                if !visited.insert(current) {
+                    continue;
+                }
+                if let Some(deps) = resolved_deps.get(current) {
+                    for dep in deps {
+                        if *dep == ancestor {
+                            return true;
+                        }
+                        q.push_back(dep);
+                    }
+                }
+            }
+            false
+        };
+
+        // when.stage must be a dependency (direct or transitive) of the current stage
+        for (i, stage) in config.stages.iter().enumerate() {
+            let prefix = format!("Stage {} ('{}')", i, stage.id);
+
+            if let Some(ref when) = stage.when {
+                if stage_id_set.contains(when.stage.as_str())
+                    && !is_transitive_dep(&stage.id, &when.stage)
+                {
+                    result.errors.push(format!(
+                        "{prefix}: when.stage '{}' must be a dependency (direct or transitive)",
+                        when.stage
+                    ));
+                }
+            }
+
+            // on_branch: the stage that defines the matching branch must be a dependency
+            if let Some(ref on_branch) = stage.on_branch {
+                for branch_name in on_branch {
+                    // Find the stage that defines this branch route
+                    for prior_stage in &config.stages {
+                        if let Some(ref branch) = prior_stage.branch {
+                            if branch.routes.contains(branch_name)
+                                && !is_transitive_dep(&stage.id, &prior_stage.id)
+                            {
+                                result.errors.push(format!(
+                                    "{prefix}: on_branch '{}' requires stage '{}' (which defines the branch) to be a dependency",
+                                    branch_name, prior_stage.id
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Stages in the same retry_group must not have depends_on pointing outside the group
+        let mut group_members: HashMap<&str, Vec<&str>> = HashMap::new();
+        for stage in &config.stages {
+            if let Some(ref group) = stage.retry_group {
+                group_members.entry(group.as_str()).or_default().push(stage.id.as_str());
+            }
+        }
+
+        for (group_name, members) in &group_members {
+            let member_set: HashSet<&str> = members.iter().copied().collect();
+            for &member_id in members {
+                if let Some(deps) = resolved_deps.get(member_id) {
+                    for dep in deps {
+                        // deps within the group are fine (sequential within group)
+                        // deps on stages *outside* the group are not allowed
+                        // UNLESS it's the first stage in the group (which needs an external trigger)
+                        if !member_set.contains(dep) && member_id != members[0] {
+                            result.errors.push(format!(
+                                "Stage '{}' in retry_group '{}': depends_on '{}' is outside the group (only the first stage in a retry group may depend on external stages)",
+                                member_id, group_name, dep
+                            ));
+                        }
                     }
                 }
             }
@@ -869,7 +1041,8 @@ stages:
         .unwrap();
         let result = validate(&config);
         assert!(!result.is_valid());
-        assert!(result.errors.iter().any(|e| e.contains("must reference an earlier stage")));
+        // when.stage 's2' is not a transitive dependency of 's1' (s1 implicitly depends on nothing)
+        assert!(result.errors.iter().any(|e| e.contains("must be a dependency")));
     }
 
     #[test]
@@ -1079,5 +1252,201 @@ stages:
         let result = validate(&config);
         assert!(result.is_valid()); // warning, not error
         assert!(result.warnings.iter().any(|w| w.contains("exports on a command stage")));
+    }
+
+    // --- depends_on validation tests ---
+
+    #[test]
+    fn test_depends_on_valid_diamond() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "analyze"
+    name: "Analyze"
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "frontend"
+    name: "Frontend"
+    depends_on: [analyze]
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "backend"
+    name: "Backend"
+    depends_on: [analyze]
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "integrate"
+    name: "Integration"
+    depends_on: [frontend, backend]
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_depends_on_undefined_stage() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    depends_on: [nonexistent]
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("undefined stage 'nonexistent'")));
+    }
+
+    #[test]
+    fn test_depends_on_self_reference() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    depends_on: [s1]
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("cannot reference itself")));
+    }
+
+    #[test]
+    fn test_depends_on_circular_dependency() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "a"
+    name: "A"
+    depends_on: [b]
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "b"
+    name: "B"
+    depends_on: [a]
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("Circular dependency")));
+    }
+
+    #[test]
+    fn test_depends_on_when_stage_must_be_dependency() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "a"
+    name: "A"
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "b"
+    name: "B"
+    depends_on: []
+    when:
+      stage: "a"
+      output_matches: ".*"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("must be a dependency")));
+    }
+
+    #[test]
+    fn test_depends_on_empty_list_allows_immediate_start() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "a"
+    name: "A"
+    depends_on: []
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "b"
+    name: "B"
+    depends_on: []
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_depends_on_backward_compatible_no_depends() {
+        // Pipeline without any depends_on should still be valid (implicit linear chain)
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "s2"
+    name: "S2"
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "s3"
+    name: "S3"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_depends_on_with_valid_when_as_dependency() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "analyze"
+    name: "Analyze"
+    system_prompt: "x"
+    user_prompt: "y"
+  - id: "frontend"
+    name: "Frontend"
+    depends_on: [analyze]
+    when:
+      stage: "analyze"
+      output_matches: "FRONTEND"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
     }
 }

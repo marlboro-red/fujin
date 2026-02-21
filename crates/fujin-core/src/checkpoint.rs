@@ -3,7 +3,7 @@ use crate::stage::StageResult;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -36,6 +36,24 @@ pub struct Checkpoint {
     /// Stage IDs that were skipped (for resume correctness).
     #[serde(default)]
     pub skipped_stages: Vec<String>,
+}
+
+impl Checkpoint {
+    /// Return a set of all stage IDs that have been completed or skipped.
+    ///
+    /// Used by the DAG scheduler to determine which stages are satisfied
+    /// when resuming from a checkpoint.
+    pub fn completed_ids(&self) -> HashSet<String> {
+        let mut ids: HashSet<String> = self
+            .completed_stages
+            .iter()
+            .map(|s| s.stage_id.clone())
+            .collect();
+        for id in &self.skipped_stages {
+            ids.insert(id.clone());
+        }
+        ids
+    }
 }
 
 /// Manages checkpoint persistence in `<data_dir>/checkpoints/<hash>/`.
@@ -320,5 +338,42 @@ mod tests {
         let cp = CheckpointManager::create_new("name: original");
         let result = CheckpointManager::validate_resume(&cp, "name: changed");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_completed_ids() {
+        let mut cp = CheckpointManager::create_new("test");
+
+        // Add some completed stages
+        cp.completed_stages.push(crate::stage::StageResult {
+            stage_id: "s1".to_string(),
+            model: String::new(),
+            response_text: String::new(),
+            artifacts: crate::artifact::ArtifactSet::new(),
+            summary: None,
+            duration: std::time::Duration::from_secs(1),
+            completed_at: Utc::now(),
+            token_usage: None,
+        });
+        cp.completed_stages.push(crate::stage::StageResult {
+            stage_id: "s3".to_string(),
+            model: String::new(),
+            response_text: String::new(),
+            artifacts: crate::artifact::ArtifactSet::new(),
+            summary: None,
+            duration: std::time::Duration::from_secs(1),
+            completed_at: Utc::now(),
+            token_usage: None,
+        });
+
+        // Add a skipped stage
+        cp.skipped_stages.push("s2".to_string());
+
+        let ids = cp.completed_ids();
+        assert!(ids.contains("s1"));
+        assert!(ids.contains("s2"));
+        assert!(ids.contains("s3"));
+        assert!(!ids.contains("s4"));
+        assert_eq!(ids.len(), 3);
     }
 }

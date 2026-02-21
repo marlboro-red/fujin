@@ -13,6 +13,9 @@ Design effective stage sequences. Covers context passing (`{{prior_summary}}`, a
 ### [Branching and Conditions](branching-and-conditions.md)
 Make stages conditional. Covers `when` (regex gating), `branch`/`on_branch` (AI-driven routing), convergence points, and combining both mechanisms.
 
+### [Parallel Stages](parallel-stages.md)
+Run independent stages concurrently with `depends_on`. Covers DAG-based scheduling, dependency topologies (fan-out, fan-in, diamond), context passing from multiple parents, and interaction with retry groups, branching, and checkpoints.
+
 ### [Exports and Dynamic Variables](exports-and-dynamic-variables.md)
 Let agents discover information at runtime and pass it to downstream stages. Covers the exports feature, prompt patterns, fallback defaults, and adaptive pipeline design.
 

@@ -51,6 +51,11 @@ impl ContextBuilder {
 
     /// Build the context for a stage, incorporating prior results.
     ///
+    /// `prior_results` contains results from all direct parent stages (DAG
+    /// dependencies). For stages with a single parent this is equivalent to
+    /// the old `Option<&StageResult>` behavior. For multiple parents,
+    /// summaries are concatenated and artifact sets are unioned.
+    ///
     /// Per-stage template variables like `{{stages.<id>.summary}}` are
     /// populated for every completed stage in `all_completed`.
     ///
@@ -61,7 +66,7 @@ impl ContextBuilder {
         &self,
         config: &PipelineConfig,
         stage_config: &StageConfig,
-        prior_result: Option<&StageResult>,
+        prior_results: &[&StageResult],
         workspace: &Workspace,
         verify_feedback: Option<&str>,
         all_completed: &[StageResult],
@@ -87,34 +92,43 @@ impl ContextBuilder {
             );
         }
 
-        // Add prior_summary
-        let prior_summary = if let Some(prior) = prior_result {
-            let summary = if let Some(ref s) = prior.summary {
-                s.clone()
-            } else {
-                // Build text to summarize: agent response + artifact info.
-                // Some runtimes (e.g. Copilot CLI) produce little/no useful
-                // text output, so we always append artifact details to give
-                // the summarizer concrete facts to work with.
-                let mut text = prior.response_text.clone();
-                let artifact_desc = Self::build_artifact_description(&prior.artifacts);
-                if !artifact_desc.is_empty() {
-                    text.push_str("\n\nFile changes from this stage:\n");
-                    text.push_str(&artifact_desc);
-                }
-                self.summarize(&config.summarizer, &text).await?
-            };
-            vars.insert("prior_summary".to_string(), summary.clone());
-            Some(summary)
-        } else {
+        // Build prior_summary from all parent results
+        let prior_summary = if prior_results.is_empty() {
             vars.insert("prior_summary".to_string(), String::new());
             None
+        } else {
+            let mut summaries = Vec::new();
+            for prior in prior_results {
+                let summary = if let Some(ref s) = prior.summary {
+                    s.clone()
+                } else {
+                    let mut text = prior.response_text.clone();
+                    let artifact_desc = Self::build_artifact_description(&prior.artifacts);
+                    if !artifact_desc.is_empty() {
+                        text.push_str("\n\nFile changes from this stage:\n");
+                        text.push_str(&artifact_desc);
+                    }
+                    self.summarize(&config.summarizer, &text).await?
+                };
+                if !summary.is_empty() {
+                    summaries.push(summary);
+                }
+            }
+            let combined = summaries.join("\n\n---\n\n");
+            vars.insert("prior_summary".to_string(), combined.clone());
+            if combined.is_empty() { None } else { Some(combined) }
         };
 
-        // Collect changed files from prior result
-        let changed_files: Vec<PathBuf> = prior_result
-            .map(|r| r.artifacts.changed_paths().into_iter().cloned().collect())
-            .unwrap_or_default();
+        // Collect changed files from all parent results (union)
+        let mut changed_files: Vec<PathBuf> = Vec::new();
+        let mut seen_paths = std::collections::HashSet::new();
+        for prior in prior_results {
+            for path in prior.artifacts.changed_paths() {
+                if seen_paths.insert(path.clone()) {
+                    changed_files.push(path.clone());
+                }
+            }
+        }
 
         // Build artifact_list variable
         let artifact_list = changed_files

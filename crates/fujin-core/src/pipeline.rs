@@ -2,13 +2,14 @@ use crate::agent::AgentRuntime;
 use crate::checkpoint::CheckpointManager;
 use crate::context::ContextBuilder;
 use crate::create_runtime;
+use crate::dag::Dag;
 use crate::error::{CoreError, CoreResult};
 use crate::event::PipelineEvent;
 use crate::paths::exports_dir;
 use crate::stage::StageResult;
 use crate::workspace::Workspace;
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -386,6 +387,7 @@ impl PipelineRunner {
         self.workspace.ensure_exists()?;
 
         let total_stages = self.config.stages.len();
+        let dag = Dag::from_config(&self.config);
 
         // Handle resume
         let (mut checkpoint, start_index) = if options.resume {
@@ -436,6 +438,70 @@ impl PipelineRunner {
         // Accumulate variables exported by stages via their `exports` config
         let mut exported_vars: HashMap<String, String> = HashMap::new();
 
+        // Use sequential execution for linear DAGs (backward compat) or DAG scheduler for parallel
+        if dag.is_linear() {
+            self.run_sequential(
+                start_index,
+                &dag,
+                &retry_group_ranges,
+                &mut retry_counts,
+                &mut verify_feedback,
+                &mut exported_vars,
+                &mut checkpoint,
+            )
+            .await?;
+        } else {
+            self.run_dag(
+                &dag,
+                &retry_group_ranges,
+                &mut retry_counts,
+                &mut verify_feedback,
+                &mut exported_vars,
+                &mut checkpoint,
+            )
+            .await?;
+        }
+
+        let total_duration = pipeline_start.elapsed();
+
+        // Aggregate token usage by model
+        let mut by_model: HashMap<String, crate::stage::TokenUsage> = HashMap::new();
+        for result in &checkpoint.completed_stages {
+            if let Some(ref usage) = result.token_usage {
+                let entry = by_model.entry(result.model.clone()).or_default();
+                entry.input_tokens += usage.input_tokens;
+                entry.output_tokens += usage.output_tokens;
+            }
+        }
+        let mut token_usage_by_model: Vec<(String, crate::stage::TokenUsage)> =
+            by_model.into_iter().collect();
+        token_usage_by_model.sort_by(|a, b| a.0.cmp(&b.0));
+
+        self.emit(PipelineEvent::PipelineCompleted {
+            total_duration,
+            stages_completed: checkpoint.completed_stages.len(),
+            token_usage_by_model,
+        });
+
+        Ok(checkpoint.completed_stages)
+    }
+
+    /// Execute stages sequentially (linear DAG or backward-compatible mode).
+    ///
+    /// This preserves the original execution model for pipelines without
+    /// explicit `depends_on` or with a purely linear dependency chain.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_sequential(
+        &self,
+        start_index: usize,
+        dag: &Dag,
+        retry_group_ranges: &HashMap<&str, (usize, usize)>,
+        retry_counts: &mut HashMap<String, u32>,
+        verify_feedback: &mut HashMap<String, String>,
+        exported_vars: &mut HashMap<String, String>,
+        checkpoint: &mut crate::checkpoint::Checkpoint,
+    ) -> CoreResult<()> {
+        let total_stages = self.config.stages.len();
         let mut stage_idx = start_index;
 
         while stage_idx < total_stages {
@@ -471,13 +537,13 @@ impl PipelineRunner {
                     checkpoint.skipped_stages.push(stage_config.id.clone());
                     checkpoint.next_stage_index = stage_idx + 1;
                     checkpoint.updated_at = Utc::now();
-                    let _ = self.checkpoint_manager.save(&checkpoint);
+                    let _ = self.checkpoint_manager.save(checkpoint);
 
                     // If this skipped stage is the last in a retry group,
                     // run verify against the work done by earlier stages.
                     if let Some(jump_idx) = self.maybe_run_group_verify(
-                        stage_idx, true, &retry_group_ranges,
-                        &mut verify_feedback, &mut retry_counts, &mut checkpoint,
+                        stage_idx, true, retry_group_ranges,
+                        verify_feedback, retry_counts, checkpoint,
                     ).await? {
                         stage_idx = jump_idx;
                         continue;
@@ -503,13 +569,13 @@ impl PipelineRunner {
                     checkpoint.skipped_stages.push(stage_config.id.clone());
                     checkpoint.next_stage_index = stage_idx + 1;
                     checkpoint.updated_at = Utc::now();
-                    let _ = self.checkpoint_manager.save(&checkpoint);
+                    let _ = self.checkpoint_manager.save(checkpoint);
 
                     // If this skipped stage is the last in a retry group,
                     // run verify against the work done by earlier stages.
                     if let Some(jump_idx) = self.maybe_run_group_verify(
-                        stage_idx, true, &retry_group_ranges,
-                        &mut verify_feedback, &mut retry_counts, &mut checkpoint,
+                        stage_idx, true, retry_group_ranges,
+                        verify_feedback, retry_counts, checkpoint,
                     ).await? {
                         stage_idx = jump_idx;
                         continue;
@@ -520,331 +586,582 @@ impl PipelineRunner {
                 }
             }
 
-            let stage_runtime = self.runtime_for_stage(stage_config);
-            self.emit(PipelineEvent::StageStarted {
-                stage_index: stage_idx,
-                stage_id: stage_config.id.clone(),
-                stage_name: stage_config.name.clone(),
-                model: if stage_config.is_command_stage() {
-                    "commands".to_string()
-                } else {
-                    stage_config.model.clone()
-                },
-                runtime: stage_runtime.name().to_string(),
-                allowed_tools: stage_config.allowed_tools.clone(),
-                retry_group: stage_config.retry_group.clone(),
-            });
+            // Execute the stage and process results
+            self.execute_and_process_stage(
+                stage_idx,
+                dag,
+                retry_group_ranges,
+                retry_counts,
+                verify_feedback,
+                exported_vars,
+                checkpoint,
+            )
+            .await?;
 
-            let stage_start = Instant::now();
-
-            // Compute the exports file path and inject {{exports_file}} for stages with exports
-            let export_file_path = if stage_config.exports.is_some() {
-                let export_path = exports_dir(self.workspace.root())
-                    .join(&checkpoint.run_id)
-                    .join(format!("{}.json", stage_config.id));
-                // Create the parent directory so the agent can write to it
-                if let Some(parent) = export_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| CoreError::WorkspaceError {
-                        path: parent.to_path_buf(),
-                        message: format!("Failed to create exports directory: {e}"),
-                    })?;
-                }
-                exported_vars.insert(
-                    "exports_file".to_string(),
-                    export_path.display().to_string(),
-                );
-                Some(export_path)
-            } else {
-                None
-            };
-
-            // 1. Execute stage (command or agent)
-            let stage_exec_result = if stage_config.is_command_stage() {
-                self.run_command_stage(stage_idx, stage_config, &stage_start, &exported_vars)
-                    .await
-            } else {
-                // Look up verify feedback for this stage's retry group
-                let feedback = stage_config
-                    .retry_group
-                    .as_ref()
-                    .and_then(|g| verify_feedback.get(g))
-                    .map(|s| s.as_str());
-
-                self.run_agent_stage(
-                    stage_idx,
-                    stage_config,
-                    &checkpoint,
-                    &stage_start,
-                    feedback,
-                    &exported_vars,
-                )
-                .await
-            };
-
-            let (response_text, token_usage) = match stage_exec_result {
-                Ok(output) => output,
-                Err(CoreError::Cancelled { ref stage_id }) => {
-                    checkpoint.next_stage_index = stage_idx;
-                    checkpoint.updated_at = Utc::now();
-                    let _ = self.checkpoint_manager.save(&checkpoint);
-                    self.emit(PipelineEvent::PipelineCancelled {
-                        stage_index: stage_idx,
-                    });
-                    return Err(CoreError::Cancelled {
-                        stage_id: stage_id.clone(),
-                    });
-                }
-                Err(e) => {
-                    // Check if this stage belongs to a retry group
-                    if let Some(ref group_name) = stage_config.retry_group {
-                        if let Some(&(first_idx, _last_idx)) = retry_group_ranges.get(group_name.as_str()) {
-                            let group_config = self.config.retry_groups.get(group_name);
-                            let max_retries = group_config.map_or(5, |g| g.max_retries);
-
-                            // Store the failure error as feedback so the retrying
-                            // agent stages know WHY the previous attempt failed.
-                            let error_msg = e.to_string();
-                            verify_feedback.insert(
-                                group_name.clone(),
-                                format!(
-                                    "Stage '{}' failed with error:\n{}",
-                                    stage_config.id, error_msg
-                                ),
-                            );
-
-                            match self.handle_retry_group_failure(
-                                group_name,
-                                first_idx,
-                                stage_idx,
-                                &stage_config.id,
-                                &error_msg,
-                                max_retries,
-                                &mut retry_counts,
-                                &mut checkpoint,
-                            ).await {
-                                Ok(jump_idx) => {
-                                    stage_idx = jump_idx;
-                                    continue;
-                                }
-                                Err(abort_err) => return Err(abort_err),
-                            }
-                        }
-                    }
-
-                    // Not in a retry group — fail normally
-                    checkpoint.next_stage_index = stage_idx;
-                    checkpoint.updated_at = Utc::now();
-                    let checkpoint_saved = self.checkpoint_manager.save(&checkpoint).is_ok();
-                    self.emit(PipelineEvent::StageFailed {
-                        stage_index: stage_idx,
-                        stage_id: stage_config.id.clone(),
-                        error: e.to_string(),
-                        checkpoint_saved,
-                    });
-                    self.emit(PipelineEvent::PipelineFailed {
-                        error: e.to_string(),
-                    });
-                    return Err(e);
-                }
-            };
-
-            // 2. Detect file changes via git (fast, even on large repos)
-            let ws_root = self.workspace.root().to_path_buf();
-            let artifacts = tokio::task::spawn_blocking(move || {
-                Workspace::new(ws_root).git_diff()
-            })
-                .await
-                .unwrap_or_default();
-
-            let duration = stage_start.elapsed();
-
-            self.emit(PipelineEvent::StageCompleted {
-                stage_index: stage_idx,
-                stage_id: stage_config.id.clone(),
-                duration,
-                artifacts: artifacts.clone(),
-                token_usage: token_usage.clone(),
-            });
-
-            // 3. Run branch classifier if this stage has a `branch` config
-            if let Some(ref branch_config) = stage_config.branch {
-                self.emit(PipelineEvent::BranchEvaluating {
-                    stage_index: stage_idx,
-                    stage_id: stage_config.id.clone(),
-                });
-                let selected = self.run_branch_classifier(
-                    branch_config,
-                    &response_text,
-                    stage_idx,
-                ).await?;
-                checkpoint.active_branches.insert(stage_config.id.clone(), selected.clone());
-                self.emit(PipelineEvent::BranchSelected {
-                    stage_index: stage_idx,
-                    stage_id: stage_config.id.clone(),
-                    selected_route: selected,
-                    available_routes: branch_config.routes.clone(),
-                });
-            }
-
-            // 4. Build stage result
-            let stage_result = StageResult {
-                stage_id: stage_config.id.clone(),
-                model: stage_config.model.clone(),
-                response_text,
-                artifacts,
-                summary: None, // Will be populated by context builder for next stage
-                duration,
-                completed_at: Utc::now(),
-                token_usage,
-            };
-
-            checkpoint.completed_stages.push(stage_result);
-
-            // 4b. Process exports: read JSON file from data dir and merge into pipeline variables
-            if let Some(ref exports) = stage_config.exports {
-                let export_path = export_file_path.as_ref().unwrap();
-                match std::fs::read_to_string(export_path) {
-                    Ok(contents) => {
-                        match serde_json::from_str::<HashMap<String, String>>(&contents) {
-                            Ok(vars) => {
-                                // Warn about missing expected keys
-                                for key in &exports.keys {
-                                    if !vars.contains_key(key) {
-                                        self.emit(PipelineEvent::ExportsWarning {
-                                            stage_index: stage_idx,
-                                            stage_id: stage_config.id.clone(),
-                                            message: format!(
-                                                "Expected key '{}' not found in exports",
-                                                key
-                                            ),
-                                        });
-                                    }
-                                }
-
-                                let loaded: Vec<(String, String)> =
-                                    vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-
-                                // Merge into accumulated exported variables
-                                for (k, v) in vars {
-                                    exported_vars.insert(k, v);
-                                }
-
-                                self.emit(PipelineEvent::ExportsLoaded {
-                                    stage_index: stage_idx,
-                                    stage_id: stage_config.id.clone(),
-                                    variables: loaded,
-                                });
-                            }
-                            Err(e) => {
-                                self.emit(PipelineEvent::ExportsWarning {
-                                    stage_index: stage_idx,
-                                    stage_id: stage_config.id.clone(),
-                                    message: format!(
-                                        "Failed to parse exports file: {}",
-                                        e
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.emit(PipelineEvent::ExportsWarning {
-                            stage_index: stage_idx,
-                            stage_id: stage_config.id.clone(),
-                            message: format!(
-                                "Failed to read exports file {}: {}",
-                                export_path.display(), e
-                            ),
-                        });
-                    }
-                }
-            }
-
-            // Determine if verification is pending before advancing the checkpoint.
-            // If this is the last stage in a retry group with a verify agent, we must
-            // NOT advance next_stage_index until verification passes — otherwise a
-            // crash during verification would skip it on resume.
-            let verify_pending = stage_config.retry_group.as_ref().and_then(|group_name| {
-                let &(_first, last) = retry_group_ranges.get(group_name.as_str())?;
-                if stage_idx != last { return None; }
-                let group_cfg = self.config.retry_groups.get(group_name)?;
-                group_cfg.verify.as_ref().map(|_| ())
-            }).is_some();
-
-            if verify_pending {
-                // Keep next_stage_index pointing at this stage so a crash during
-                // verification re-runs the last stage (and then verify) on resume.
-                checkpoint.next_stage_index = stage_idx;
-            } else {
-                checkpoint.next_stage_index = stage_idx + 1;
-            }
-            checkpoint.updated_at = Utc::now();
-
-            // 5. Save checkpoint
-            self.checkpoint_manager.save(&checkpoint)?;
-
-            // Run verify for this retry group if this is the last stage
-            if let Some(jump_idx) = self.maybe_run_group_verify(
-                stage_idx, false, &retry_group_ranges,
-                &mut verify_feedback, &mut retry_counts, &mut checkpoint,
-            ).await? {
-                stage_idx = jump_idx;
+            // Check if a retry group restarted (checkpoint was rolled back)
+            // If next_stage_index < stage_idx + 1, a retry occurred
+            if checkpoint.next_stage_index <= stage_idx {
+                stage_idx = checkpoint.next_stage_index;
                 continue;
             }
-
-            info!(
-                stage_id = %stage_config.id,
-                duration_secs = duration.as_secs_f64(),
-                "Stage completed"
-            );
 
             stage_idx += 1;
         }
 
-        let total_duration = pipeline_start.elapsed();
-
-        // Aggregate token usage by model
-        let mut by_model: HashMap<String, crate::stage::TokenUsage> = HashMap::new();
-        for result in &checkpoint.completed_stages {
-            if let Some(ref usage) = result.token_usage {
-                let entry = by_model.entry(result.model.clone()).or_default();
-                entry.input_tokens += usage.input_tokens;
-                entry.output_tokens += usage.output_tokens;
-            }
-        }
-        let mut token_usage_by_model: Vec<(String, crate::stage::TokenUsage)> =
-            by_model.into_iter().collect();
-        token_usage_by_model.sort_by(|a, b| a.0.cmp(&b.0));
-
-        self.emit(PipelineEvent::PipelineCompleted {
-            total_duration,
-            stages_completed: checkpoint.completed_stages.len(),
-            token_usage_by_model,
-        });
-
-        Ok(checkpoint.completed_stages)
+        Ok(())
     }
 
-    /// Execute an agent-based stage.
+    /// Execute stages using DAG-based scheduling for parallel execution.
     ///
-    /// Returns `(response_text, token_usage)` on success.
-    async fn run_agent_stage(
+    /// Independent stages (whose dependencies are satisfied) run concurrently.
+    /// Stages within the same retry group are executed sequentially within
+    /// their group, but the group can run in parallel with other stages.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_dag(
+        &self,
+        dag: &Dag,
+        retry_group_ranges: &HashMap<&str, (usize, usize)>,
+        retry_counts: &mut HashMap<String, u32>,
+        verify_feedback: &mut HashMap<String, String>,
+        exported_vars: &mut HashMap<String, String>,
+        checkpoint: &mut crate::checkpoint::Checkpoint,
+    ) -> CoreResult<()> {
+        let mut completed: HashSet<String> = checkpoint.completed_ids();
+        let mut skipped: HashSet<String> = checkpoint.skipped_stages.iter().cloned().collect();
+        let mut in_flight: HashSet<String> = HashSet::new();
+
+        // Track which retry group stages are currently being processed
+        // to ensure they run sequentially within the group.
+        let mut retry_group_in_flight: HashSet<String> = HashSet::new();
+
+        loop {
+            // Check for cancellation
+            if let Some(ref flag) = self.cancel_flag {
+                if flag.load(Ordering::Relaxed) {
+                    let stage_id = in_flight
+                        .iter()
+                        .next()
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    self.emit(PipelineEvent::PipelineCancelled {
+                        stage_index: dag.index_of(&stage_id).unwrap_or(0),
+                    });
+                    return Err(CoreError::Cancelled { stage_id });
+                }
+            }
+
+            // Find stages ready to run
+            let ready = dag.ready_stages(&completed, &skipped, &in_flight);
+
+            if ready.is_empty() && in_flight.is_empty() {
+                break; // All stages done
+            }
+
+            // Launch ready stages that aren't blocked by retry group constraints
+            for stage_id in &ready {
+                let stage_idx = dag.index_of(stage_id).unwrap();
+                let stage_config = &self.config.stages[stage_idx];
+
+                // If this stage is in a retry group, check if another stage
+                // from the same group is already in flight (must be sequential).
+                if let Some(ref group) = stage_config.retry_group {
+                    if retry_group_in_flight.contains(group.as_str()) {
+                        continue; // Wait for the other group stage to finish
+                    }
+                    retry_group_in_flight.insert(group.clone());
+                }
+
+                // Check skip conditions (on_branch, when)
+                if self.should_skip_stage(stage_idx, stage_config, checkpoint) {
+                    // Emit skip event and record
+                    let reason = self.get_skip_reason(stage_idx, stage_config, checkpoint);
+                    self.emit(PipelineEvent::StageSkipped {
+                        stage_index: stage_idx,
+                        stage_id: stage_id.clone(),
+                        reason,
+                    });
+                    checkpoint.skipped_stages.push(stage_id.clone());
+                    skipped.insert(stage_id.clone());
+                    checkpoint.updated_at = Utc::now();
+                    let _ = self.checkpoint_manager.save(checkpoint);
+
+                    // Remove from retry group tracking if applicable
+                    if let Some(ref group) = stage_config.retry_group {
+                        retry_group_in_flight.remove(group.as_str());
+
+                        // Check if this was the last stage in the group for verify
+                        if let Some(jump_idx) = self.maybe_run_group_verify(
+                            stage_idx, true, retry_group_ranges,
+                            verify_feedback, retry_counts, checkpoint,
+                        ).await? {
+                            // Retry: clear completed stages for the group
+                            let first_id = &self.config.stages[jump_idx].id;
+                            // Remove completed stages that are in this retry group
+                            if let Some(&(first, last)) = retry_group_ranges.get(stage_config.retry_group.as_ref().unwrap().as_str()) {
+                                for idx in first..=last {
+                                    let id = &self.config.stages[idx].id;
+                                    completed.remove(id);
+                                    skipped.remove(id);
+                                }
+                            }
+                            let _ = first_id; // used above indirectly
+                        }
+                    }
+                    continue;
+                }
+
+                in_flight.insert(stage_id.clone());
+            }
+
+            if in_flight.is_empty() {
+                // All remaining stages are blocked by retry group constraints;
+                // this shouldn't happen with valid DAGs, but break to avoid infinite loop.
+                break;
+            }
+
+            // Execute one in-flight stage at a time (process results sequentially
+            // to maintain checkpoint consistency and handle retry group logic).
+            // For true parallelism, we'd use JoinSet, but stage execution involves
+            // shared mutable state (checkpoint, exported_vars, verify_feedback) that
+            // makes concurrent execution complex. Instead, we get parallelism at the
+            // scheduling level: we pick *which* stages to run based on the DAG, even
+            // though we execute them one at a time in the current implementation.
+            //
+            // For v1: execute ready stages one at a time in DAG order.
+            // This still enables DAG-based scheduling (correct ordering), while
+            // true concurrent execution can be added incrementally.
+            let next_stage_id = in_flight.iter().next().cloned().unwrap();
+            let next_stage_idx = dag.index_of(&next_stage_id).unwrap();
+
+            match self.execute_and_process_stage(
+                next_stage_idx,
+                dag,
+                retry_group_ranges,
+                retry_counts,
+                verify_feedback,
+                exported_vars,
+                checkpoint,
+            ).await {
+                Ok(()) => {
+                    in_flight.remove(&next_stage_id);
+                    completed.insert(next_stage_id.clone());
+
+                    // Remove from retry group tracking
+                    let stage_config = &self.config.stages[next_stage_idx];
+                    if let Some(ref group) = stage_config.retry_group {
+                        retry_group_in_flight.remove(group.as_str());
+                    }
+
+                    // Check if a retry occurred (checkpoint was rolled back)
+                    if checkpoint.next_stage_index <= next_stage_idx {
+                        // Retry group restarted — remove completed stages for the group
+                        let stage_config = &self.config.stages[next_stage_idx];
+                        if let Some(ref group_name) = stage_config.retry_group {
+                            if let Some(&(first, last)) = retry_group_ranges.get(group_name.as_str()) {
+                                for idx in first..=last {
+                                    let id = &self.config.stages[idx].id;
+                                    completed.remove(id);
+                                    skipped.remove(id);
+                                    in_flight.remove(id);
+                                }
+                                retry_group_in_flight.remove(group_name.as_str());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    in_flight.remove(&next_stage_id);
+                    let stage_config = &self.config.stages[next_stage_idx];
+                    if let Some(ref group) = stage_config.retry_group {
+                        retry_group_in_flight.remove(group.as_str());
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if a stage should be skipped (on_branch or when condition).
+    fn should_skip_stage(
+        &self,
+        _stage_idx: usize,
+        stage_config: &StageConfig,
+        checkpoint: &crate::checkpoint::Checkpoint,
+    ) -> bool {
+        // on_branch gating
+        if let Some(ref required_branches) = stage_config.on_branch {
+            let branch_active = required_branches.iter().any(|b| {
+                checkpoint.active_branches.values().any(|selected| selected == b)
+            });
+            if !branch_active {
+                return true;
+            }
+        }
+
+        // when condition
+        if let Some(ref when) = stage_config.when {
+            if !evaluate_when_condition(when, &checkpoint.completed_stages) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Get the reason why a stage was skipped.
+    fn get_skip_reason(
+        &self,
+        _stage_idx: usize,
+        stage_config: &StageConfig,
+        checkpoint: &crate::checkpoint::Checkpoint,
+    ) -> String {
+        if let Some(ref required_branches) = stage_config.on_branch {
+            let branch_active = required_branches.iter().any(|b| {
+                checkpoint.active_branches.values().any(|selected| selected == b)
+            });
+            if !branch_active {
+                return format!(
+                    "branch {:?} not active (active: {:?})",
+                    required_branches,
+                    checkpoint.active_branches.values().collect::<Vec<_>>()
+                );
+            }
+        }
+
+        if let Some(ref when) = stage_config.when {
+            return format!(
+                "when condition not met (stage '{}' output !~ /{}/ )",
+                when.stage, when.output_matches
+            );
+        }
+
+        "unknown".to_string()
+    }
+
+    /// Execute a single stage and process all post-execution logic.
+    ///
+    /// Handles: execution, artifact detection, branch classification, exports,
+    /// checkpoint updates, and retry group verification. Used by both the
+    /// sequential and DAG execution paths.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_and_process_stage(
+        &self,
+        stage_idx: usize,
+        dag: &Dag,
+        retry_group_ranges: &HashMap<&str, (usize, usize)>,
+        retry_counts: &mut HashMap<String, u32>,
+        verify_feedback: &mut HashMap<String, String>,
+        exported_vars: &mut HashMap<String, String>,
+        checkpoint: &mut crate::checkpoint::Checkpoint,
+    ) -> CoreResult<()> {
+        let stage_config = &self.config.stages[stage_idx];
+        let stage_runtime = self.runtime_for_stage(stage_config);
+
+        self.emit(PipelineEvent::StageStarted {
+            stage_index: stage_idx,
+            stage_id: stage_config.id.clone(),
+            stage_name: stage_config.name.clone(),
+            model: if stage_config.is_command_stage() {
+                "commands".to_string()
+            } else {
+                stage_config.model.clone()
+            },
+            runtime: stage_runtime.name().to_string(),
+            allowed_tools: stage_config.allowed_tools.clone(),
+            retry_group: stage_config.retry_group.clone(),
+        });
+
+        let stage_start = Instant::now();
+
+        // Compute the exports file path and inject {{exports_file}} for stages with exports
+        let export_file_path = if stage_config.exports.is_some() {
+            let export_path = exports_dir(self.workspace.root())
+                .join(&checkpoint.run_id)
+                .join(format!("{}.json", stage_config.id));
+            if let Some(parent) = export_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| CoreError::WorkspaceError {
+                    path: parent.to_path_buf(),
+                    message: format!("Failed to create exports directory: {e}"),
+                })?;
+            }
+            exported_vars.insert(
+                "exports_file".to_string(),
+                export_path.display().to_string(),
+            );
+            Some(export_path)
+        } else {
+            None
+        };
+
+        // Execute stage (command or agent)
+        let stage_exec_result = if stage_config.is_command_stage() {
+            self.run_command_stage(stage_idx, stage_config, &stage_start, exported_vars)
+                .await
+        } else {
+            let feedback = stage_config
+                .retry_group
+                .as_ref()
+                .and_then(|g| verify_feedback.get(g))
+                .map(|s| s.as_str());
+
+            self.run_agent_stage_dag(
+                stage_idx,
+                stage_config,
+                dag,
+                checkpoint,
+                &stage_start,
+                feedback,
+                exported_vars,
+            )
+            .await
+        };
+
+        let (response_text, token_usage) = match stage_exec_result {
+            Ok(output) => output,
+            Err(CoreError::Cancelled { ref stage_id }) => {
+                checkpoint.next_stage_index = stage_idx;
+                checkpoint.updated_at = Utc::now();
+                let _ = self.checkpoint_manager.save(checkpoint);
+                self.emit(PipelineEvent::PipelineCancelled {
+                    stage_index: stage_idx,
+                });
+                return Err(CoreError::Cancelled {
+                    stage_id: stage_id.clone(),
+                });
+            }
+            Err(e) => {
+                // Check if this stage belongs to a retry group
+                if let Some(ref group_name) = stage_config.retry_group {
+                    if let Some(&(first_idx, _last_idx)) = retry_group_ranges.get(group_name.as_str()) {
+                        let group_config = self.config.retry_groups.get(group_name);
+                        let max_retries = group_config.map_or(5, |g| g.max_retries);
+
+                        let error_msg = e.to_string();
+                        verify_feedback.insert(
+                            group_name.clone(),
+                            format!(
+                                "Stage '{}' failed with error:\n{}",
+                                stage_config.id, error_msg
+                            ),
+                        );
+
+                        match self.handle_retry_group_failure(
+                            group_name,
+                            first_idx,
+                            stage_idx,
+                            &stage_config.id,
+                            &error_msg,
+                            max_retries,
+                            retry_counts,
+                            checkpoint,
+                        ).await {
+                            Ok(_jump_idx) => {
+                                // Signal retry by keeping checkpoint.next_stage_index
+                                return Ok(());
+                            }
+                            Err(abort_err) => return Err(abort_err),
+                        }
+                    }
+                }
+
+                // Not in a retry group — fail normally
+                checkpoint.next_stage_index = stage_idx;
+                checkpoint.updated_at = Utc::now();
+                let checkpoint_saved = self.checkpoint_manager.save(checkpoint).is_ok();
+                self.emit(PipelineEvent::StageFailed {
+                    stage_index: stage_idx,
+                    stage_id: stage_config.id.clone(),
+                    error: e.to_string(),
+                    checkpoint_saved,
+                });
+                self.emit(PipelineEvent::PipelineFailed {
+                    error: e.to_string(),
+                });
+                return Err(e);
+            }
+        };
+
+        // Detect file changes via git
+        let ws_root = self.workspace.root().to_path_buf();
+        let artifacts = tokio::task::spawn_blocking(move || {
+            Workspace::new(ws_root).git_diff()
+        })
+            .await
+            .unwrap_or_default();
+
+        let duration = stage_start.elapsed();
+
+        self.emit(PipelineEvent::StageCompleted {
+            stage_index: stage_idx,
+            stage_id: stage_config.id.clone(),
+            duration,
+            artifacts: artifacts.clone(),
+            token_usage: token_usage.clone(),
+        });
+
+        // Run branch classifier if configured
+        if let Some(ref branch_config) = stage_config.branch {
+            self.emit(PipelineEvent::BranchEvaluating {
+                stage_index: stage_idx,
+                stage_id: stage_config.id.clone(),
+            });
+            let selected = self.run_branch_classifier(
+                branch_config,
+                &response_text,
+                stage_idx,
+            ).await?;
+            checkpoint.active_branches.insert(stage_config.id.clone(), selected.clone());
+            self.emit(PipelineEvent::BranchSelected {
+                stage_index: stage_idx,
+                stage_id: stage_config.id.clone(),
+                selected_route: selected,
+                available_routes: branch_config.routes.clone(),
+            });
+        }
+
+        // Build stage result
+        let stage_result = StageResult {
+            stage_id: stage_config.id.clone(),
+            model: stage_config.model.clone(),
+            response_text,
+            artifacts,
+            summary: None,
+            duration,
+            completed_at: Utc::now(),
+            token_usage,
+        };
+
+        checkpoint.completed_stages.push(stage_result);
+
+        // Process exports
+        if let Some(ref exports) = stage_config.exports {
+            let export_path = export_file_path.as_ref().unwrap();
+            match std::fs::read_to_string(export_path) {
+                Ok(contents) => {
+                    match serde_json::from_str::<HashMap<String, String>>(&contents) {
+                        Ok(vars) => {
+                            for key in &exports.keys {
+                                if !vars.contains_key(key) {
+                                    self.emit(PipelineEvent::ExportsWarning {
+                                        stage_index: stage_idx,
+                                        stage_id: stage_config.id.clone(),
+                                        message: format!(
+                                            "Expected key '{}' not found in exports",
+                                            key
+                                        ),
+                                    });
+                                }
+                            }
+
+                            let loaded: Vec<(String, String)> =
+                                vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+                            for (k, v) in vars {
+                                exported_vars.insert(k, v);
+                            }
+
+                            self.emit(PipelineEvent::ExportsLoaded {
+                                stage_index: stage_idx,
+                                stage_id: stage_config.id.clone(),
+                                variables: loaded,
+                            });
+                        }
+                        Err(e) => {
+                            self.emit(PipelineEvent::ExportsWarning {
+                                stage_index: stage_idx,
+                                stage_id: stage_config.id.clone(),
+                                message: format!("Failed to parse exports file: {}", e),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.emit(PipelineEvent::ExportsWarning {
+                        stage_index: stage_idx,
+                        stage_id: stage_config.id.clone(),
+                        message: format!(
+                            "Failed to read exports file {}: {}",
+                            export_path.display(), e
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Checkpoint management
+        let verify_pending = stage_config.retry_group.as_ref().and_then(|group_name| {
+            let &(_first, last) = retry_group_ranges.get(group_name.as_str())?;
+            if stage_idx != last { return None; }
+            let group_cfg = self.config.retry_groups.get(group_name)?;
+            group_cfg.verify.as_ref().map(|_| ())
+        }).is_some();
+
+        if verify_pending {
+            checkpoint.next_stage_index = stage_idx;
+        } else {
+            checkpoint.next_stage_index = stage_idx + 1;
+        }
+        checkpoint.updated_at = Utc::now();
+        self.checkpoint_manager.save(checkpoint)?;
+
+        // Run verify for retry group
+        if let Some(_jump_idx) = self.maybe_run_group_verify(
+            stage_idx, false, retry_group_ranges,
+            verify_feedback, retry_counts, checkpoint,
+        ).await? {
+            // Retry: checkpoint.next_stage_index was already set by handle_retry_group_failure
+            return Ok(());
+        }
+
+        info!(
+            stage_id = %stage_config.id,
+            duration_secs = duration.as_secs_f64(),
+            "Stage completed"
+        );
+
+        Ok(())
+    }
+
+    /// Execute an agent-based stage with DAG-aware context building.
+    ///
+    /// Uses the stage's DAG parents (direct dependencies) for prior context
+    /// instead of just the last completed stage.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_agent_stage_dag(
         &self,
         stage_idx: usize,
         stage_config: &StageConfig,
+        dag: &Dag,
         checkpoint: &crate::checkpoint::Checkpoint,
         stage_start: &Instant,
         verify_feedback: Option<&str>,
         exported_vars: &HashMap<String, String>,
     ) -> CoreResult<(String, Option<crate::stage::TokenUsage>)> {
-        // Build context
+        // Build context using DAG parents
         self.emit(PipelineEvent::ContextBuilding {
             stage_index: stage_idx,
         });
-        let prior_result = checkpoint.completed_stages.last();
+
+        let parent_ids = dag.parents(&stage_config.id);
+        let prior_results: Vec<&crate::stage::StageResult> = checkpoint
+            .completed_stages
+            .iter()
+            .filter(|r| parent_ids.contains(&r.stage_id))
+            .collect();
+
         let context = self
             .context_builder
-            .build(&self.config, stage_config, prior_result, &self.workspace, verify_feedback, &checkpoint.completed_stages, exported_vars)
+            .build(
+                &self.config,
+                stage_config,
+                &prior_results,
+                &self.workspace,
+                verify_feedback,
+                &checkpoint.completed_stages,
+                exported_vars,
+            )
             .await?;
 
         self.emit(PipelineEvent::StageContext {
@@ -878,7 +1195,7 @@ impl PipelineRunner {
             }
         });
 
-        // Create a progress channel that bridges agent activity to PipelineEvent
+        // Create a progress channel
         let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
         let activity_tx = self.event_tx.clone();
         let activity_idx = stage_idx;
@@ -896,7 +1213,7 @@ impl PipelineRunner {
             }
         });
 
-        // Execute agent (with optional timeout), using per-stage runtime if configured
+        // Execute agent
         let stage_runtime = self.runtime_for_stage(stage_config);
         let agent_future = stage_runtime.execute(
             stage_config,
@@ -1036,15 +1353,20 @@ impl PipelineRunner {
             branch: None,
             on_branch: None,
             exports: None,
+            depends_on: None,
         };
 
         // Build context (includes prior stage results and changed files)
         // Verify agents don't need exported vars — pass an empty map
         let empty_vars = HashMap::new();
-        let prior_result = checkpoint.completed_stages.last();
+        let prior_results: Vec<&crate::stage::StageResult> = checkpoint
+            .completed_stages
+            .last()
+            .into_iter()
+            .collect();
         let context = self
             .context_builder
-            .build(&self.config, &verify_stage, prior_result, &self.workspace, None, &checkpoint.completed_stages, &empty_vars)
+            .build(&self.config, &verify_stage, &prior_results, &self.workspace, None, &checkpoint.completed_stages, &empty_vars)
             .await?;
 
         // Create a progress channel that bridges verify agent activity to PipelineEvent
@@ -1122,6 +1444,7 @@ impl PipelineRunner {
             branch: None,
             on_branch: None,
             exports: None,
+            depends_on: None,
         };
 
         // Build a minimal context (no prior summary needed)

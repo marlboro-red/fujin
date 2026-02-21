@@ -25,7 +25,7 @@ You don't need all five. Pick the stages that match your task. A two-stage pipel
 
 ## Context passing in detail
 
-When stage N finishes, fujin builds context for stage N+1 through three channels:
+When a stage finishes, fujin builds context for its downstream dependents through three channels. In sequential pipelines, "upstream" means the immediately preceding stage. In DAG pipelines (using `depends_on`), "upstream" means all direct parent stages. See the **[Parallel Stages Guide](parallel-stages.md)** for how context merging works with multiple parents.
 
 ### 1. Summarized output — `{{prior_summary}}`
 
@@ -382,6 +382,7 @@ Key patterns in this example:
 
 ## What to read next
 
+- **[Parallel Stages](parallel-stages.md)** — Run independent stages concurrently with `depends_on`
 - **[Branching and Conditions](branching-and-conditions.md)** — Skip stages or route to different paths based on prior output
 - **[Exports and Dynamic Variables](exports-and-dynamic-variables.md)** — Let agents set variables at runtime for downstream stages
 - **[Retry Groups](retry-groups.md)** — Automatic retry-on-failure with verification agents

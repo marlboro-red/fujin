@@ -218,6 +218,12 @@ pub struct StageConfig {
     /// and merges its key-value pairs into the pipeline's template variables.
     #[serde(default)]
     pub exports: Option<ExportsConfig>,
+
+    /// Explicit stage dependencies. This stage waits for all listed stages to complete.
+    /// When absent (`None`), the stage implicitly depends on the previous stage in YAML order.
+    /// Use `depends_on: []` to declare a stage with no dependencies (can start immediately).
+    #[serde(default)]
+    pub depends_on: Option<Vec<String>>,
 }
 
 impl StageConfig {
@@ -662,6 +668,76 @@ stages:
         let config = PipelineConfig::from_yaml(yaml).unwrap();
         let exports = config.stages[0].exports.as_ref().unwrap();
         assert!(exports.keys.is_empty());
+    }
+
+    #[test]
+    fn test_depends_on_parsing() {
+        let yaml = r#"
+name: dag-test
+stages:
+  - id: analyze
+    name: Analyze
+    system_prompt: "sp"
+    user_prompt: "up"
+  - id: frontend
+    name: Frontend
+    depends_on: [analyze]
+    system_prompt: "sp"
+    user_prompt: "up"
+  - id: backend
+    name: Backend
+    depends_on: [analyze]
+    system_prompt: "sp"
+    user_prompt: "up"
+  - id: integrate
+    name: Integration
+    depends_on: [frontend, backend]
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert!(config.stages[0].depends_on.is_none());
+        assert_eq!(
+            config.stages[1].depends_on,
+            Some(vec!["analyze".to_string()])
+        );
+        assert_eq!(
+            config.stages[2].depends_on,
+            Some(vec!["analyze".to_string()])
+        );
+        assert_eq!(
+            config.stages[3].depends_on,
+            Some(vec!["frontend".to_string(), "backend".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_depends_on_empty_list() {
+        let yaml = r#"
+name: dag-test
+stages:
+  - id: s1
+    name: S1
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.stages[0].depends_on, Some(vec![]));
+    }
+
+    #[test]
+    fn test_depends_on_absent_by_default() {
+        let yaml = r#"
+name: no-deps
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert!(config.stages[0].depends_on.is_none());
     }
 
     #[test]

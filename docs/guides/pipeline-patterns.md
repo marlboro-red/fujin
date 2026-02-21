@@ -570,6 +570,136 @@ stages:
       - "cargo clippy -- -D warnings 2>&1"
 ```
 
+## Pattern: Parallel CI checks
+
+Run multiple independent checks concurrently, then summarize the results. Uses `depends_on: []` so all checks start immediately.
+
+```yaml
+name: "Parallel CI Pipeline"
+
+stages:
+  - id: "lint"
+    name: "Lint"
+    depends_on: []
+    commands:
+      - "cargo clippy -- -D warnings 2>&1"
+
+  - id: "test"
+    name: "Test"
+    depends_on: []
+    commands:
+      - "cargo test 2>&1"
+
+  - id: "format"
+    name: "Format Check"
+    depends_on: []
+    commands:
+      - "cargo fmt --check 2>&1"
+
+  - id: "security"
+    name: "Security Audit"
+    depends_on: []
+    commands:
+      - "cargo audit 2>&1"
+
+  - id: "fix"
+    name: "Fix Issues"
+    depends_on: [lint, test, format, security]
+    model: "claude-sonnet-4-6"
+    system_prompt: |
+      You are a developer fixing CI failures. Read the output from
+      all checks and fix every issue. Be targeted — make minimal
+      changes to resolve each specific failure.
+    user_prompt: |
+      Lint results: {{stages.lint.response}}
+      Test results: {{stages.test.response}}
+      Format check: {{stages.format.response}}
+      Security audit: {{stages.security.response}}
+
+      Fix all failures. Re-run the checks to verify.
+    allowed_tools: ["read", "edit", "bash"]
+```
+
+**When to use:** Pipelines with multiple independent validation steps. All four checks run concurrently, then the fix stage addresses any failures. This is faster than running checks sequentially.
+
+## Pattern: Parallel frontend + backend implementation
+
+A diamond pipeline that plans once, implements frontend and backend in parallel, then runs integration tests.
+
+```yaml
+name: "Parallel Full-Stack"
+
+variables:
+  feature: "User profile pages with avatar upload and activity feed"
+
+summarizer:
+  max_tokens: 2048
+
+stages:
+  - id: "plan"
+    name: "Design Architecture"
+    model: "claude-opus-4-6"
+    system_prompt: |
+      You are a senior architect. Design the feature for both
+      frontend and backend. Write docs/plan.md with API contracts,
+      data models, and component hierarchy.
+    user_prompt: |
+      Feature: {{feature}}
+      Read the existing codebase, then design the architecture.
+    allowed_tools: ["read", "write", "glob", "grep"]
+
+  - id: "backend"
+    name: "Implement Backend"
+    depends_on: [plan]
+    model: "claude-sonnet-4-6"
+    system_prompt: |
+      You are a backend developer. Implement the server-side
+      components described in docs/plan.md. Follow existing patterns.
+    user_prompt: |
+      Plan: {{stages.plan.summary}}
+      Implement the API endpoints, data models, and migrations.
+      Run backend tests when done.
+    allowed_tools: ["read", "write", "edit", "bash"]
+
+  - id: "frontend"
+    name: "Implement Frontend"
+    depends_on: [plan]
+    model: "claude-sonnet-4-6"
+    system_prompt: |
+      You are a frontend developer. Implement the client-side
+      components described in docs/plan.md. Follow existing patterns.
+    user_prompt: |
+      Plan: {{stages.plan.summary}}
+      Implement the React components, API client calls, and routes.
+      Run frontend tests when done.
+    allowed_tools: ["read", "write", "edit", "bash"]
+
+  - id: "integrate"
+    name: "Integration Tests"
+    depends_on: [frontend, backend]
+    commands:
+      - "npm run test:integration 2>&1"
+
+  - id: "review"
+    name: "Code Review"
+    depends_on: [integrate]
+    model: "claude-opus-4-6"
+    system_prompt: |
+      You are a principal engineer reviewing a full-stack feature.
+      Check for API contract mismatches between frontend and backend,
+      security issues in file uploads, and missing error handling.
+    user_prompt: |
+      Plan: {{stages.plan.summary}}
+      Backend: {{stages.backend.summary}}
+      Frontend: {{stages.frontend.summary}}
+      Integration results: {{stages.integrate.response}}
+
+      Review all changes. Fix any issues you find.
+    allowed_tools: ["read", "edit", "bash"]
+```
+
+**When to use:** Any full-stack feature where frontend and backend work is independent after the initial design phase. The parallel execution can cut total pipeline time significantly.
+
 ## Pattern: Documentation generator
 
 Read an existing codebase and generate comprehensive documentation from scratch.

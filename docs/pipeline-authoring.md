@@ -4,7 +4,7 @@ This document covers everything you need to know to create fujin pipeline config
 
 ## Overview
 
-A fujin pipeline is a YAML file that defines a sequence of **stages**. Each stage invokes an agent with a specific prompt, model, and set of tools. Stages execute sequentially — the output of one stage feeds into the next through automatic summarization and file change tracking. Agents always run in the directory where `fujin` was invoked.
+A fujin pipeline is a YAML file that defines a set of **stages**. Each stage invokes an agent with a specific prompt, model, and set of tools. By default, stages execute sequentially — each stage implicitly depends on the one before it. With `depends_on`, you can declare explicit dependencies so that independent stages run in parallel. The output of upstream stages feeds into downstream stages through automatic summarization and file change tracking. Agents always run in the directory where `fujin` was invoked.
 
 Fujin supports multiple agent runtimes — Claude Code (default) and GitHub Copilot CLI — which can be configured per-pipeline or per-stage.
 
@@ -95,7 +95,7 @@ Defines named retry groups for automatic retry-on-failure. See [Retry groups](#r
 
 #### `stages` (required, list)
 
-An ordered list of stage configurations. Stages execute top-to-bottom. The pipeline must have at least one stage.
+An ordered list of stage configurations. By default stages execute top-to-bottom, but stages with `depends_on` can run in parallel when their dependencies are satisfied. The pipeline must have at least one stage.
 
 ---
 
@@ -258,6 +258,26 @@ Export files are stored in the platform data directory (not the workspace), so t
 
 If the file doesn't exist or is malformed, a warning is emitted but the pipeline continues — missing variables render as empty strings, matching the existing behavior for undefined template variables.
 
+#### `depends_on` (optional, list of strings)
+
+Declares explicit stage dependencies. This stage waits for all listed stages to complete before starting. When multiple stages share the same dependency and don't depend on each other, they can run in parallel.
+
+```yaml
+depends_on: [analyze]                  # waits for "analyze" to complete
+depends_on: [frontend, backend]        # waits for both to complete
+depends_on: []                         # no dependencies — can start immediately
+```
+
+| Value | Behavior |
+|-------|----------|
+| absent (default) | Implicitly depends on the previous stage in YAML order (preserves sequential execution) |
+| `[stage_a, stage_b]` | Waits for all listed stages to complete |
+| `[]` (empty list) | No dependencies — stage can start immediately, in parallel with the first stage |
+
+When `depends_on` creates a non-linear dependency graph, the pipeline runner uses DAG-based scheduling to execute independent stages concurrently. Pipelines without any `depends_on` are fully backward-compatible and execute sequentially as before.
+
+See the **[Parallel Stages Guide](guides/parallel-stages.md)** for detailed usage, topology patterns, and context passing behavior.
+
 #### `retry_group` (optional, string)
 
 Assigns the stage to a **retry group**. Stages sharing the same retry group name are re-executed as a unit when any stage in the group fails. An optional verify agent can judge whether the group's output is correct.
@@ -325,9 +345,9 @@ These are automatically injected by fujin and don't need to be defined in `varia
 
 | Variable | Available in | Description |
 |----------|-------------|-------------|
-| `{{prior_summary}}` | Stage 2+ | Summarized output from the previous stage |
-| `{{artifact_list}}` | Stage 2+ | Newline-separated list of file paths changed by the previous stage |
-| `{{all_artifacts}}` | Stage 2+ | Full content of files changed by the previous stage, formatted as `=== path ===\n<content>` blocks |
+| `{{prior_summary}}` | Stage 2+ | Summarized output from parent stages. In sequential pipelines, this is the previous stage. In DAG pipelines, it combines summaries from all direct `depends_on` parents. |
+| `{{artifact_list}}` | Stage 2+ | Newline-separated list of file paths changed by parent stages (union of all parents in DAG pipelines) |
+| `{{all_artifacts}}` | Stage 2+ | Full content of files changed by parent stages, formatted as `=== path ===\n<content>` blocks |
 | `{{stages.<id>.summary}}` | After stage `<id>` completes | Summary of a specific completed stage, referenced by its `id` |
 | `{{stages.<id>.response}}` | After stage `<id>` completes | Full response text of a specific completed stage |
 | `{{exports_file}}` | Stages with `exports` | Path where the agent should write its exports JSON file |
@@ -392,19 +412,21 @@ Overrides take precedence over values in the YAML file.
 
 ## Inter-stage context passing
 
-When a pipeline has multiple stages, fujin automatically passes context from one stage to the next through three mechanisms:
+When a pipeline has multiple stages, fujin automatically passes context from upstream stages to downstream stages through three mechanisms:
 
 ### 1. Prior summary (`{{prior_summary}}`)
 
-After each stage completes, its full text output is summarized using the configured `summarizer` model. The summary is available as `{{prior_summary}}` in the next stage's prompt.
+After each stage completes, its full text output is summarized using the configured `summarizer` model. The summary is available as `{{prior_summary}}` in downstream stages.
+
+In a **sequential pipeline**, `{{prior_summary}}` contains the summary of the immediately preceding stage. In a **DAG pipeline** (using `depends_on`), it contains the combined summaries of all direct parent stages, joined with `---` separators. For DAG pipelines, prefer `{{stages.<id>.summary}}` for unambiguous references.
 
 ### 2. Shared directory
 
-All stages share the same working directory (the directory where `fujin` was invoked). Files written by stage 1 are readable by stage 2. Fujin tracks file changes (created, modified, deleted) per stage and displays them in the TUI.
+All stages share the same working directory (the directory where `fujin` was invoked). Files written by one stage are readable by any subsequent stage. Fujin tracks file changes (created, modified, deleted) per stage and displays them in the TUI.
 
 ### 3. Artifact variables
 
-`{{artifact_list}}` gives you a simple list of changed file paths. `{{all_artifacts}}` gives you the full content of those files inlined into the prompt. Use these when you want the next stage to explicitly see what the previous stage produced without needing to read files.
+`{{artifact_list}}` gives you a simple list of changed file paths. `{{all_artifacts}}` gives you the full content of those files inlined into the prompt. In DAG pipelines, these contain the union of artifacts from all direct parent stages. Use these when you want downstream stages to explicitly see what upstream stages produced without making tool calls.
 
 ---
 
@@ -810,6 +832,65 @@ stages:
       - "npm test"
 ```
 
+### Parallel stages with `depends_on`
+
+A pipeline where frontend and backend work happens in parallel:
+
+```yaml
+name: "Parallel Full-Stack"
+
+variables:
+  feature: "Add user dashboard with real-time stats"
+
+stages:
+  - id: plan
+    name: Design Architecture
+    model: "claude-opus-4-6"
+    system_prompt: "You are a senior architect."
+    user_prompt: |
+      Design the architecture for: {{feature}}
+      Write the plan to docs/plan.md.
+    allowed_tools: ["read", "write", "glob"]
+
+  - id: frontend
+    name: Build Frontend
+    depends_on: [plan]
+    system_prompt: "You are a React developer."
+    user_prompt: |
+      Plan: {{stages.plan.summary}}
+      Build the dashboard UI components.
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: backend
+    name: Build Backend
+    depends_on: [plan]
+    system_prompt: "You are a backend developer."
+    user_prompt: |
+      Plan: {{stages.plan.summary}}
+      Build the API endpoints and WebSocket handlers.
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: integrate
+    name: Integration Tests
+    depends_on: [frontend, backend]
+    commands:
+      - "npm test 2>&1"
+
+  - id: review
+    name: Code Review
+    depends_on: [integrate]
+    model: "claude-opus-4-6"
+    system_prompt: "You are a code reviewer."
+    user_prompt: |
+      Frontend: {{stages.frontend.summary}}
+      Backend: {{stages.backend.summary}}
+      Test results: {{stages.integrate.response}}
+      Review all changes for correctness and security.
+    allowed_tools: ["read", "edit"]
+```
+
+`frontend` and `backend` run in parallel after `plan` completes. `integrate` waits for both.
+
 ### Conditional stage with `when`
 
 A pipeline that conditionally writes tests based on analysis:
@@ -964,6 +1045,11 @@ Fujin validates your pipeline config before execution. The following rules are e
 - A retry group must have at least 2 stages (or use a `verify` agent)
 - `verify.system_prompt` and `verify.user_prompt` must not be empty
 - `timeout_secs` must be greater than 0 (if set)
+- `depends_on` must reference defined stage IDs (no self-references)
+- `depends_on` must not create circular dependencies
+- `when.stage` must be a direct or transitive dependency of the current stage
+- `on_branch` stage references must be transitive dependencies of the current stage
+- Non-first stages in a retry group cannot `depends_on` stages outside the group
 
 **Warnings** (reported but don't prevent execution):
 - Unknown tool names in `allowed_tools` (valid: `read`, `write`, `bash`, `edit`, `glob`, `grep`, `notebook`)
