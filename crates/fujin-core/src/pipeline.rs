@@ -1254,11 +1254,27 @@ impl PipelineRunner {
                                 }
                             }
 
-                            let loaded: Vec<(String, String)> =
-                                vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            // Only insert keys declared in exports.keys
+                            let mut loaded: Vec<(String, String)> = Vec::new();
+                            for key in &exports.keys {
+                                if let Some(v) = vars.get(key) {
+                                    exported_vars.insert(key.clone(), v.clone());
+                                    loaded.push((key.clone(), v.clone()));
+                                }
+                            }
 
-                            for (k, v) in vars {
-                                exported_vars.insert(k, v);
+                            // Warn about undeclared keys
+                            for k in vars.keys() {
+                                if !exports.keys.contains(k) {
+                                    self.emit(PipelineEvent::ExportsWarning {
+                                        stage_index: stage_idx,
+                                        stage_id: stage_id.to_string(),
+                                        message: format!(
+                                            "Undeclared key '{}' in exports file ignored",
+                                            k
+                                        ),
+                                    });
+                                }
                             }
 
                             self.emit(PipelineEvent::ExportsLoaded {
@@ -1579,7 +1595,7 @@ impl PipelineRunner {
 
         let mut combined_output = String::new();
 
-        let result: CoreResult<()> = async {
+        let cmd_future = async {
             for (cmd_idx, cmd_template) in commands.iter().enumerate() {
                 // Check cancellation
                 if let Some(ref flag) = self.cancel_flag {
@@ -1610,8 +1626,21 @@ impl PipelineRunner {
                 combined_output.push_str(&format!("$ {cmd}\n{output}"));
             }
             Ok(())
-        }
-        .await;
+        };
+
+        let result: CoreResult<()> = if let Some(timeout_secs) = stage_config.timeout_secs {
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd_future).await {
+                Ok(r) => r,
+                Err(_) => Err(CoreError::AgentError {
+                    message: format!(
+                        "Stage '{}' timed out after {}s",
+                        stage_config.id, timeout_secs
+                    ),
+                }),
+            }
+        } else {
+            cmd_future.await
+        };
 
         // Always abort the tick task, whether commands succeeded or failed
         tick_handle.abort();
@@ -1990,7 +2019,7 @@ async fn execute_command_stage_spawned(
 
     let mut combined_output = String::new();
 
-    let result: CoreResult<()> = async {
+    let cmd_future = async {
         for (cmd_idx, cmd_template) in commands.iter().enumerate() {
             // Check cancellation
             if let Some(ref flag) = input.cancel_flag {
@@ -2025,8 +2054,21 @@ async fn execute_command_stage_spawned(
             combined_output.push_str(&format!("$ {cmd}\n{output}"));
         }
         Ok(())
-    }
-    .await;
+    };
+
+    let result: CoreResult<()> = if let Some(timeout_secs) = input.stage_config.timeout_secs {
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd_future).await {
+            Ok(r) => r,
+            Err(_) => Err(CoreError::AgentError {
+                message: format!(
+                    "Stage '{}' timed out after {}s",
+                    input.stage_config.id, timeout_secs
+                ),
+            }),
+        }
+    } else {
+        cmd_future.await
+    };
 
     tick_handle.abort();
 
@@ -2211,7 +2253,10 @@ fn evaluate_when_condition(
     };
 
     let pattern = format!("(?i){}", when.output_matches);
-    match regex::Regex::new(&pattern) {
+    match regex::RegexBuilder::new(&pattern)
+        .size_limit(1_000_000)
+        .build()
+    {
         Ok(re) => re.is_match(&referenced.response_text),
         Err(_) => false,
     }

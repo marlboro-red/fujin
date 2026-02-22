@@ -135,6 +135,7 @@ impl Workspace {
         }
 
         for entry in WalkDir::new(&self.root)
+            .follow_links(false)
             .into_iter()
             .filter_entry(|e| e.depth() == 0 || !is_hidden(e))
         {
@@ -212,7 +213,18 @@ impl Workspace {
     }
 
     /// Read a file from the workspace.
+    ///
+    /// Rejects paths containing `..` components to prevent path traversal attacks.
     pub fn read_file(&self, rel_path: &Path) -> CoreResult<String> {
+        if rel_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(CoreError::WorkspaceError {
+                path: rel_path.to_path_buf(),
+                message: "Path traversal detected: path contains '..' components".to_string(),
+            });
+        }
         let abs_path = self.root.join(rel_path);
         std::fs::read_to_string(&abs_path).map_err(|e| CoreError::WorkspaceError {
             path: abs_path,
@@ -280,6 +292,51 @@ mod tests {
         let diff = Workspace::diff(&snap1, &snap2);
         assert_eq!(diff.deleted_count(), 1);
         assert_eq!(diff.total_count(), 1);
+    }
+
+    #[test]
+    fn test_read_file_path_traversal_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path().to_path_buf());
+        fs::write(dir.path().join("ok.txt"), "fine").unwrap();
+
+        // Normal read should work
+        assert!(ws.read_file(Path::new("ok.txt")).is_ok());
+
+        // Path traversal should be rejected
+        let result = ws.read_file(Path::new("../../etc/passwd"));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Path traversal detected"), "got: {err}");
+
+        let result = ws.read_file(Path::new("subdir/../../../etc/passwd"));
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_excluded_from_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path().to_path_buf());
+
+        // Create a real file inside the workspace
+        fs::write(dir.path().join("real.txt"), "real content").unwrap();
+
+        // Create a file outside the workspace
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+
+        // Create a symlink inside the workspace pointing outside
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("link.txt"),
+        )
+        .unwrap();
+
+        let snap = ws.snapshot().unwrap();
+        assert_eq!(snap.files.len(), 1);
+        assert!(snap.files.contains_key(Path::new("real.txt")));
+        assert!(!snap.files.contains_key(Path::new("link.txt")));
     }
 
     #[test]

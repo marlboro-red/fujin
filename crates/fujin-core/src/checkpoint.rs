@@ -105,11 +105,11 @@ impl CheckpointManager {
         let json = serde_json::to_string_pretty(checkpoint)?;
 
         let path = self.checkpoint_path(&checkpoint.run_id);
-        std::fs::write(&path, &json)?;
+        write_private(&path, &json)?;
 
         // Also save as "latest" copy for easy resume
         let latest_path = self.checkpoint_dir.join("latest.json");
-        std::fs::write(&latest_path, &json)?;
+        write_private(&latest_path, &json)?;
 
         debug!(
             run_id = %checkpoint.run_id,
@@ -251,6 +251,17 @@ pub struct CheckpointSummary {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Write a file and set permissions to 0o600 on Unix.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 /// Hash a config string for change detection.
 fn hash_config(config_yaml: &str) -> String {
     format!("{:x}", Sha256::digest(config_yaml.as_bytes()))
@@ -324,6 +335,28 @@ mod tests {
 
         let list = manager.list().unwrap();
         assert!(list.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_checkpoint_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = CheckpointManager::with_dir(dir.path().to_path_buf());
+
+        let cp = CheckpointManager::create_new("test config");
+        manager.save(&cp).unwrap();
+
+        // Check the run-specific checkpoint file
+        let path = dir.path().join(format!("{}.json", cp.run_id));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "checkpoint file should be 0600, got {:o}", mode);
+
+        // Check the latest.json symlink/copy
+        let latest = dir.path().join("latest.json");
+        let mode = std::fs::metadata(&latest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "latest.json should be 0600, got {:o}", mode);
     }
 
     #[test]

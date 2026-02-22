@@ -11,6 +11,9 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// Maximum response size (50 MB) to prevent unbounded memory growth.
+const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+
 /// GitHub Copilot CLI agent runtime.
 ///
 /// Spawns `copilot` as a subprocess for each stage using programmatic mode
@@ -258,7 +261,15 @@ impl AgentRuntime for CopilotCliRuntime {
 
         debug!(stdout_len = stdout.len(), "Copilot CLI process completed");
 
-        let response_text = stdout.trim().to_string();
+        let mut response_text = stdout.trim().to_string();
+
+        if response_text.len() > MAX_RESPONSE_BYTES {
+            warn!(
+                "Agent response exceeded {}MB limit, truncating",
+                MAX_RESPONSE_BYTES / 1_048_576
+            );
+            response_text.truncate(MAX_RESPONSE_BYTES);
+        }
 
         // Copilot CLI programmatic mode does not provide token usage
         Ok(AgentOutput {

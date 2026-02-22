@@ -13,6 +13,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use fujin_config::StageConfig;
 
+/// Maximum response size (50 MB) to prevent unbounded memory growth.
+const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+
 /// Output from an agent execution.
 #[derive(Debug, Clone)]
 pub struct AgentOutput {
@@ -392,10 +395,27 @@ impl AgentRuntime for ClaudeCodeRuntime {
                     // Collect final result
                     if let Some(text) = parsed.result.or(parsed.content) {
                         if !text.is_empty() {
-                            if !response_text.is_empty() {
-                                response_text.push('\n');
+                            if response_text.len() + text.len() + 1 > MAX_RESPONSE_BYTES {
+                                warn!(
+                                    "Agent response exceeded {}MB limit, truncating",
+                                    MAX_RESPONSE_BYTES / 1_048_576
+                                );
+                                let remaining =
+                                    MAX_RESPONSE_BYTES.saturating_sub(response_text.len());
+                                if remaining > 0 {
+                                    if !response_text.is_empty() {
+                                        response_text.push('\n');
+                                    }
+                                    response_text
+                                        .push_str(&text[..remaining.min(text.len())]);
+                                }
+                                // Continue reading to drain pipe but don't accumulate
+                            } else {
+                                if !response_text.is_empty() {
+                                    response_text.push('\n');
+                                }
+                                response_text.push_str(&text);
                             }
-                            response_text.push_str(&text);
                         }
                     }
 
@@ -501,7 +521,15 @@ impl AgentRuntime for ClaudeCodeRuntime {
 
             debug!(stdout_len = stdout.len(), "Claude Code process completed");
 
-            let (response_text, token_usage) = parse_claude_output(&stdout);
+            let (mut response_text, token_usage) = parse_claude_output(&stdout);
+
+            if response_text.len() > MAX_RESPONSE_BYTES {
+                warn!(
+                    "Agent response exceeded {}MB limit, truncating",
+                    MAX_RESPONSE_BYTES / 1_048_576
+                );
+                response_text.truncate(MAX_RESPONSE_BYTES);
+            }
 
             Ok(AgentOutput {
                 response_text,

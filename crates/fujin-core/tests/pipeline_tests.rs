@@ -2641,7 +2641,8 @@ stages:
     model: mock-model
     system_prompt: "You are an analyzer."
     user_prompt: "Analyze. Write to {{exports_file}}"
-    exports: {}
+    exports:
+      keys: [build_target]
   - id: build
     name: Build
     commands:
