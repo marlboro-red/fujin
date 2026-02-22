@@ -1,6 +1,6 @@
 use crate::agent::AgentRuntime;
 use crate::checkpoint::CheckpointManager;
-use crate::context::{ContextBuilder, StageContext};
+use crate::context::ContextBuilder;
 use crate::create_runtime;
 use crate::dag::Dag;
 use crate::error::{CoreError, CoreResult};
@@ -55,7 +55,6 @@ struct StageExecutionInput {
     stage_id: String,
     stage_config: StageConfig,
     runtime: Arc<dyn AgentRuntime>,
-    context: StageContext,
     workspace_root: PathBuf,
     event_tx: mpsc::UnboundedSender<PipelineEvent>,
     cancel_flag: Option<Arc<AtomicBool>>,
@@ -63,6 +62,18 @@ struct StageExecutionInput {
     /// Used by command stages for template rendering.
     exported_vars: HashMap<String, String>,
     stage_start: Instant,
+
+    // --- Context-building data (used by agent stages, built inside spawned task) ---
+    /// Runtime name for the summarizer subprocess (e.g. "claude-code").
+    context_builder_runtime: String,
+    /// Full pipeline config (needed for template variables and summarizer config).
+    pipeline_config: PipelineConfig,
+    /// Cloned results from direct parent stages.
+    prior_results: Vec<StageResult>,
+    /// Verify feedback string (retry groups only).
+    verify_feedback: Option<String>,
+    /// All completed stage results (for {{stages.<id>.*}} template variables).
+    all_completed: Vec<StageResult>,
 }
 
 /// Output from a completed spawned stage execution task.
@@ -790,60 +801,24 @@ impl PipelineRunner {
                     );
                 }
 
-                // Build context for agent stages (sequential — needs checkpoint data)
-                let context = if stage_config.is_command_stage() {
-                    StageContext {
-                        rendered_prompt: String::new(),
-                        prior_summary: None,
-                        changed_files: Vec::new(),
-                        verify_feedback: None,
-                    }
-                } else {
-                    self.emit(PipelineEvent::ContextBuilding {
-                        stage_index: stage_idx,
-                    });
-
-                    let parent_ids = dag.parents(&stage_config.id);
-                    let prior_results: Vec<&crate::stage::StageResult> = checkpoint
-                        .completed_stages
-                        .iter()
-                        .filter(|r| parent_ids.contains(&r.stage_id))
-                        .collect();
-
-                    let feedback = stage_config
-                        .retry_group
-                        .as_ref()
-                        .and_then(|g| verify_feedback.get(g))
-                        .map(|s| s.as_str());
-
-                    let ctx = self
-                        .context_builder
-                        .build(
-                            &self.config,
-                            stage_config,
-                            &prior_results,
-                            &self.workspace,
-                            feedback,
-                            &checkpoint.completed_stages,
-                            exported_vars,
-                        )
-                        .await?;
-
-                    self.emit(PipelineEvent::StageContext {
-                        stage_index: stage_idx,
-                        rendered_prompt: ctx.rendered_prompt.clone(),
-                        prior_summary: ctx.prior_summary.clone(),
-                    });
-
-                    self.emit(PipelineEvent::AgentRunning {
-                        stage_index: stage_idx,
-                        stage_id: stage_config.id.clone(),
-                    });
-
-                    ctx
-                };
-
                 // === EXECUTE PHASE (parallel, spawned) ===
+
+                // Snapshot data needed for context building inside the spawned task
+                let parent_ids = dag.parents(&stage_config.id);
+                let prior_results: Vec<StageResult> = checkpoint
+                    .completed_stages
+                    .iter()
+                    .filter(|r| parent_ids.contains(&r.stage_id))
+                    .cloned()
+                    .collect();
+
+                let feedback = stage_config
+                    .retry_group
+                    .as_ref()
+                    .and_then(|g| verify_feedback.get(g))
+                    .cloned();
+
+                let all_completed = checkpoint.completed_stages.clone();
 
                 // Snapshot pipeline variables + exported vars for command template rendering
                 let merged_vars = {
@@ -859,12 +834,16 @@ impl PipelineRunner {
                     stage_id: stage_id.clone(),
                     stage_config: stage_config.clone(),
                     runtime: stage_runtime,
-                    context,
                     workspace_root: self.workspace.root().to_path_buf(),
                     event_tx: self.event_tx.clone(),
                     cancel_flag: self.cancel_flag.clone(),
                     exported_vars: merged_vars,
                     stage_start,
+                    context_builder_runtime: self.context_builder.runtime_name.clone(),
+                    pipeline_config: self.config.clone(),
+                    prior_results,
+                    verify_feedback: feedback,
+                    all_completed,
                 };
 
                 join_set.spawn(execute_stage_task(input));
@@ -1910,11 +1889,42 @@ async fn execute_stage_task(
 
 /// Execute an agent-based stage in a spawned task.
 ///
-/// Sets up tick/progress channels, runs the agent via the runtime, and handles timeouts.
-/// Context must already be built and passed in via the input.
+/// Builds context in parallel (inside the spawned task), then runs the agent.
 async fn execute_agent_stage_spawned(
     input: &StageExecutionInput,
 ) -> CoreResult<(String, Option<crate::stage::TokenUsage>)> {
+    // Build context inside the spawned task (enables parallel context building)
+    let _ = input.event_tx.send(PipelineEvent::ContextBuilding {
+        stage_index: input.stage_idx,
+    });
+
+    let context_builder = ContextBuilder::with_runtime(input.context_builder_runtime.clone());
+    let prior_refs: Vec<&StageResult> = input.prior_results.iter().collect();
+    let workspace = Workspace::new(input.workspace_root.clone());
+
+    let context = context_builder
+        .build(
+            &input.pipeline_config,
+            &input.stage_config,
+            &prior_refs,
+            &workspace,
+            input.verify_feedback.as_deref(),
+            &input.all_completed,
+            &input.exported_vars,
+        )
+        .await?;
+
+    let _ = input.event_tx.send(PipelineEvent::StageContext {
+        stage_index: input.stage_idx,
+        rendered_prompt: context.rendered_prompt.clone(),
+        prior_summary: context.prior_summary.clone(),
+    });
+
+    let _ = input.event_tx.send(PipelineEvent::AgentRunning {
+        stage_index: input.stage_idx,
+        stage_id: input.stage_id.clone(),
+    });
+
     // Set up tick task for elapsed time tracking
     let tick_tx = input.event_tx.clone();
     let tick_idx = input.stage_idx;
@@ -1956,7 +1966,7 @@ async fn execute_agent_stage_spawned(
     // Execute agent
     let agent_future = input.runtime.execute(
         &input.stage_config,
-        &input.context,
+        &context,
         &input.workspace_root,
         Some(ptx),
         input.cancel_flag.clone(),

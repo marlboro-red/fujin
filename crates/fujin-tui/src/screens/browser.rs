@@ -327,31 +327,45 @@ impl BrowserState {
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
-                let effective_runtime = stage.runtime.as_deref().unwrap_or(&config.runtime);
-                let rt_short = match effective_runtime {
-                    "claude-code" | "" => "claude",
-                    "copilot-cli" => "copilot",
-                    other => other,
-                };
-                let rt_color = match effective_runtime {
-                    "copilot-cli" => ratatui::style::Color::Rgb(110, 200, 250),
-                    _ => theme::TOKEN_LABEL,
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:width$}  ", ""),
-                        Style::default().fg(theme::TEXT_MUTED),
-                    ),
-                    Span::styled(
-                        rt_short.to_string(),
-                        Style::default().fg(rt_color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(" · ", Style::default().fg(theme::TEXT_MUTED)),
-                    Span::styled(
-                        theme::shorten_model(&stage.model),
-                        Style::default().fg(theme::TOKEN_LABEL),
-                    ),
-                ]));
+                if stage.is_command_stage() {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:width$}  ", ""),
+                            Style::default().fg(theme::TEXT_MUTED),
+                        ),
+                        Span::styled(
+                            "commands".to_string(),
+                            Style::default().fg(theme::TOKEN_LABEL),
+                        ),
+                    ]));
+                } else {
+                    let effective_runtime =
+                        stage.runtime.as_deref().unwrap_or(&config.runtime);
+                    let rt_short = match effective_runtime {
+                        "claude-code" | "" => "claude",
+                        "copilot-cli" => "copilot",
+                        other => other,
+                    };
+                    let rt_color = match effective_runtime {
+                        "copilot-cli" => ratatui::style::Color::Rgb(110, 200, 250),
+                        _ => theme::TOKEN_LABEL,
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:width$}  ", ""),
+                            Style::default().fg(theme::TEXT_MUTED),
+                        ),
+                        Span::styled(
+                            rt_short.to_string(),
+                            Style::default().fg(rt_color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" · ", Style::default().fg(theme::TEXT_MUTED)),
+                        Span::styled(
+                            theme::shorten_model(&stage.model),
+                            Style::default().fg(theme::TOKEN_LABEL),
+                        ),
+                    ]));
+                }
                 if !stage.allowed_tools.is_empty() {
                     lines.push(Line::from(vec![
                         Span::styled(

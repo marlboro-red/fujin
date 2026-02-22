@@ -35,7 +35,7 @@ pub struct StageContext {
 pub struct ContextBuilder {
     /// Name of the runtime to use for summarization.
     /// Determines which CLI binary and flags to use.
-    runtime_name: String,
+    pub(crate) runtime_name: String,
 }
 
 impl ContextBuilder {
