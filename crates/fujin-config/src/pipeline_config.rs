@@ -28,8 +28,33 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub retry_groups: HashMap<String, RetryGroupConfig>,
 
+    /// Included pipelines whose stages are merged into this pipeline.
+    #[serde(default)]
+    pub includes: Vec<IncludeConfig>,
+
     /// Ordered list of pipeline stages.
     pub stages: Vec<StageConfig>,
+}
+
+/// Configuration for including stages from another pipeline file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncludeConfig {
+    /// Path to the pipeline YAML file (resolved relative to the parent file).
+    pub source: String,
+
+    /// Prefix alias for all stage IDs from this include.
+    /// Stage "build" with as: "be" becomes "be.build".
+    #[serde(rename = "as")]
+    pub alias: String,
+
+    /// Stages in the parent DAG that the included pipeline's root stages depend on.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+
+    /// Variables to pass into the included pipeline.
+    /// These override the included pipeline's own variable defaults.
+    #[serde(default)]
+    pub vars: HashMap<String, String>,
 }
 
 /// Configuration for the inter-stage summarizer.

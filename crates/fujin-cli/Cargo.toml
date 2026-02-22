@@ -19,3 +19,4 @@ tracing-subscriber = { workspace = true }
 console = { workspace = true }
 indicatif = { workspace = true }
 dotenvy = { workspace = true }
+serde_yml = { workspace = true }

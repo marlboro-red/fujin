@@ -495,6 +495,7 @@ dependencies = [
  "fujin-core",
  "fujin-tui",
  "indicatif",
+ "serde_yml",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -508,6 +509,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "tempfile",
  "thiserror",
 ]
 
@@ -541,6 +543,7 @@ dependencies = [
  "fujin-config",
  "fujin-core",
  "ratatui",
+ "serde_yml",
  "tokio",
 ]
 

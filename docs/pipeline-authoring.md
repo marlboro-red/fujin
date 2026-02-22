@@ -45,6 +45,12 @@ retry_groups:                      # optional, default: {}
   group_name:
     max_retries: 5
     verify: ...
+includes:                          # optional, default: []
+  - source: backend.yaml
+    as: be
+    depends_on: [analyze]
+    vars:
+      db_url: "{{db_url}}"
 stages:                            # REQUIRED — at least one stage
   - ...
 ```
@@ -92,6 +98,32 @@ The summarizer calls Claude to condense the previous stage's full output into a 
 #### `retry_groups` (optional, map)
 
 Defines named retry groups for automatic retry-on-failure. See [Retry groups](#retry_group-optional-string) in stage fields for usage.
+
+#### `includes` (optional, list)
+
+Import stages from other pipeline files. Each include loads a pipeline YAML, prefixes its stage IDs with the `as` alias, and merges them into the current pipeline. Includes are resolved before validation — the result is a flat pipeline config.
+
+```yaml
+includes:
+  - source: backend.yaml           # path relative to this file
+    as: be                          # prefix for included stage IDs
+    depends_on: [analyze]           # wires included root stages to parent
+    vars:                           # variables passed into the include
+      db_url: "prod-db.example.com"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `source` | string | *required* | Path to the pipeline YAML file (relative to the parent file) |
+| `as` | string | *required* | Prefix alias for stage IDs. Must be alphanumeric, underscore, or hyphen. Must be unique. |
+| `depends_on` | list | `[]` | Parent stages that included root stages depend on |
+| `vars` | map | `{}` | Variables passed into the included pipeline (override its defaults) |
+
+Included pipelines can themselves contain `includes` (nested includes). Prefixes stack: if `backend.yaml` includes `database.yaml` as `db`, and you include `backend.yaml` as `be`, the database stages get prefixed as `be.db.migrate`.
+
+Circular includes are detected and produce an error.
+
+See the **[Pipeline Includes Guide](guides/pipeline-includes.md)** for detailed usage, examples, and interaction with other features.
 
 #### `stages` (required, list)
 
@@ -1032,6 +1064,12 @@ Fujin validates your pipeline config before execution. The following rules are e
 **Errors** (prevent execution):
 - `name` must not be empty
 - `stages` must contain at least one stage
+- Include `source` must not be empty
+- Include `as` alias must not be empty and must be a valid identifier (alphanumeric, underscore, hyphen)
+- Include aliases must be unique
+- Include `depends_on` must reference stages defined in the parent's `stages`
+- Include source file must exist and be a valid pipeline config
+- Circular includes are not allowed
 - All stage `id` values must be unique
 - Each stage must have non-empty `id`, `name`, `system_prompt`, and `user_prompt`
 - `when.stage` must reference a stage ID that appears earlier in the stages list

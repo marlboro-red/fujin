@@ -1,8 +1,10 @@
+mod includes;
 mod pipeline_config;
 mod validation;
 
-pub use pipeline_config::{BranchConfig, ExportsConfig, PipelineConfig, RetryGroupConfig, StageConfig, SummarizerConfig, VerifyConfig, WhenCondition, KNOWN_RUNTIMES};
-pub use validation::{validate, ValidationResult};
+pub use includes::resolve_includes;
+pub use pipeline_config::{BranchConfig, ExportsConfig, IncludeConfig, PipelineConfig, RetryGroupConfig, StageConfig, SummarizerConfig, VerifyConfig, WhenCondition, KNOWN_RUNTIMES};
+pub use validation::{validate, validate_includes, ValidationResult};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -19,5 +21,11 @@ pub enum ConfigError {
     Validation {
         errors: Vec<String>,
         warnings: Vec<String>,
+    },
+
+    #[error("Include resolution failed for '{include_source}': {message}")]
+    IncludeError {
+        include_source: String,
+        message: String,
     },
 }

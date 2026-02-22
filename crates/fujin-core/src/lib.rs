@@ -11,6 +11,7 @@ pub mod pipeline;
 pub mod stage;
 pub mod util;
 pub mod workspace;
+pub mod worktree;
 
 pub use agent::{AgentOutput, AgentRuntime, ClaudeCodeRuntime};
 pub use artifact::{ArtifactSet, FileChange, FileChangeKind};

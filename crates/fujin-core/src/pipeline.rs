@@ -677,15 +677,34 @@ impl PipelineRunner {
         // to ensure they run sequentially within the group.
         let mut retry_group_in_flight: HashSet<String> = HashSet::new();
 
+        // Worktree isolation for parallel stages
+        let use_worktrees = crate::worktree::is_git_repo(self.workspace.root());
+        let original_head = if use_worktrees {
+            Some(crate::worktree::get_head(self.workspace.root())?)
+        } else {
+            if !dag.is_linear() {
+                warn!("Workspace is not a git repo — parallel stages will share the workspace (no isolation)");
+            }
+            None
+        };
+        // Track which files were modified by worktree stages (for conflict detection)
+        let mut worktree_modified_files: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        // Track active worktrees by stage_id
+        let mut active_worktrees: HashMap<String, crate::worktree::WorktreeInfo> = HashMap::new();
+
         let mut join_set: tokio::task::JoinSet<
             Result<StageExecutionOutput, (usize, String, CoreError)>,
         > = tokio::task::JoinSet::new();
 
-        loop {
+        let dag_result: CoreResult<()> = 'dag: loop {
             // Check for cancellation
             if let Some(ref flag) = self.cancel_flag {
                 if flag.load(Ordering::Relaxed) {
                     join_set.abort_all();
+                    // Clean up active worktrees on cancellation
+                    for (_, wt) in active_worktrees.drain() {
+                        let _ = crate::worktree::remove(self.workspace.root(), &wt);
+                    }
                     let stage_id = in_flight
                         .iter()
                         .next()
@@ -694,7 +713,7 @@ impl PipelineRunner {
                     self.emit(PipelineEvent::PipelineCancelled {
                         stage_index: dag.index_of(&stage_id).unwrap_or(0),
                     });
-                    return Err(CoreError::Cancelled { stage_id });
+                    break 'dag Err(CoreError::Cancelled { stage_id });
                 }
             }
 
@@ -702,7 +721,12 @@ impl PipelineRunner {
             let ready = dag.ready_stages(&completed, &skipped, &in_flight);
 
             if ready.is_empty() && join_set.is_empty() {
-                break; // All stages done
+                break 'dag Ok(()); // All stages done
+            }
+
+            // Auto-commit pending changes before creating worktrees so they start fresh
+            if use_worktrees && !ready.is_empty() {
+                let _ = crate::worktree::auto_commit(self.workspace.root(), "pre-parallel");
             }
 
             // Launch ready stages that aren't blocked by retry group constraints
@@ -766,6 +790,27 @@ impl PipelineRunner {
                 let stage_start = Instant::now();
                 let stage_runtime = self.runtime_for_stage(stage_config);
 
+                // Create worktree for isolated execution
+                let (effective_workspace, worktree_isolated) = if use_worktrees {
+                    match crate::worktree::create(
+                        self.workspace.root(),
+                        &checkpoint.run_id,
+                        stage_id,
+                    ) {
+                        Ok(wt) => {
+                            let path = wt.path.clone();
+                            active_worktrees.insert(stage_id.clone(), wt);
+                            (path, true)
+                        }
+                        Err(e) => {
+                            warn!(stage_id = %stage_id, "Failed to create worktree, falling back to shared workspace: {e}");
+                            (self.workspace.root().to_path_buf(), false)
+                        }
+                    }
+                } else {
+                    (self.workspace.root().to_path_buf(), false)
+                };
+
                 self.emit(PipelineEvent::StageStarted {
                     stage_index: stage_idx,
                     stage_id: stage_id.clone(),
@@ -778,6 +823,7 @@ impl PipelineRunner {
                     runtime: stage_runtime.name().to_string(),
                     allowed_tools: stage_config.allowed_tools.clone(),
                     retry_group: stage_config.retry_group.clone(),
+                    isolated: worktree_isolated,
                 });
 
                 // Set up exports file path
@@ -834,7 +880,7 @@ impl PipelineRunner {
                     stage_id: stage_id.clone(),
                     stage_config: stage_config.clone(),
                     runtime: stage_runtime,
-                    workspace_root: self.workspace.root().to_path_buf(),
+                    workspace_root: effective_workspace,
                     event_tx: self.event_tx.clone(),
                     cancel_flag: self.cancel_flag.clone(),
                     exported_vars: merged_vars,
@@ -852,7 +898,7 @@ impl PipelineRunner {
 
             if join_set.is_empty() {
                 // Nothing spawned and nothing in flight — avoid infinite loop
-                break;
+                break 'dag Ok(());
             }
 
             // === POST-PROCESS PHASE (sequential, one completed task at a time) ===
@@ -871,6 +917,50 @@ impl PipelineRunner {
                     let completed_stage_id = output.stage_id.clone();
                     let completed_stage_idx = output.stage_idx;
 
+                    // Handle worktree: collect artifacts and merge back
+                    let pre_artifacts = if let Some(wt) = active_worktrees.remove(&output.stage_id) {
+                        // Get artifacts from the worktree (only this stage's changes)
+                        let wt_path = wt.path.clone();
+                        let artifacts = tokio::task::spawn_blocking(move || {
+                            Workspace::new(wt_path).git_diff()
+                        })
+                        .await
+                        .unwrap_or_default();
+
+                        // Detect conflicts (file modified by multiple parallel stages)
+                        for change in &artifacts.changes {
+                            let stages = worktree_modified_files
+                                .entry(change.path.clone())
+                                .or_default();
+                            stages.push(output.stage_id.clone());
+                            if stages.len() > 1 {
+                                warn!(
+                                    path = %change.path.display(),
+                                    stages = ?stages,
+                                    "File modified by multiple parallel stages — last to complete wins"
+                                );
+                            }
+                        }
+
+                        // Apply changes from worktree to main workspace
+                        let _ = crate::worktree::apply_changes(
+                            self.workspace.root(),
+                            &wt,
+                            &artifacts,
+                        );
+                        // Clean up worktree
+                        let _ = crate::worktree::remove(self.workspace.root(), &wt);
+                        // Auto-commit so future worktrees see these changes
+                        let _ = crate::worktree::auto_commit(
+                            self.workspace.root(),
+                            &output.stage_id,
+                        );
+
+                        Some(artifacts)
+                    } else {
+                        None
+                    };
+
                     match self
                         .post_process_stage(
                             output.stage_idx,
@@ -883,6 +973,7 @@ impl PipelineRunner {
                             verify_feedback,
                             exported_vars,
                             checkpoint,
+                            pre_artifacts,
                         )
                         .await
                     {
@@ -910,8 +1001,12 @@ impl PipelineRunner {
                             }
                         }
                         Err(e) => {
+                            // Clean up remaining worktrees on error
+                            for (_, wt) in active_worktrees.drain() {
+                                let _ = crate::worktree::remove(self.workspace.root(), &wt);
+                            }
                             join_set.abort_all();
-                            return Err(e);
+                            break 'dag Err(e);
                         }
                     }
                 }
@@ -921,6 +1016,11 @@ impl PipelineRunner {
                     let stage_config = &self.config.stages[stage_idx];
                     if let Some(ref group) = stage_config.retry_group {
                         retry_group_in_flight.remove(group.as_str());
+                    }
+
+                    // Clean up worktree for the failed stage
+                    if let Some(wt) = active_worktrees.remove(&stage_id) {
+                        let _ = crate::worktree::remove(self.workspace.root(), &wt);
                     }
 
                     match self
@@ -953,26 +1053,39 @@ impl PipelineRunner {
                             }
                         }
                         Err(e) => {
+                            // Clean up remaining worktrees on error
+                            for (_, wt) in active_worktrees.drain() {
+                                let _ = crate::worktree::remove(self.workspace.root(), &wt);
+                            }
                             join_set.abort_all();
-                            return Err(e);
+                            break 'dag Err(e);
                         }
                     }
                 }
                 Some(Err(join_error)) => {
                     // Task panicked (JoinError)
+                    // Clean up remaining worktrees on panic
+                    for (_, wt) in active_worktrees.drain() {
+                        let _ = crate::worktree::remove(self.workspace.root(), &wt);
+                    }
                     join_set.abort_all();
-                    return Err(CoreError::AgentError {
+                    break 'dag Err(CoreError::AgentError {
                         message: format!("Stage task panicked: {}", join_error),
                     });
                 }
                 None => {
                     // JoinSet is empty — shouldn't happen since we check above
-                    break;
+                    break 'dag Ok(());
                 }
             }
+        };
+
+        // Soft-reset to undo auto-commits, restoring all changes as uncommitted
+        if let Some(ref original) = original_head {
+            let _ = crate::worktree::soft_reset(self.workspace.root(), original);
         }
 
-        Ok(())
+        dag_result
     }
 
     /// Check if a stage should be skipped (on_branch or when condition).
@@ -1064,6 +1177,7 @@ impl PipelineRunner {
             runtime: stage_runtime.name().to_string(),
             allowed_tools: stage_config.allowed_tools.clone(),
             retry_group: stage_config.retry_group.clone(),
+            isolated: false,
         });
 
         let stage_start = Instant::now();
@@ -1122,6 +1236,7 @@ impl PipelineRunner {
                     verify_feedback,
                     exported_vars,
                     checkpoint,
+                    None,
                 )
                 .await
             }
@@ -1145,6 +1260,10 @@ impl PipelineRunner {
     ///
     /// Shared between the sequential path (`execute_and_process_stage`) and
     /// the parallel DAG path (`run_dag`).
+    ///
+    /// When `pre_artifacts` is `Some`, those artifacts are used directly instead
+    /// of running `git_diff()`. This is used by the worktree-based parallel path
+    /// where artifacts were already collected from the isolated worktree.
     #[allow(clippy::too_many_arguments)]
     async fn post_process_stage(
         &self,
@@ -1158,16 +1277,21 @@ impl PipelineRunner {
         verify_feedback: &mut HashMap<String, String>,
         exported_vars: &mut HashMap<String, String>,
         checkpoint: &mut crate::checkpoint::Checkpoint,
+        pre_artifacts: Option<crate::artifact::ArtifactSet>,
     ) -> CoreResult<()> {
         let stage_config = &self.config.stages[stage_idx];
 
-        // Detect file changes via git
-        let ws_root = self.workspace.root().to_path_buf();
-        let artifacts = tokio::task::spawn_blocking(move || {
-            Workspace::new(ws_root).git_diff()
-        })
-        .await
-        .unwrap_or_default();
+        // Detect file changes via git (or use pre-collected artifacts from worktree)
+        let artifacts = if let Some(artifacts) = pre_artifacts {
+            artifacts
+        } else {
+            let ws_root = self.workspace.root().to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                Workspace::new(ws_root).git_diff()
+            })
+            .await
+            .unwrap_or_default()
+        };
 
         self.emit(PipelineEvent::StageCompleted {
             stage_index: stage_idx,

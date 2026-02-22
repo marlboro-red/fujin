@@ -517,6 +517,67 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
     result
 }
 
+/// Validate include directives before resolution.
+///
+/// Checks structural issues that should be caught before attempting to
+/// load and resolve included files.
+pub fn validate_includes(config: &PipelineConfig) -> ValidationResult {
+    let mut result = ValidationResult::default();
+
+    if config.includes.is_empty() {
+        return result;
+    }
+
+    let stage_ids: HashSet<&str> = config.stages.iter().map(|s| s.id.as_str()).collect();
+    let mut seen_aliases = HashSet::new();
+
+    for (i, include) in config.includes.iter().enumerate() {
+        let prefix = format!("Include {} ('{}')", i, include.source);
+
+        // source must not be empty
+        if include.source.trim().is_empty() {
+            result.errors.push(format!("{prefix}: source must not be empty"));
+        }
+
+        // alias must not be empty
+        if include.alias.trim().is_empty() {
+            result.errors.push(format!("{prefix}: 'as' alias must not be empty"));
+        }
+
+        // alias must be a valid identifier (alphanumeric + underscore, no dots)
+        if !include.alias.is_empty()
+            && !include
+                .alias
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        {
+            result.errors.push(format!(
+                "{prefix}: alias '{}' must contain only alphanumeric characters, underscores, or hyphens",
+                include.alias
+            ));
+        }
+
+        // No duplicate aliases
+        if !include.alias.is_empty() && !seen_aliases.insert(&include.alias) {
+            result.errors.push(format!(
+                "{prefix}: duplicate alias '{}'",
+                include.alias
+            ));
+        }
+
+        // depends_on entries must reference stage IDs defined in the parent's stages
+        for dep in &include.depends_on {
+            if !stage_ids.contains(dep.as_str()) {
+                result.errors.push(format!(
+                    "{prefix}: depends_on references undefined parent stage '{dep}'"
+                ));
+            }
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

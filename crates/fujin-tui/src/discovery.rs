@@ -1,4 +1,4 @@
-use fujin_config::PipelineConfig;
+use fujin_config::{resolve_includes, PipelineConfig};
 use std::path::{Path, PathBuf};
 
 /// A discovered pipeline with its source path and parsed config.
@@ -76,6 +76,19 @@ fn scan_directory(
 
         let config = match PipelineConfig::from_yaml(&raw_yaml) {
             Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Resolve includes (flatten included pipelines)
+        let base_dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let config = match resolve_includes(config, base_dir) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Re-serialize to capture resolved stages
+        let raw_yaml = match serde_yml::to_string(&config) {
+            Ok(y) => y,
             Err(_) => continue,
         };
 

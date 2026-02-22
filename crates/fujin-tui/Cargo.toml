@@ -10,3 +10,4 @@ tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 anyhow = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+serde_yml = { workspace = true }

@@ -72,6 +72,8 @@ pub struct StageInfo {
     pub retry_group: Option<String>,
     /// Branch selection info (if this stage ran a branch classifier).
     pub branch_info: Option<(String, Vec<String>)>,
+    /// Whether the stage is running in an isolated git worktree.
+    pub isolated: bool,
 }
 
 /// State for the pipeline execution screen.
@@ -155,6 +157,7 @@ impl ExecutionState {
                 verifying: false,
                 retry_group,
                 branch_info: None,
+                isolated: false,
             })
             .collect();
         Self {
@@ -262,6 +265,7 @@ impl ExecutionState {
                 runtime,
                 allowed_tools,
                 retry_group,
+                isolated,
             } => {
                 // Ensure stages vec is large enough
                 while self.stages.len() <= stage_index {
@@ -278,6 +282,7 @@ impl ExecutionState {
                         verifying: false,
                         retry_group: None,
                         branch_info: None,
+                        isolated: false,
                     });
                 }
                 let stage = &mut self.stages[stage_index];
@@ -287,6 +292,7 @@ impl ExecutionState {
                 stage.allowed_tools = allowed_tools;
                 stage.model = model.clone();
                 stage.retry_group = retry_group;
+                stage.isolated = isolated;
                 // Immediately transition to Running so the TUI shows progress
                 stage.status = StageStatus::Running {
                     elapsed: Duration::ZERO,
@@ -1274,6 +1280,12 @@ impl ExecutionState {
                     Style::default().fg(theme::TEXT_MUTED),
                 ));
             }
+            if stage.isolated {
+                header_spans.push(Span::styled(
+                    "  [isolated]",
+                    Style::default().fg(theme::TEXT_MUTED),
+                ));
+            }
             vec![Line::from(header_spans)]
         };
 
@@ -1875,6 +1887,7 @@ mod tests {
             runtime: "claude-code".into(),
             allowed_tools: vec![],
             retry_group: None,
+            isolated: false,
         });
 
         assert_eq!(state.stages.len(), 3); // pre-populated by new_state()
@@ -1894,6 +1907,7 @@ mod tests {
             runtime: "claude-code".into(),
             allowed_tools: vec![],
             retry_group: None,
+            isolated: false,
         });
         state.stages[0].status = StageStatus::Running {
             elapsed: Duration::ZERO,
@@ -1928,6 +1942,7 @@ mod tests {
             runtime: "claude-code".into(),
             allowed_tools: vec![],
             retry_group: None,
+            isolated: false,
         });
 
         state.handle_pipeline_event(PipelineEvent::StageFailed {
@@ -1966,6 +1981,7 @@ mod tests {
             runtime: "claude-code".into(),
             allowed_tools: vec![],
             retry_group: None,
+            isolated: false,
         });
 
         state.handle_pipeline_event(PipelineEvent::PipelineCancelled { stage_index: 1 });
@@ -1985,6 +2001,7 @@ mod tests {
             runtime: "claude-code".into(),
             allowed_tools: vec![],
             retry_group: None,
+            isolated: false,
         });
         state.handle_pipeline_event(PipelineEvent::AgentRunning {
             stage_index: 0,
@@ -2019,6 +2036,7 @@ mod tests {
             runtime: "claude-code".into(),
             allowed_tools: vec![],
             retry_group: None,
+            isolated: false,
         });
         state.handle_pipeline_event(PipelineEvent::AgentRunning {
             stage_index: 0,
@@ -2092,6 +2110,7 @@ mod tests {
             runtime: "claude-code".into(),
             allowed_tools: vec![],
             retry_group: None,
+            isolated: false,
         });
     }
 
@@ -2315,6 +2334,7 @@ mod tests {
             runtime: "copilot-cli".into(),
             allowed_tools: vec!["read".into(), "write".into()],
             retry_group: None,
+            isolated: false,
         });
         assert_eq!(state.stages[0].runtime, "copilot-cli");
         assert_eq!(state.stages[0].allowed_tools, vec!["read", "write"]);

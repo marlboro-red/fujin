@@ -36,6 +36,8 @@ pub enum PipelineEvent {
         /// Allowed tools for this stage.
         allowed_tools: Vec<String>,
         retry_group: Option<String>,
+        /// Whether the stage is running in an isolated git worktree.
+        isolated: bool,
     },
 
     /// Context is being built for a stage (summarization, template rendering).

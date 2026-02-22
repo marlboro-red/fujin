@@ -4,7 +4,7 @@ use console::style;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
-use fujin_config::{PipelineConfig, validate, KNOWN_RUNTIMES};
+use fujin_config::{PipelineConfig, resolve_includes, validate, validate_includes, KNOWN_RUNTIMES};
 use fujin_core::{
     CheckpointManager, PipelineRunner, RunOptions,
     create_runtime, paths,
@@ -248,6 +248,7 @@ fn spawn_cli_display(mut rx: mpsc::UnboundedReceiver<PipelineEvent>) {
                     model,
                     runtime,
                     allowed_tools,
+                    isolated,
                     ..
                 } => {
                     // Clear any existing spinner
@@ -276,6 +277,13 @@ fn spawn_cli_display(mut rx: mpsc::UnboundedReceiver<PipelineEvent>) {
                             "  {} tools: {}",
                             style("⚙").dim(),
                             style(allowed_tools.join(", ")).dim()
+                        );
+                    }
+                    if isolated {
+                        println!(
+                            "  {} {}",
+                            style("⚙").dim(),
+                            style("isolated workspace").dim()
                         );
                     }
                 }
@@ -621,6 +629,25 @@ async fn cmd_run(
     let mut config = PipelineConfig::from_yaml(&config_yaml)
         .with_context(|| "Failed to parse pipeline config")?;
 
+    // Validate includes before resolution
+    let include_validation = validate_includes(&config);
+    if !include_validation.is_valid() {
+        eprintln!("{} Include validation failed:", style("✗").red().bold());
+        for err in &include_validation.errors {
+            eprintln!("  {} {err}", style("•").red());
+        }
+        anyhow::bail!("Invalid include directives");
+    }
+
+    // Resolve includes (flatten included pipelines into this config)
+    let base_dir = config_path.parent().unwrap_or(Path::new("."));
+    config = resolve_includes(config, base_dir)
+        .with_context(|| "Failed to resolve includes")?;
+
+    // Re-serialize for checkpoint hashing (now includes resolved stages)
+    let config_yaml = serde_yml::to_string(&config)
+        .with_context(|| "Failed to re-serialize resolved config")?;
+
     // Apply variable overrides
     let overrides: HashMap<String, String> = vars.into_iter().collect();
     config.apply_overrides(&overrides);
@@ -710,8 +737,22 @@ fn cmd_validate(config_path: PathBuf) -> Result<()> {
     let config_yaml = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config: {}", config_path.display()))?;
 
-    let config = PipelineConfig::from_yaml(&config_yaml)
+    let mut config = PipelineConfig::from_yaml(&config_yaml)
         .with_context(|| "Failed to parse pipeline config")?;
+
+    // Validate and resolve includes
+    let include_validation = validate_includes(&config);
+    if !include_validation.is_valid() {
+        eprintln!("{} Include validation failed:", style("✗").red().bold());
+        for err in &include_validation.errors {
+            eprintln!("  {} {err}", style("•").red());
+        }
+        anyhow::bail!("Invalid include directives");
+    }
+
+    let base_dir = config_path.parent().unwrap_or(Path::new("."));
+    config = resolve_includes(config, base_dir)
+        .with_context(|| "Failed to resolve includes")?;
 
     let validation = validate(&config);
 
