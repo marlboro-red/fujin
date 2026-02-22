@@ -1,6 +1,6 @@
 # fujin
 
-A Rust CLI tool that orchestrates multi-stage AI agent pipelines. Define stages in YAML, and `fujin` executes them sequentially — each stage gets a fresh agent context, operates directly on the current directory, and passes summarized results to the next stage.
+A Rust CLI tool that orchestrates multi-stage AI agent pipelines. Define stages in YAML, and `fujin` executes them — passing context between stages, tracking file changes via git, and running independent stages in parallel when dependencies allow.
 
 Fujin supports multiple agent runtimes:
 - **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** — the default runtime, with structured JSON output and streaming progress
@@ -14,13 +14,12 @@ You can choose a runtime per-pipeline or per-stage, and mix runtimes in the same
 cd /path/to/your/project
 fujin run -c pipeline.yaml
 
-For each stage:
+For each stage (respecting dependency order, parallel when possible):
   1. Build context: summarize prior stage output + collect file diffs
   2. Spawn agent subprocess with stage config
   3. Agent executes — reads/writes files in the current directory
   4. Detect changes via git status → track artifacts
   5. Save checkpoint (JSON)
-  6. Next stage
 ```
 
 Agents handle all file I/O, bash execution, and tool use natively. The pipeline doesn't parse code blocks or manage file writes — it uses `git status` to track what changed. Models always run in the directory where `fujin` was invoked.
@@ -90,6 +89,48 @@ stages:
       - "bash"
 ```
 
+A multi-stage pipeline passes context between stages automatically:
+
+```yaml
+name: "Code and Docs"
+
+variables:
+  language: "rust"
+  description: "A REST API for todo management"
+
+summarizer:
+  model: "claude-haiku-4-5-20251001"
+  max_tokens: 1024
+
+stages:
+  - id: "architecture"
+    name: "Design Architecture"
+    system_prompt: |
+      You are a senior software architect.
+    user_prompt: |
+      Design the architecture for: {{description}}
+
+  - id: "codegen"
+    name: "Generate Code"
+    system_prompt: |
+      You are an expert {{language}} developer.
+    user_prompt: |
+      Previous stage summary: {{prior_summary}}
+      Implement the project based on the architecture doc.
+    allowed_tools: ["write", "read", "bash"]
+
+  - id: "docs"
+    name: "Write Documentation"
+    system_prompt: |
+      You are a technical writer.
+    user_prompt: |
+      Previous stage summary: {{prior_summary}}
+      Files from previous stages: {{artifact_list}}
+      Review all code and write comprehensive docs.
+```
+
+## Features
+
 ### Agent Runtimes
 
 By default, pipelines use Claude Code. Set the `runtime` field to choose a different agent runtime:
@@ -138,46 +179,6 @@ stages:
 Available runtimes: `claude-code` (default), `copilot-cli`.
 
 > **Note:** Model names differ between runtimes. Claude Code uses names like `claude-sonnet-4-6` while Copilot CLI uses `claude-sonnet-4`, `claude-haiku-4.5`, or `gpt-5`. Use the model names appropriate for the stage's runtime.
-
-A multi-stage pipeline passes context between stages automatically:
-
-```yaml
-name: "Code and Docs"
-
-variables:
-  language: "rust"
-  description: "A REST API for todo management"
-
-summarizer:
-  model: "claude-haiku-4-5-20251001"
-  max_tokens: 1024
-
-stages:
-  - id: "architecture"
-    name: "Design Architecture"
-    system_prompt: |
-      You are a senior software architect.
-    user_prompt: |
-      Design the architecture for: {{description}}
-
-  - id: "codegen"
-    name: "Generate Code"
-    system_prompt: |
-      You are an expert {{language}} developer.
-    user_prompt: |
-      Previous stage summary: {{prior_summary}}
-      Implement the project based on the architecture doc.
-    allowed_tools: ["write", "read", "bash"]
-
-  - id: "docs"
-    name: "Write Documentation"
-    system_prompt: |
-      You are a technical writer.
-    user_prompt: |
-      Previous stage summary: {{prior_summary}}
-      Files from previous stages: {{artifact_list}}
-      Review all code and write comprehensive docs.
-```
 
 ### Command Stages
 
@@ -232,9 +233,52 @@ stages:
 
 When a stage has `commands`, the agent-specific fields (`system_prompt`, `user_prompt`, `model`, `allowed_tools`) are ignored. Only `id`, `name`, `timeout_secs`, and `commands` apply.
 
+### Parallel Stages
+
+By default, stages execute sequentially — each stage implicitly depends on the previous one. The `depends_on` field lets you declare explicit dependencies so that independent stages can run in parallel:
+
+```yaml
+stages:
+  - id: analyze
+    name: Analyze
+    system_prompt: "You are a senior architect."
+    user_prompt: "Read SPEC.md and create a plan."
+    allowed_tools: ["read", "write"]
+
+  - id: frontend
+    name: Build Frontend
+    depends_on: [analyze]
+    system_prompt: "You are a frontend developer."
+    user_prompt: "Plan: {{stages.analyze.summary}}. Build the UI."
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: backend
+    name: Build Backend
+    depends_on: [analyze]
+    system_prompt: "You are a backend developer."
+    user_prompt: "Plan: {{stages.analyze.summary}}. Build the API."
+    allowed_tools: ["read", "write", "bash"]
+
+  - id: integrate
+    name: Integration Tests
+    depends_on: [frontend, backend]
+    commands:
+      - "npm test 2>&1"
+```
+
+This creates a diamond dependency graph — `frontend` and `backend` run in parallel after `analyze` completes, and `integrate` waits for both.
+
+| Config | Behavior |
+|--------|----------|
+| `depends_on` absent | Implicitly depends on the previous stage (sequential) |
+| `depends_on: [a, b]` | Waits for all listed stages to complete |
+| `depends_on: []` | No dependencies — starts immediately |
+
+Existing pipelines without `depends_on` work exactly as before. See the **[Parallel Stages Guide](docs/guides/parallel-stages.md)** for fan-out/fan-in topologies, context passing in DAG pipelines, and interaction with retry groups and branching.
+
 ### Conditional Execution
 
-Stages normally execute sequentially. With **conditional execution**, stages can be skipped based on prior results — enabling branching workflows without breaking the linear execution model.
+Stages can be skipped based on prior results — enabling branching workflows.
 
 #### `when` — regex gating
 
@@ -317,20 +361,25 @@ After the `analyze` stage completes, the runner reads the exports file and makes
 
 Export files are stored in the platform data directory (not the workspace), so they don't pollute the repository.
 
+### Checkpointing and Resume
+
+After each stage completes, `fujin` saves a checkpoint to `.fujin/checkpoints/` in the current directory. If a stage fails or is interrupted:
+
+```bash
+# Resume from where it left off
+fujin run -c pipeline.yaml --resume
+```
+
+Resume validates that the pipeline config hasn't changed since the checkpoint was created. If you've modified the config, clean the checkpoints and start fresh:
+
+```bash
+fujin checkpoint clean
+fujin run -c pipeline.yaml
+```
+
+## Config Reference
+
 See the [Pipeline Authoring Guide](docs/pipeline-authoring.md) for the full field reference.
-
-### Guides
-
-- **[Getting Started](docs/guides/getting-started.md)** — Create your first pipeline from scratch
-- **[Multi-Stage Pipelines](docs/guides/multi-stage-pipelines.md)** — Context passing, model selection, and stage composition
-- **[Branching and Conditions](docs/guides/branching-and-conditions.md)** — Conditional execution with `when` and `branch`/`on_branch`
-- **[Exports and Dynamic Variables](docs/guides/exports-and-dynamic-variables.md)** — Let agents set variables at runtime
-- **[Retry Groups](docs/guides/retry-groups.md)** — Automatic retry-on-failure with verification agents
-- **[Pipeline Patterns](docs/guides/pipeline-patterns.md)** — Ready-to-use recipes for common workflows
-
-Run `fujin init --list` to see all available templates, or `fujin setup` to install them locally where you can customize them.
-
-### Config Reference
 
 **Top-level fields:**
 
@@ -341,7 +390,7 @@ Run `fujin init --list` to see all available templates, or `fujin setup` to inst
 | `runtime` | string | `"claude-code"` | Default agent runtime (`claude-code` or `copilot-cli`) |
 | `variables` | map | `{}` | Template variables for prompts |
 | `summarizer` | object | see below | Inter-stage summarizer settings |
-| `retry_groups` | map | `{}` | Retry group definitions (see [Pipeline Authoring Guide](docs/pipeline-authoring.md)) |
+| `retry_groups` | map | `{}` | Retry group definitions (see [Retry Groups](docs/guides/retry-groups.md)) |
 | `stages` | list | *required* | Pipeline stages (at least 1) |
 
 **Summarizer fields:**
@@ -359,6 +408,7 @@ Run `fujin init --list` to see all available templates, or `fujin setup` to inst
 | `name` | string | *required* | Human-readable name |
 | `timeout_secs` | integer | — | Stage timeout in seconds (no limit if unset) |
 | `commands` | list | — | Shell commands to run (makes this a command stage) |
+| `depends_on` | list | — | Explicit dependencies (see [Parallel Stages](#parallel-stages)). Absent = depends on previous stage; `[]` = no dependencies |
 
 **Agent stage fields** (ignored when `commands` is set):
 
@@ -390,7 +440,7 @@ Prompts and commands use [Handlebars](https://handlebarsjs.com/) syntax. Availab
 | Variable | Description |
 |----------|-------------|
 | `{{<key>}}` | Any key defined in `variables` |
-| `{{prior_summary}}` | Summary of the previous stage's output |
+| `{{prior_summary}}` | Summary of the previous stage's output (or combined parent summaries in DAG pipelines) |
 | `{{artifact_list}}` | Newline-separated list of files changed by prior stages |
 | `{{all_artifacts}}` | Changed file paths with their full content |
 | `{{stages.<id>.summary}}` | Summary of a specific completed stage (by stage ID) |
@@ -481,21 +531,17 @@ fujin checkpoint clean               # Remove all checkpoints
 
 Checkpoint commands operate on `.fujin/checkpoints/` in the current directory.
 
-## Checkpointing and Resume
+## Guides
 
-After each stage completes, `fujin` saves a checkpoint to `.fujin/checkpoints/` in the current directory. If a stage fails or is interrupted:
+- **[Getting Started](docs/guides/getting-started.md)** — Create your first pipeline from scratch
+- **[Multi-Stage Pipelines](docs/guides/multi-stage-pipelines.md)** — Context passing, model selection, and stage composition
+- **[Parallel Stages](docs/guides/parallel-stages.md)** — Run independent stages concurrently with `depends_on`
+- **[Branching and Conditions](docs/guides/branching-and-conditions.md)** — Conditional execution with `when` and `branch`/`on_branch`
+- **[Exports and Dynamic Variables](docs/guides/exports-and-dynamic-variables.md)** — Let agents set variables at runtime
+- **[Retry Groups](docs/guides/retry-groups.md)** — Automatic retry-on-failure with verification agents
+- **[Pipeline Patterns](docs/guides/pipeline-patterns.md)** — Ready-to-use recipes for common workflows
 
-```bash
-# Resume from where it left off
-fujin run -c pipeline.yaml --resume
-```
-
-Resume validates that the pipeline config hasn't changed since the checkpoint was created. If you've modified the config, clean the checkpoints and start fresh:
-
-```bash
-fujin checkpoint clean
-fujin run -c pipeline.yaml
-```
+Run `fujin init --list` to see all available templates, or `fujin setup` to install them locally where you can customize them.
 
 ## Project Structure
 
@@ -506,23 +552,33 @@ fujin/
 │   ├── fujin-cli/                # Binary (fujin) — CLI entry point
 │   │   ├── configs/              # Built-in templates (compiled into binary)
 │   │   └── src/
-│   │       ├── main.rs           # CLI entry point
-│   │       └── paths.rs          # Platform data directory helpers
+│   │       └── main.rs           # CLI entry point
 │   ├── fujin-core/               # Library — pipeline engine
 │   │   └── src/
-│   │       ├── pipeline.rs       # Pipeline execution loop
+│   │       ├── pipeline.rs       # Pipeline execution loop (sequential + DAG)
+│   │       ├── dag.rs            # DAG construction and parallel scheduling
 │   │       ├── stage.rs          # Stage result types
 │   │       ├── agent.rs          # AgentRuntime trait + ClaudeCodeRuntime
-│   │       ├── copilot.rs       # CopilotCliRuntime (GitHub Copilot CLI)
+│   │       ├── copilot.rs        # CopilotCliRuntime (GitHub Copilot CLI)
 │   │       ├── artifact.rs       # File change tracking
 │   │       ├── workspace.rs      # Filesystem snapshot/diff
 │   │       ├── checkpoint.rs     # Checkpoint save/load/resume
 │   │       ├── context.rs        # Context building + summarization
+│   │       ├── event.rs          # Pipeline event types
+│   │       ├── paths.rs          # Platform data directory helpers
+│   │       ├── util.rs           # Shared utilities
 │   │       └── error.rs          # Error types
-│   └── fujin-config/             # Library — YAML config parsing & validation
+│   ├── fujin-config/             # Library — YAML config parsing & validation
+│   │   └── src/
+│   │       ├── pipeline_config.rs
+│   │       └── validation.rs
+│   └── fujin-tui/                # Library — terminal UI for interactive mode
 │       └── src/
-│           ├── pipeline_config.rs
-│           └── validation.rs
+│           ├── app.rs            # Application state + event loop
+│           ├── discovery.rs      # Pipeline file discovery
+│           ├── screens/          # Browser, variables, execution screens
+│           ├── widgets/          # Reusable UI components
+│           └── theme.rs          # Colors and styling
 ```
 
 ## Development
