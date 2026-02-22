@@ -37,6 +37,8 @@ impl Dag {
             dependents.entry(stage.id.clone()).or_default();
         }
 
+        let known_ids: HashSet<&str> = config.stages.iter().map(|s| s.id.as_str()).collect();
+
         for (i, stage) in config.stages.iter().enumerate() {
             let deps: Vec<String> = match &stage.depends_on {
                 Some(deps) => deps.clone(),
@@ -51,6 +53,11 @@ impl Dag {
             };
 
             for dep in deps {
+                // Skip unknown dependency references (validation catches these;
+                // silently inserting them would cause the pipeline to hang).
+                if !known_ids.contains(dep.as_str()) {
+                    continue;
+                }
                 dependencies.get_mut(&stage.id).unwrap().insert(dep.clone());
                 dependents.entry(dep).or_default().insert(stage.id.clone());
             }
@@ -161,11 +168,21 @@ impl Dag {
         }
     }
 
-    /// Check if the DAG is linear (every stage has at most one parent and one child).
+    /// Check if the DAG is linear (a single chain where every stage has at most
+    /// one parent and one child, and there is at most one root node).
     ///
     /// A linear DAG is equivalent to the original sequential execution order.
+    /// Disconnected graphs (multiple roots) are not linear — they benefit from
+    /// parallel execution via the DAG scheduler.
     pub fn is_linear(&self) -> bool {
+        let mut root_count = 0;
         for id in &self.stage_ids {
+            if self.dependencies[id].is_empty() {
+                root_count += 1;
+                if root_count > 1 {
+                    return false;
+                }
+            }
             if self.dependencies[id].len() > 1 {
                 return false;
             }

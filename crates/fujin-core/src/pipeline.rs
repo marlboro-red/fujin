@@ -1,6 +1,6 @@
 use crate::agent::AgentRuntime;
 use crate::checkpoint::CheckpointManager;
-use crate::context::ContextBuilder;
+use crate::context::{ContextBuilder, StageContext};
 use crate::create_runtime;
 use crate::dag::Dag;
 use crate::error::{CoreError, CoreResult};
@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use fujin_config::{PipelineConfig, StageConfig};
@@ -37,15 +37,41 @@ pub struct PipelineRunner {
     config: PipelineConfig,
     config_yaml: String,
     /// Default runtime for the pipeline (from config `runtime` field).
-    runtime: Box<dyn AgentRuntime>,
+    runtime: Arc<dyn AgentRuntime>,
     /// Additional runtimes for per-stage overrides, keyed by runtime name.
     /// Pre-built during construction for all unique stage runtime overrides.
-    extra_runtimes: HashMap<String, Box<dyn AgentRuntime>>,
+    extra_runtimes: HashMap<String, Arc<dyn AgentRuntime>>,
     context_builder: ContextBuilder,
     workspace: Workspace,
     checkpoint_manager: CheckpointManager,
     event_tx: mpsc::UnboundedSender<PipelineEvent>,
     cancel_flag: Option<Arc<AtomicBool>>,
+}
+
+/// Input data for a spawned stage execution task.
+/// Contains all owned data needed to execute a stage in a separate tokio task.
+struct StageExecutionInput {
+    stage_idx: usize,
+    stage_id: String,
+    stage_config: StageConfig,
+    runtime: Arc<dyn AgentRuntime>,
+    context: StageContext,
+    workspace_root: PathBuf,
+    event_tx: mpsc::UnboundedSender<PipelineEvent>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    /// Pipeline variables merged with currently exported variables.
+    /// Used by command stages for template rendering.
+    exported_vars: HashMap<String, String>,
+    stage_start: Instant,
+}
+
+/// Output from a completed spawned stage execution task.
+struct StageExecutionOutput {
+    stage_idx: usize,
+    stage_id: String,
+    response_text: String,
+    token_usage: Option<crate::stage::TokenUsage>,
+    duration: Duration,
 }
 
 impl PipelineRunner {
@@ -65,23 +91,23 @@ impl PipelineRunner {
         let workspace = Workspace::new(workspace_root.clone());
         let checkpoint_manager = CheckpointManager::new(&workspace_root);
         let default_runtime_name = config.runtime.clone();
-        let runtime = create_runtime(&default_runtime_name).unwrap_or_else(|e| {
+        let runtime: Arc<dyn AgentRuntime> = Arc::from(create_runtime(&default_runtime_name).unwrap_or_else(|e| {
             warn!(
                 runtime = %default_runtime_name,
                 error = %e,
                 "Unknown pipeline runtime, falling back to claude-code"
             );
             create_runtime("claude-code").unwrap()
-        });
+        }));
 
         // Pre-build any extra runtimes needed for per-stage overrides
-        let mut extra_runtimes: HashMap<String, Box<dyn AgentRuntime>> = HashMap::new();
+        let mut extra_runtimes: HashMap<String, Arc<dyn AgentRuntime>> = HashMap::new();
         for stage in &config.stages {
             if let Some(ref rt_name) = stage.runtime {
                 if rt_name != &default_runtime_name && !extra_runtimes.contains_key(rt_name) {
                     match create_runtime(rt_name) {
                         Ok(rt) => {
-                            extra_runtimes.insert(rt_name.clone(), rt);
+                            extra_runtimes.insert(rt_name.clone(), Arc::from(rt));
                         }
                         Err(e) => {
                             warn!(
@@ -113,7 +139,7 @@ impl PipelineRunner {
 
     /// Override the default agent runtime (for testing or alternative runtimes).
     pub fn with_runtime(mut self, runtime: Box<dyn AgentRuntime>) -> Self {
-        self.runtime = runtime;
+        self.runtime = Arc::from(runtime);
         self
     }
 
@@ -121,13 +147,13 @@ impl PipelineRunner {
     ///
     /// If the stage has a `runtime` override that differs from the default,
     /// returns the pre-built override runtime. Otherwise returns the default.
-    fn runtime_for_stage(&self, stage_config: &StageConfig) -> &dyn AgentRuntime {
+    fn runtime_for_stage(&self, stage_config: &StageConfig) -> Arc<dyn AgentRuntime> {
         if let Some(ref runtime_name) = stage_config.runtime {
             if let Some(rt) = self.extra_runtimes.get(runtime_name) {
-                return rt.as_ref();
+                return Arc::clone(rt);
             }
         }
-        self.runtime.as_ref()
+        Arc::clone(&self.runtime)
     }
 
     /// Set a cancellation flag for cooperative cancellation.
@@ -611,11 +637,17 @@ impl PipelineRunner {
         Ok(())
     }
 
-    /// Execute stages using DAG-based scheduling for parallel execution.
+    /// Execute stages using DAG-based scheduling with true parallel execution.
     ///
-    /// Independent stages (whose dependencies are satisfied) run concurrently.
-    /// Stages within the same retry group are executed sequentially within
-    /// their group, but the group can run in parallel with other stages.
+    /// Independent stages (whose dependencies are satisfied) run concurrently
+    /// via `tokio::task::JoinSet`. Stages within the same retry group are
+    /// executed sequentially within their group, but groups can run in parallel
+    /// with other stages.
+    ///
+    /// Lifecycle per stage:
+    /// 1. **Prepare** (sequential, main task): skip checks, context building, emit StageStarted
+    /// 2. **Execute** (parallel, spawned tasks): agent/command execution via JoinSet
+    /// 3. **Post-process** (sequential, main task): git diff, events, exports, checkpoint
     #[allow(clippy::too_many_arguments)]
     async fn run_dag(
         &self,
@@ -634,10 +666,15 @@ impl PipelineRunner {
         // to ensure they run sequentially within the group.
         let mut retry_group_in_flight: HashSet<String> = HashSet::new();
 
+        let mut join_set: tokio::task::JoinSet<
+            Result<StageExecutionOutput, (usize, String, CoreError)>,
+        > = tokio::task::JoinSet::new();
+
         loop {
             // Check for cancellation
             if let Some(ref flag) = self.cancel_flag {
                 if flag.load(Ordering::Relaxed) {
+                    join_set.abort_all();
                     let stage_id = in_flight
                         .iter()
                         .next()
@@ -653,7 +690,7 @@ impl PipelineRunner {
             // Find stages ready to run
             let ready = dag.ready_stages(&completed, &skipped, &in_flight);
 
-            if ready.is_empty() && in_flight.is_empty() {
+            if ready.is_empty() && join_set.is_empty() {
                 break; // All stages done
             }
 
@@ -673,7 +710,6 @@ impl PipelineRunner {
 
                 // Check skip conditions (on_branch, when)
                 if self.should_skip_stage(stage_idx, stage_config, checkpoint) {
-                    // Emit skip event and record
                     let reason = self.get_skip_reason(stage_idx, stage_config, checkpoint);
                     self.emit(PipelineEvent::StageSkipped {
                         stage_index: stage_idx,
@@ -689,93 +725,270 @@ impl PipelineRunner {
                     if let Some(ref group) = stage_config.retry_group {
                         retry_group_in_flight.remove(group.as_str());
 
-                        // Check if this was the last stage in the group for verify
-                        if let Some(jump_idx) = self.maybe_run_group_verify(
-                            stage_idx, true, retry_group_ranges,
-                            verify_feedback, retry_counts, checkpoint,
-                        ).await? {
-                            // Retry: clear completed stages for the group
-                            let first_id = &self.config.stages[jump_idx].id;
-                            // Remove completed stages that are in this retry group
-                            if let Some(&(first, last)) = retry_group_ranges.get(stage_config.retry_group.as_ref().unwrap().as_str()) {
+                        if let Some(_jump_idx) = self
+                            .maybe_run_group_verify(
+                                stage_idx,
+                                true,
+                                retry_group_ranges,
+                                verify_feedback,
+                                retry_counts,
+                                checkpoint,
+                            )
+                            .await?
+                        {
+                            if let Some(&(first, last)) = retry_group_ranges
+                                .get(stage_config.retry_group.as_ref().unwrap().as_str())
+                            {
                                 for idx in first..=last {
                                     let id = &self.config.stages[idx].id;
                                     completed.remove(id);
                                     skipped.remove(id);
                                 }
                             }
-                            let _ = first_id; // used above indirectly
                         }
                     }
                     continue;
                 }
 
+                // === PREPARE PHASE (sequential) ===
+
+                let stage_start = Instant::now();
+                let stage_runtime = self.runtime_for_stage(stage_config);
+
+                self.emit(PipelineEvent::StageStarted {
+                    stage_index: stage_idx,
+                    stage_id: stage_id.clone(),
+                    stage_name: stage_config.name.clone(),
+                    model: if stage_config.is_command_stage() {
+                        "commands".to_string()
+                    } else {
+                        stage_config.model.clone()
+                    },
+                    runtime: stage_runtime.name().to_string(),
+                    allowed_tools: stage_config.allowed_tools.clone(),
+                    retry_group: stage_config.retry_group.clone(),
+                });
+
+                // Set up exports file path
+                if stage_config.exports.is_some() {
+                    let export_path = exports_dir(self.workspace.root())
+                        .join(&checkpoint.run_id)
+                        .join(format!("{}.json", stage_config.id));
+                    if let Some(parent) = export_path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            CoreError::WorkspaceError {
+                                path: parent.to_path_buf(),
+                                message: format!(
+                                    "Failed to create exports directory: {e}"
+                                ),
+                            }
+                        })?;
+                    }
+                    exported_vars.insert(
+                        "exports_file".to_string(),
+                        export_path.display().to_string(),
+                    );
+                }
+
+                // Build context for agent stages (sequential — needs checkpoint data)
+                let context = if stage_config.is_command_stage() {
+                    StageContext {
+                        rendered_prompt: String::new(),
+                        prior_summary: None,
+                        changed_files: Vec::new(),
+                        verify_feedback: None,
+                    }
+                } else {
+                    self.emit(PipelineEvent::ContextBuilding {
+                        stage_index: stage_idx,
+                    });
+
+                    let parent_ids = dag.parents(&stage_config.id);
+                    let prior_results: Vec<&crate::stage::StageResult> = checkpoint
+                        .completed_stages
+                        .iter()
+                        .filter(|r| parent_ids.contains(&r.stage_id))
+                        .collect();
+
+                    let feedback = stage_config
+                        .retry_group
+                        .as_ref()
+                        .and_then(|g| verify_feedback.get(g))
+                        .map(|s| s.as_str());
+
+                    let ctx = self
+                        .context_builder
+                        .build(
+                            &self.config,
+                            stage_config,
+                            &prior_results,
+                            &self.workspace,
+                            feedback,
+                            &checkpoint.completed_stages,
+                            exported_vars,
+                        )
+                        .await?;
+
+                    self.emit(PipelineEvent::StageContext {
+                        stage_index: stage_idx,
+                        rendered_prompt: ctx.rendered_prompt.clone(),
+                        prior_summary: ctx.prior_summary.clone(),
+                    });
+
+                    self.emit(PipelineEvent::AgentRunning {
+                        stage_index: stage_idx,
+                        stage_id: stage_config.id.clone(),
+                    });
+
+                    ctx
+                };
+
+                // === EXECUTE PHASE (parallel, spawned) ===
+
+                // Snapshot pipeline variables + exported vars for command template rendering
+                let merged_vars = {
+                    let mut vars = self.config.variables.clone();
+                    for (k, v) in exported_vars.iter() {
+                        vars.insert(k.clone(), v.clone());
+                    }
+                    vars
+                };
+
+                let input = StageExecutionInput {
+                    stage_idx,
+                    stage_id: stage_id.clone(),
+                    stage_config: stage_config.clone(),
+                    runtime: stage_runtime,
+                    context,
+                    workspace_root: self.workspace.root().to_path_buf(),
+                    event_tx: self.event_tx.clone(),
+                    cancel_flag: self.cancel_flag.clone(),
+                    exported_vars: merged_vars,
+                    stage_start,
+                };
+
+                join_set.spawn(execute_stage_task(input));
                 in_flight.insert(stage_id.clone());
             }
 
-            if in_flight.is_empty() {
-                // All remaining stages are blocked by retry group constraints;
-                // this shouldn't happen with valid DAGs, but break to avoid infinite loop.
+            if join_set.is_empty() {
+                // Nothing spawned and nothing in flight — avoid infinite loop
                 break;
             }
 
-            // Execute one in-flight stage at a time (process results sequentially
-            // to maintain checkpoint consistency and handle retry group logic).
-            // For true parallelism, we'd use JoinSet, but stage execution involves
-            // shared mutable state (checkpoint, exported_vars, verify_feedback) that
-            // makes concurrent execution complex. Instead, we get parallelism at the
-            // scheduling level: we pick *which* stages to run based on the DAG, even
-            // though we execute them one at a time in the current implementation.
-            //
-            // For v1: execute ready stages one at a time in DAG order.
-            // This still enables DAG-based scheduling (correct ordering), while
-            // true concurrent execution can be added incrementally.
-            let next_stage_id = in_flight.iter().next().cloned().unwrap();
-            let next_stage_idx = dag.index_of(&next_stage_id).unwrap();
+            // === POST-PROCESS PHASE (sequential, one completed task at a time) ===
 
-            match self.execute_and_process_stage(
-                next_stage_idx,
-                dag,
-                retry_group_ranges,
-                retry_counts,
-                verify_feedback,
-                exported_vars,
-                checkpoint,
-            ).await {
-                Ok(()) => {
-                    in_flight.remove(&next_stage_id);
-                    completed.insert(next_stage_id.clone());
+            let join_result = join_set.join_next().await;
 
-                    // Remove from retry group tracking
-                    let stage_config = &self.config.stages[next_stage_idx];
+            match join_result {
+                Some(Ok(Ok(output))) => {
+                    // Task completed successfully
+                    in_flight.remove(&output.stage_id);
+                    let stage_config = &self.config.stages[output.stage_idx];
                     if let Some(ref group) = stage_config.retry_group {
                         retry_group_in_flight.remove(group.as_str());
                     }
 
-                    // Check if a retry occurred (checkpoint was rolled back)
-                    if checkpoint.next_stage_index <= next_stage_idx {
-                        // Retry group restarted — remove completed stages for the group
-                        let stage_config = &self.config.stages[next_stage_idx];
-                        if let Some(ref group_name) = stage_config.retry_group {
-                            if let Some(&(first, last)) = retry_group_ranges.get(group_name.as_str()) {
-                                for idx in first..=last {
-                                    let id = &self.config.stages[idx].id;
-                                    completed.remove(id);
-                                    skipped.remove(id);
-                                    in_flight.remove(id);
+                    let completed_stage_id = output.stage_id.clone();
+                    let completed_stage_idx = output.stage_idx;
+
+                    match self
+                        .post_process_stage(
+                            output.stage_idx,
+                            &output.stage_id,
+                            output.response_text,
+                            output.token_usage,
+                            output.duration,
+                            retry_group_ranges,
+                            retry_counts,
+                            verify_feedback,
+                            exported_vars,
+                            checkpoint,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            // Check if a retry group restart occurred
+                            if checkpoint.next_stage_index <= completed_stage_idx {
+                                let stage_config =
+                                    &self.config.stages[completed_stage_idx];
+                                if let Some(ref group_name) = stage_config.retry_group {
+                                    if let Some(&(first, last)) =
+                                        retry_group_ranges.get(group_name.as_str())
+                                    {
+                                        for idx in first..=last {
+                                            let id = &self.config.stages[idx].id;
+                                            completed.remove(id);
+                                            skipped.remove(id);
+                                            in_flight.remove(id);
+                                        }
+                                        retry_group_in_flight
+                                            .remove(group_name.as_str());
+                                    }
                                 }
-                                retry_group_in_flight.remove(group_name.as_str());
+                            } else {
+                                completed.insert(completed_stage_id);
                             }
+                        }
+                        Err(e) => {
+                            join_set.abort_all();
+                            return Err(e);
                         }
                     }
                 }
-                Err(e) => {
-                    in_flight.remove(&next_stage_id);
-                    let stage_config = &self.config.stages[next_stage_idx];
+                Some(Ok(Err((stage_idx, stage_id, error)))) => {
+                    // Task completed with an error
+                    in_flight.remove(&stage_id);
+                    let stage_config = &self.config.stages[stage_idx];
                     if let Some(ref group) = stage_config.retry_group {
                         retry_group_in_flight.remove(group.as_str());
                     }
-                    return Err(e);
+
+                    match self
+                        .handle_stage_error(
+                            stage_idx,
+                            &stage_id,
+                            error,
+                            retry_group_ranges,
+                            retry_counts,
+                            verify_feedback,
+                            checkpoint,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            // Retry group restart — clean up tracking
+                            let stage_config = &self.config.stages[stage_idx];
+                            if let Some(ref group_name) = stage_config.retry_group {
+                                if let Some(&(first, last)) =
+                                    retry_group_ranges.get(group_name.as_str())
+                                {
+                                    for idx in first..=last {
+                                        let id = &self.config.stages[idx].id;
+                                        completed.remove(id);
+                                        skipped.remove(id);
+                                        in_flight.remove(id);
+                                    }
+                                    retry_group_in_flight.remove(group_name.as_str());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            join_set.abort_all();
+                            return Err(e);
+                        }
+                    }
+                }
+                Some(Err(join_error)) => {
+                    // Task panicked (JoinError)
+                    join_set.abort_all();
+                    return Err(CoreError::AgentError {
+                        message: format!("Stage task panicked: {}", join_error),
+                    });
+                }
+                None => {
+                    // JoinSet is empty — shouldn't happen since we check above
+                    break;
                 }
             }
         }
@@ -843,8 +1056,8 @@ impl PipelineRunner {
     /// Execute a single stage and process all post-execution logic.
     ///
     /// Handles: execution, artifact detection, branch classification, exports,
-    /// checkpoint updates, and retry group verification. Used by both the
-    /// sequential and DAG execution paths.
+    /// checkpoint updates, and retry group verification. Used by the sequential
+    /// execution path.
     #[allow(clippy::too_many_arguments)]
     async fn execute_and_process_stage(
         &self,
@@ -857,11 +1070,12 @@ impl PipelineRunner {
         checkpoint: &mut crate::checkpoint::Checkpoint,
     ) -> CoreResult<()> {
         let stage_config = &self.config.stages[stage_idx];
+        let stage_id = stage_config.id.clone();
         let stage_runtime = self.runtime_for_stage(stage_config);
 
         self.emit(PipelineEvent::StageStarted {
             stage_index: stage_idx,
-            stage_id: stage_config.id.clone(),
+            stage_id: stage_id.clone(),
             stage_name: stage_config.name.clone(),
             model: if stage_config.is_command_stage() {
                 "commands".to_string()
@@ -876,10 +1090,10 @@ impl PipelineRunner {
         let stage_start = Instant::now();
 
         // Compute the exports file path and inject {{exports_file}} for stages with exports
-        let export_file_path = if stage_config.exports.is_some() {
+        if stage_config.exports.is_some() {
             let export_path = exports_dir(self.workspace.root())
                 .join(&checkpoint.run_id)
-                .join(format!("{}.json", stage_config.id));
+                .join(format!("{}.json", stage_id));
             if let Some(parent) = export_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| CoreError::WorkspaceError {
                     path: parent.to_path_buf(),
@@ -890,10 +1104,7 @@ impl PipelineRunner {
                 "exports_file".to_string(),
                 export_path.display().to_string(),
             );
-            Some(export_path)
-        } else {
-            None
-        };
+        }
 
         // Execute stage (command or agent)
         let stage_exec_result = if stage_config.is_command_stage() {
@@ -918,84 +1129,70 @@ impl PipelineRunner {
             .await
         };
 
-        let (response_text, token_usage) = match stage_exec_result {
-            Ok(output) => output,
-            Err(CoreError::Cancelled { ref stage_id }) => {
-                checkpoint.next_stage_index = stage_idx;
-                checkpoint.updated_at = Utc::now();
-                let _ = self.checkpoint_manager.save(checkpoint);
-                self.emit(PipelineEvent::PipelineCancelled {
-                    stage_index: stage_idx,
-                });
-                return Err(CoreError::Cancelled {
-                    stage_id: stage_id.clone(),
-                });
+        match stage_exec_result {
+            Ok((response_text, token_usage)) => {
+                let duration = stage_start.elapsed();
+                self.post_process_stage(
+                    stage_idx,
+                    &stage_id,
+                    response_text,
+                    token_usage,
+                    duration,
+                    retry_group_ranges,
+                    retry_counts,
+                    verify_feedback,
+                    exported_vars,
+                    checkpoint,
+                )
+                .await
             }
             Err(e) => {
-                // Check if this stage belongs to a retry group
-                if let Some(ref group_name) = stage_config.retry_group {
-                    if let Some(&(first_idx, _last_idx)) = retry_group_ranges.get(group_name.as_str()) {
-                        let group_config = self.config.retry_groups.get(group_name);
-                        let max_retries = group_config.map_or(5, |g| g.max_retries);
-
-                        let error_msg = e.to_string();
-                        verify_feedback.insert(
-                            group_name.clone(),
-                            format!(
-                                "Stage '{}' failed with error:\n{}",
-                                stage_config.id, error_msg
-                            ),
-                        );
-
-                        match self.handle_retry_group_failure(
-                            group_name,
-                            first_idx,
-                            stage_idx,
-                            &stage_config.id,
-                            &error_msg,
-                            max_retries,
-                            retry_counts,
-                            checkpoint,
-                        ).await {
-                            Ok(_jump_idx) => {
-                                // Signal retry by keeping checkpoint.next_stage_index
-                                return Ok(());
-                            }
-                            Err(abort_err) => return Err(abort_err),
-                        }
-                    }
-                }
-
-                // Not in a retry group — fail normally
-                checkpoint.next_stage_index = stage_idx;
-                checkpoint.updated_at = Utc::now();
-                let checkpoint_saved = self.checkpoint_manager.save(checkpoint).is_ok();
-                self.emit(PipelineEvent::StageFailed {
-                    stage_index: stage_idx,
-                    stage_id: stage_config.id.clone(),
-                    error: e.to_string(),
-                    checkpoint_saved,
-                });
-                self.emit(PipelineEvent::PipelineFailed {
-                    error: e.to_string(),
-                });
-                return Err(e);
+                self.handle_stage_error(
+                    stage_idx,
+                    &stage_id,
+                    e,
+                    retry_group_ranges,
+                    retry_counts,
+                    verify_feedback,
+                    checkpoint,
+                )
+                .await
             }
-        };
+        }
+    }
+
+    /// Post-process a completed stage: git diff, events, branch classification,
+    /// exports, checkpoint, and retry group verification.
+    ///
+    /// Shared between the sequential path (`execute_and_process_stage`) and
+    /// the parallel DAG path (`run_dag`).
+    #[allow(clippy::too_many_arguments)]
+    async fn post_process_stage(
+        &self,
+        stage_idx: usize,
+        stage_id: &str,
+        response_text: String,
+        token_usage: Option<crate::stage::TokenUsage>,
+        duration: Duration,
+        retry_group_ranges: &HashMap<&str, (usize, usize)>,
+        retry_counts: &mut HashMap<String, u32>,
+        verify_feedback: &mut HashMap<String, String>,
+        exported_vars: &mut HashMap<String, String>,
+        checkpoint: &mut crate::checkpoint::Checkpoint,
+    ) -> CoreResult<()> {
+        let stage_config = &self.config.stages[stage_idx];
 
         // Detect file changes via git
         let ws_root = self.workspace.root().to_path_buf();
         let artifacts = tokio::task::spawn_blocking(move || {
             Workspace::new(ws_root).git_diff()
         })
-            .await
-            .unwrap_or_default();
-
-        let duration = stage_start.elapsed();
+        .await
+        .unwrap_or_default();
 
         self.emit(PipelineEvent::StageCompleted {
             stage_index: stage_idx,
-            stage_id: stage_config.id.clone(),
+            stage_id: stage_id.to_string(),
             duration,
             artifacts: artifacts.clone(),
             token_usage: token_usage.clone(),
@@ -1005,17 +1202,17 @@ impl PipelineRunner {
         if let Some(ref branch_config) = stage_config.branch {
             self.emit(PipelineEvent::BranchEvaluating {
                 stage_index: stage_idx,
-                stage_id: stage_config.id.clone(),
+                stage_id: stage_id.to_string(),
             });
-            let selected = self.run_branch_classifier(
-                branch_config,
-                &response_text,
-                stage_idx,
-            ).await?;
-            checkpoint.active_branches.insert(stage_config.id.clone(), selected.clone());
+            let selected = self
+                .run_branch_classifier(branch_config, &response_text, stage_idx)
+                .await?;
+            checkpoint
+                .active_branches
+                .insert(stage_id.to_string(), selected.clone());
             self.emit(PipelineEvent::BranchSelected {
                 stage_index: stage_idx,
-                stage_id: stage_config.id.clone(),
+                stage_id: stage_id.to_string(),
                 selected_route: selected,
                 available_routes: branch_config.routes.clone(),
             });
@@ -1023,7 +1220,7 @@ impl PipelineRunner {
 
         // Build stage result
         let stage_result = StageResult {
-            stage_id: stage_config.id.clone(),
+            stage_id: stage_id.to_string(),
             model: stage_config.model.clone(),
             response_text,
             artifacts,
@@ -1037,8 +1234,10 @@ impl PipelineRunner {
 
         // Process exports
         if let Some(ref exports) = stage_config.exports {
-            let export_path = export_file_path.as_ref().unwrap();
-            match std::fs::read_to_string(export_path) {
+            let export_path = exports_dir(self.workspace.root())
+                .join(&checkpoint.run_id)
+                .join(format!("{}.json", stage_id));
+            match std::fs::read_to_string(&export_path) {
                 Ok(contents) => {
                     match serde_json::from_str::<HashMap<String, String>>(&contents) {
                         Ok(vars) => {
@@ -1046,7 +1245,7 @@ impl PipelineRunner {
                                 if !vars.contains_key(key) {
                                     self.emit(PipelineEvent::ExportsWarning {
                                         stage_index: stage_idx,
-                                        stage_id: stage_config.id.clone(),
+                                        stage_id: stage_id.to_string(),
                                         message: format!(
                                             "Expected key '{}' not found in exports",
                                             key
@@ -1064,14 +1263,14 @@ impl PipelineRunner {
 
                             self.emit(PipelineEvent::ExportsLoaded {
                                 stage_index: stage_idx,
-                                stage_id: stage_config.id.clone(),
+                                stage_id: stage_id.to_string(),
                                 variables: loaded,
                             });
                         }
                         Err(e) => {
                             self.emit(PipelineEvent::ExportsWarning {
                                 stage_index: stage_idx,
-                                stage_id: stage_config.id.clone(),
+                                stage_id: stage_id.to_string(),
                                 message: format!("Failed to parse exports file: {}", e),
                             });
                         }
@@ -1080,10 +1279,11 @@ impl PipelineRunner {
                 Err(e) => {
                     self.emit(PipelineEvent::ExportsWarning {
                         stage_index: stage_idx,
-                        stage_id: stage_config.id.clone(),
+                        stage_id: stage_id.to_string(),
                         message: format!(
                             "Failed to read exports file {}: {}",
-                            export_path.display(), e
+                            export_path.display(),
+                            e
                         ),
                     });
                 }
@@ -1091,12 +1291,18 @@ impl PipelineRunner {
         }
 
         // Checkpoint management
-        let verify_pending = stage_config.retry_group.as_ref().and_then(|group_name| {
-            let &(_first, last) = retry_group_ranges.get(group_name.as_str())?;
-            if stage_idx != last { return None; }
-            let group_cfg = self.config.retry_groups.get(group_name)?;
-            group_cfg.verify.as_ref().map(|_| ())
-        }).is_some();
+        let verify_pending = stage_config
+            .retry_group
+            .as_ref()
+            .and_then(|group_name| {
+                let &(_first, last) = retry_group_ranges.get(group_name.as_str())?;
+                if stage_idx != last {
+                    return None;
+                }
+                let group_cfg = self.config.retry_groups.get(group_name)?;
+                group_cfg.verify.as_ref().map(|_| ())
+            })
+            .is_some();
 
         if verify_pending {
             checkpoint.next_stage_index = stage_idx;
@@ -1107,21 +1313,107 @@ impl PipelineRunner {
         self.checkpoint_manager.save(checkpoint)?;
 
         // Run verify for retry group
-        if let Some(_jump_idx) = self.maybe_run_group_verify(
-            stage_idx, false, retry_group_ranges,
-            verify_feedback, retry_counts, checkpoint,
-        ).await? {
+        if let Some(_jump_idx) = self
+            .maybe_run_group_verify(
+                stage_idx,
+                false,
+                retry_group_ranges,
+                verify_feedback,
+                retry_counts,
+                checkpoint,
+            )
+            .await?
+        {
             // Retry: checkpoint.next_stage_index was already set by handle_retry_group_failure
             return Ok(());
         }
 
         info!(
-            stage_id = %stage_config.id,
+            stage_id = %stage_id,
             duration_secs = duration.as_secs_f64(),
             "Stage completed"
         );
 
         Ok(())
+    }
+
+    /// Handle a stage execution error: cancellation, retry groups, or normal failure.
+    ///
+    /// Returns `Ok(())` if a retry group restart was triggered, or `Err` to propagate.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_stage_error(
+        &self,
+        stage_idx: usize,
+        stage_id: &str,
+        error: CoreError,
+        retry_group_ranges: &HashMap<&str, (usize, usize)>,
+        retry_counts: &mut HashMap<String, u32>,
+        verify_feedback: &mut HashMap<String, String>,
+        checkpoint: &mut crate::checkpoint::Checkpoint,
+    ) -> CoreResult<()> {
+        let stage_config = &self.config.stages[stage_idx];
+
+        // Handle cancellation
+        if matches!(&error, CoreError::Cancelled { .. }) {
+            checkpoint.next_stage_index = stage_idx;
+            checkpoint.updated_at = Utc::now();
+            let _ = self.checkpoint_manager.save(checkpoint);
+            self.emit(PipelineEvent::PipelineCancelled {
+                stage_index: stage_idx,
+            });
+            return Err(error);
+        }
+
+        // Check if this stage belongs to a retry group
+        if let Some(ref group_name) = stage_config.retry_group {
+            if let Some(&(first_idx, _last_idx)) =
+                retry_group_ranges.get(group_name.as_str())
+            {
+                let group_config = self.config.retry_groups.get(group_name);
+                let max_retries = group_config.map_or(5, |g| g.max_retries);
+
+                let error_msg = error.to_string();
+                verify_feedback.insert(
+                    group_name.clone(),
+                    format!("Stage '{}' failed with error:\n{}", stage_id, error_msg),
+                );
+
+                match self
+                    .handle_retry_group_failure(
+                        group_name,
+                        first_idx,
+                        stage_idx,
+                        stage_id,
+                        &error_msg,
+                        max_retries,
+                        retry_counts,
+                        checkpoint,
+                    )
+                    .await
+                {
+                    Ok(_jump_idx) => {
+                        // Signal retry by keeping checkpoint.next_stage_index
+                        return Ok(());
+                    }
+                    Err(abort_err) => return Err(abort_err),
+                }
+            }
+        }
+
+        // Not in a retry group — fail normally
+        checkpoint.next_stage_index = stage_idx;
+        checkpoint.updated_at = Utc::now();
+        let checkpoint_saved = self.checkpoint_manager.save(checkpoint).is_ok();
+        self.emit(PipelineEvent::StageFailed {
+            stage_index: stage_idx,
+            stage_id: stage_id.to_string(),
+            error: error.to_string(),
+            checkpoint_saved,
+        });
+        self.emit(PipelineEvent::PipelineFailed {
+            error: error.to_string(),
+        });
+        Err(error)
     }
 
     /// Execute an agent-based stage with DAG-aware context building.
@@ -1562,16 +1854,309 @@ impl PipelineRunner {
     }
 }
 
+/// Top-level spawnable function for stage execution.
+///
+/// Dispatches to agent or command execution based on the stage config.
+/// Returns `Ok(StageExecutionOutput)` on success, or `Err((stage_idx, stage_id, error))` on failure.
+async fn execute_stage_task(
+    input: StageExecutionInput,
+) -> Result<StageExecutionOutput, (usize, String, CoreError)> {
+    let result = if input.stage_config.is_command_stage() {
+        execute_command_stage_spawned(&input).await
+    } else {
+        execute_agent_stage_spawned(&input).await
+    };
+
+    match result {
+        Ok((response_text, token_usage)) => Ok(StageExecutionOutput {
+            stage_idx: input.stage_idx,
+            stage_id: input.stage_id,
+            response_text,
+            token_usage,
+            duration: input.stage_start.elapsed(),
+        }),
+        Err(e) => Err((input.stage_idx, input.stage_id, e)),
+    }
+}
+
+/// Execute an agent-based stage in a spawned task.
+///
+/// Sets up tick/progress channels, runs the agent via the runtime, and handles timeouts.
+/// Context must already be built and passed in via the input.
+async fn execute_agent_stage_spawned(
+    input: &StageExecutionInput,
+) -> CoreResult<(String, Option<crate::stage::TokenUsage>)> {
+    // Set up tick task for elapsed time tracking
+    let tick_tx = input.event_tx.clone();
+    let tick_idx = input.stage_idx;
+    let tick_start = input.stage_start;
+    let tick_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if tick_tx
+                .send(PipelineEvent::AgentTick {
+                    stage_index: tick_idx,
+                    elapsed: tick_start.elapsed(),
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Create a progress channel
+    let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
+    let activity_tx = input.event_tx.clone();
+    let activity_idx = input.stage_idx;
+    tokio::spawn(async move {
+        while let Some(activity) = prx.recv().await {
+            if activity_tx
+                .send(PipelineEvent::AgentActivity {
+                    stage_index: activity_idx,
+                    activity,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Execute agent
+    let agent_future = input.runtime.execute(
+        &input.stage_config,
+        &input.context,
+        &input.workspace_root,
+        Some(ptx),
+        input.cancel_flag.clone(),
+    );
+
+    let agent_result = if let Some(timeout_secs) = input.stage_config.timeout_secs {
+        let timeout_duration = Duration::from_secs(timeout_secs);
+        match tokio::time::timeout(timeout_duration, agent_future).await {
+            Ok(result) => result,
+            Err(_) => Err(CoreError::AgentError {
+                message: format!(
+                    "Stage '{}' timed out after {}s",
+                    input.stage_config.id, timeout_secs
+                ),
+            }),
+        }
+    } else {
+        agent_future.await
+    };
+
+    tick_handle.abort();
+
+    let agent_output = agent_result?;
+    Ok((agent_output.response_text, agent_output.token_usage))
+}
+
+/// Execute a command-based stage in a spawned task.
+///
+/// Runs CLI commands sequentially with tick tracking and template variable rendering.
+async fn execute_command_stage_spawned(
+    input: &StageExecutionInput,
+) -> CoreResult<(String, Option<crate::stage::TokenUsage>)> {
+    let commands = input.stage_config.commands.as_ref().unwrap();
+    let total_commands = commands.len();
+
+    // Set up tick task
+    let tick_tx = input.event_tx.clone();
+    let tick_idx = input.stage_idx;
+    let tick_start = input.stage_start;
+    let tick_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if tick_tx
+                .send(PipelineEvent::AgentTick {
+                    stage_index: tick_idx,
+                    elapsed: tick_start.elapsed(),
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Render command templates with pipeline variables + exported variables
+    let mut vars = input.exported_vars.clone();
+    vars.insert("stage_id".to_string(), input.stage_config.id.clone());
+    vars.insert("stage_name".to_string(), input.stage_config.name.clone());
+
+    let mut combined_output = String::new();
+
+    let result: CoreResult<()> = async {
+        for (cmd_idx, cmd_template) in commands.iter().enumerate() {
+            // Check cancellation
+            if let Some(ref flag) = input.cancel_flag {
+                if flag.load(Ordering::Relaxed) {
+                    return Err(CoreError::Cancelled {
+                        stage_id: input.stage_config.id.clone(),
+                    });
+                }
+            }
+
+            let cmd = render_command_template(cmd_template, &vars)?;
+
+            let _ = input.event_tx.send(PipelineEvent::CommandRunning {
+                stage_index: input.stage_idx,
+                command_index: cmd_idx,
+                command: cmd.clone(),
+                total_commands,
+            });
+
+            let output = execute_command_standalone(
+                &cmd,
+                &input.workspace_root,
+                input.stage_idx,
+                &input.stage_id,
+                &input.event_tx,
+            )
+            .await?;
+
+            if !combined_output.is_empty() {
+                combined_output.push_str("\n\n");
+            }
+            combined_output.push_str(&format!("$ {cmd}\n{output}"));
+        }
+        Ok(())
+    }
+    .await;
+
+    tick_handle.abort();
+
+    result?;
+    Ok((combined_output, None))
+}
+
+/// Execute a single shell command (standalone version for spawned tasks).
+async fn execute_command_standalone(
+    command: &str,
+    workspace_root: &std::path::Path,
+    stage_idx: usize,
+    stage_id: &str,
+    event_tx: &mpsc::UnboundedSender<PipelineEvent>,
+) -> CoreResult<String> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", command]);
+        c
+    };
+
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = Command::new("sh");
+        c.args(["-c", command]);
+        c
+    };
+
+    cmd.current_dir(workspace_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| CoreError::AgentError {
+        message: format!("Failed to spawn command '{command}': {e}"),
+    })?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stderr_tx = event_tx.clone();
+    let stderr_idx = stage_idx;
+    let stderr_handle = tokio::spawn(async move {
+        let mut lines = Vec::new();
+        if let Some(stream) = stderr {
+            let mut reader = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = stderr_tx.send(PipelineEvent::CommandOutput {
+                    stage_index: stderr_idx,
+                    line: line.clone(),
+                });
+                lines.push(line);
+            }
+        }
+        lines
+    });
+
+    let mut output_lines = Vec::new();
+    if let Some(stream) = stdout {
+        let mut reader = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let _ = event_tx.send(PipelineEvent::CommandOutput {
+                stage_index: stage_idx,
+                line: line.clone(),
+            });
+            output_lines.push(line);
+        }
+    }
+
+    let stderr_lines = stderr_handle.await.unwrap_or_default();
+
+    let status = child.wait().await.map_err(|e| CoreError::AgentError {
+        message: format!("Failed to wait for command '{command}': {e}"),
+    })?;
+
+    let stdout_text = output_lines.join("\n");
+
+    if !status.success() {
+        let stderr_text = stderr_lines.join("\n");
+        return Err(CoreError::AgentError {
+            message: format!(
+                "Command failed in stage '{}' (exit {}): {}\n{}",
+                stage_id,
+                status.code().unwrap_or(-1),
+                command,
+                if stderr_text.is_empty() {
+                    &stdout_text
+                } else {
+                    &stderr_text
+                }
+            ),
+        });
+    }
+
+    Ok(stdout_text)
+}
+
+/// Shell-escape a string value for safe interpolation into shell commands.
+///
+/// On POSIX systems, wraps the value in single quotes and escapes internal
+/// single quotes. This prevents command injection when template variables
+/// (including agent-exported values) are interpolated into `sh -c` commands.
+fn shell_escape(s: &str) -> String {
+    // POSIX: wrap in single quotes, escape internal single quotes as '\''
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Render `{{variable}}` placeholders in a command string.
+///
+/// Variable values are shell-escaped before interpolation to prevent
+/// command injection (e.g., from agent-exported variables).
 fn render_command_template(
     template: &str,
     vars: &std::collections::HashMap<String, String>,
 ) -> CoreResult<String> {
+    // Shell-escape all variable values to prevent command injection
+    let escaped_vars: std::collections::HashMap<String, String> = vars
+        .iter()
+        .map(|(k, v)| (k.clone(), shell_escape(v)))
+        .collect();
+
     let mut hbs = handlebars::Handlebars::new();
     hbs.register_escape_fn(handlebars::no_escape);
     hbs.register_template_string("cmd", template)
         .map_err(|e| CoreError::TemplateError(format!("Invalid command template: {e}")))?;
-    hbs.render("cmd", vars)
+    hbs.render("cmd", &escaped_vars)
         .map_err(|e| CoreError::TemplateError(format!("Command template rendering failed: {e}")))
 }
 

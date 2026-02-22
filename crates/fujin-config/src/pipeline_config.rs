@@ -298,6 +298,22 @@ impl PipelineConfig {
         Ok(config)
     }
 
+    /// Parse a pipeline config from a YAML string and validate it.
+    ///
+    /// Returns the parsed config along with any validation warnings.
+    /// Fails if validation produces errors.
+    pub fn from_yaml_validated(yaml: &str) -> Result<(Self, Vec<String>), crate::ConfigError> {
+        let config = Self::from_yaml(yaml)?;
+        let result = crate::validate(&config);
+        if !result.is_valid() {
+            return Err(crate::ConfigError::Validation {
+                errors: result.errors,
+                warnings: result.warnings,
+            });
+        }
+        Ok((config, result.warnings))
+    }
+
     /// Load a pipeline config from a YAML file.
     pub fn from_file(path: &std::path::Path) -> Result<Self, crate::ConfigError> {
         let contents = std::fs::read_to_string(path).map_err(|e| {
@@ -307,6 +323,22 @@ impl PipelineConfig {
             }
         })?;
         Self::from_yaml(&contents)
+    }
+
+    /// Load a pipeline config from a YAML file and validate it.
+    ///
+    /// Returns the parsed config along with any validation warnings.
+    /// Fails if validation produces errors.
+    pub fn from_file_validated(path: &std::path::Path) -> Result<(Self, Vec<String>), crate::ConfigError> {
+        let config = Self::from_file(path)?;
+        let result = crate::validate(&config);
+        if !result.is_valid() {
+            return Err(crate::ConfigError::Validation {
+                errors: result.errors,
+                warnings: result.warnings,
+            });
+        }
+        Ok((config, result.warnings))
     }
 
     /// Apply variable overrides (from --var CLI flags).
@@ -752,5 +784,52 @@ stages:
 "#;
         let config = PipelineConfig::from_yaml(yaml).unwrap();
         assert!(config.stages[0].exports.is_none());
+    }
+
+    #[test]
+    fn test_from_yaml_validated_valid() {
+        let yaml = r#"
+name: valid-pipeline
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let (config, warnings) = PipelineConfig::from_yaml_validated(yaml).unwrap();
+        assert_eq!(config.name, "valid-pipeline");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_from_yaml_validated_invalid() {
+        let yaml = r#"
+name: ""
+stages: []
+"#;
+        let err = PipelineConfig::from_yaml_validated(yaml).unwrap_err();
+        match err {
+            crate::ConfigError::Validation { errors, .. } => {
+                assert!(!errors.is_empty());
+            }
+            _ => panic!("Expected Validation error, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_from_yaml_validated_with_warnings() {
+        let yaml = r#"
+name: warn-pipeline
+runtime: "unknown-runtime"
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let (config, warnings) = PipelineConfig::from_yaml_validated(yaml).unwrap();
+        assert_eq!(config.name, "warn-pipeline");
+        assert!(!warnings.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("Unknown pipeline runtime")));
     }
 }

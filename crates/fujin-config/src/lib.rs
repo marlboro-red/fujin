@@ -14,4 +14,10 @@ pub enum ConfigError {
 
     #[error("Failed to parse YAML config: {0}")]
     YamlParse(#[from] serde_yml::Error),
+
+    #[error("Config validation failed:\n{}", errors.join("\n"))]
+    Validation {
+        errors: Vec<String>,
+        warnings: Vec<String>,
+    },
 }

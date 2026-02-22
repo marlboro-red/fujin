@@ -3,6 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use fujin_core::event::PipelineEvent;
 use fujin_core::artifact::ArtifactSet;
 use fujin_core::stage::TokenUsage;
+use fujin_core::util::truncate_chars;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -991,8 +992,8 @@ impl ExecutionState {
                             }
                             VerifyStatus::Passed => ("\u{2713}", theme::SUCCESS, "passed".to_string()),
                             VerifyStatus::Failed { response } => {
-                                let short = if response.len() > 60 {
-                                    format!("{}\u{2026}", &response[..60])
+                                let short = if response.chars().count() > 60 {
+                                    format!("{}\u{2026}", truncate_chars(response, 60).trim_end_matches("..."))
                                 } else {
                                     response.clone()
                                 };

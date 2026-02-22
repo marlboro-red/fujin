@@ -3,9 +3,12 @@ use fujin_config::PipelineConfig;
 use fujin_core::*;
 use fujin_core::agent::{AgentRuntime, AgentOutput};
 use fujin_core::context::StageContext;
+use fujin_core::error::CoreResult;
 use fujin_core::event::PipelineEvent;
 use fujin_core::stage::TokenUsage;
+use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -2280,6 +2283,340 @@ stages:
     assert_eq!(warnings.len(), 2, "Expected 2 warnings for missing keys (framework, db)");
     assert!(warnings.iter().any(|w| w.contains("framework")));
     assert!(warnings.iter().any(|w| w.contains("db")));
+}
+
+// ---------------------------------------------------------------------------
+// DAG parallel execution tests
+// ---------------------------------------------------------------------------
+
+/// A mock runtime that records execution timestamps per stage, allowing
+/// tests to verify that stages ran in parallel.
+struct TimingMockRuntime {
+    /// Per-stage delay in milliseconds.
+    stage_delay_ms: HashMap<String, u64>,
+    /// Shared log of (stage_id, start_instant, end_instant) entries.
+    execution_log: Arc<std::sync::Mutex<Vec<(String, Instant, Instant)>>>,
+    default_response: String,
+}
+
+impl TimingMockRuntime {
+    fn new(
+        stage_delays: Vec<(&str, u64)>,
+        execution_log: Arc<std::sync::Mutex<Vec<(String, Instant, Instant)>>>,
+    ) -> Self {
+        Self {
+            stage_delay_ms: stage_delays
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            execution_log,
+            default_response: "done".to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for TimingMockRuntime {
+    fn name(&self) -> &str {
+        "timing-mock"
+    }
+
+    async fn execute(
+        &self,
+        config: &fujin_config::StageConfig,
+        _context: &StageContext,
+        _workspace_root: &Path,
+        _progress_tx: Option<mpsc::UnboundedSender<String>>,
+        _cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> CoreResult<AgentOutput> {
+        let start = Instant::now();
+        let delay = self.stage_delay_ms.get(&config.id).copied().unwrap_or(50);
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        let end = Instant::now();
+
+        self.execution_log
+            .lock()
+            .unwrap()
+            .push((config.id.clone(), start, end));
+
+        Ok(AgentOutput {
+            response_text: self.default_response.clone(),
+            token_usage: None,
+        })
+    }
+
+    async fn health_check(&self) -> CoreResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_dag_diamond_parallel_execution() {
+    // Diamond DAG: analyze -> (frontend, backend) -> integrate
+    // frontend and backend should execute in parallel
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: diamond-dag
+stages:
+  - id: analyze
+    name: Analyze
+    model: mock-model
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+  - id: frontend
+    name: Frontend
+    model: mock-model
+    depends_on: [analyze]
+    system_prompt: "sp"
+    user_prompt: "up"
+  - id: backend
+    name: Backend
+    model: mock-model
+    depends_on: [analyze]
+    system_prompt: "sp"
+    user_prompt: "up"
+  - id: integrate
+    name: Integration
+    model: mock-model
+    depends_on: [frontend, backend]
+    system_prompt: "sp"
+    user_prompt: "up"
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let execution_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(TimingMockRuntime::new(
+            vec![
+                ("analyze", 50),
+                ("frontend", 200),
+                ("backend", 200),
+                ("integrate", 50),
+            ],
+            execution_log.clone(),
+        )));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed");
+    assert_eq!(results.len(), 4);
+
+    // Verify all stages completed
+    let completed_ids: Vec<&str> = results.iter().map(|r| r.stage_id.as_str()).collect();
+    assert!(completed_ids.contains(&"analyze"));
+    assert!(completed_ids.contains(&"frontend"));
+    assert!(completed_ids.contains(&"backend"));
+    assert!(completed_ids.contains(&"integrate"));
+
+    // Verify execution order from the timing log
+    let log = execution_log.lock().unwrap();
+    let get_entry = |id: &str| -> &(String, Instant, Instant) {
+        log.iter().find(|(s, _, _)| s == id).unwrap()
+    };
+
+    let analyze = get_entry("analyze");
+    let frontend = get_entry("frontend");
+    let backend = get_entry("backend");
+    let integrate = get_entry("integrate");
+
+    // analyze must finish before frontend and backend start
+    assert!(
+        analyze.2 <= frontend.1,
+        "analyze should finish before frontend starts"
+    );
+    assert!(
+        analyze.2 <= backend.1,
+        "analyze should finish before backend starts"
+    );
+
+    // frontend and backend should overlap (parallel execution)
+    // They both take 200ms, so if run sequentially total would be ~400ms.
+    // If parallel, they should overlap significantly.
+    let frontend_start = frontend.1;
+    let backend_start = backend.1;
+    let gap = if frontend_start > backend_start {
+        frontend_start.duration_since(backend_start)
+    } else {
+        backend_start.duration_since(frontend_start)
+    };
+    assert!(
+        gap < std::time::Duration::from_millis(100),
+        "frontend and backend should start close together (gap: {:?}), indicating parallel execution",
+        gap
+    );
+
+    // integrate must start after both frontend and backend finish
+    assert!(
+        frontend.2 <= integrate.1,
+        "integrate should start after frontend finishes"
+    );
+    assert!(
+        backend.2 <= integrate.1,
+        "integrate should start after backend finishes"
+    );
+
+    // Verify events
+    drop(runner);
+    let events = collect_events(rx).await;
+
+    let has_completed = events.iter().any(
+        |e| matches!(e, PipelineEvent::PipelineCompleted { stages_completed: 4, .. }),
+    );
+    assert!(has_completed, "Expected PipelineCompleted with 4 stages");
+}
+
+#[tokio::test]
+async fn test_dag_independent_stages_no_deps() {
+    // Two stages with depends_on: [] should both run immediately in parallel
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: parallel-independent
+stages:
+  - id: task-a
+    name: Task A
+    model: mock-model
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+  - id: task-b
+    name: Task B
+    model: mock-model
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let execution_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(TimingMockRuntime::new(
+            vec![("task-a", 200), ("task-b", 200)],
+            execution_log.clone(),
+        )));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed");
+    assert_eq!(results.len(), 2);
+
+    // Verify both started close together (parallel)
+    let log = execution_log.lock().unwrap();
+    let task_a = log.iter().find(|(s, _, _)| s == "task-a").unwrap();
+    let task_b = log.iter().find(|(s, _, _)| s == "task-b").unwrap();
+
+    let gap = if task_a.1 > task_b.1 {
+        task_a.1.duration_since(task_b.1)
+    } else {
+        task_b.1.duration_since(task_a.1)
+    };
+    assert!(
+        gap < std::time::Duration::from_millis(100),
+        "task-a and task-b should start close together (gap: {:?}), indicating parallel execution",
+        gap
+    );
+}
+
+#[tokio::test]
+async fn test_dag_respects_dependency_ordering() {
+    // Linear chain using explicit depends_on: a -> b -> c
+    // Even with DAG infrastructure, should execute in order
+    let dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let yaml = r#"
+name: dag-linear-chain
+stages:
+  - id: stage-a
+    name: A
+    model: mock-model
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+  - id: stage-b
+    name: B
+    model: mock-model
+    depends_on: [stage-a]
+    system_prompt: "sp"
+    user_prompt: "up"
+  - id: stage-c
+    name: C
+    model: mock-model
+    depends_on: [stage-b]
+    system_prompt: "sp"
+    user_prompt: "up"
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let execution_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(TimingMockRuntime::new(
+            vec![("stage-a", 50), ("stage-b", 50), ("stage-c", 50)],
+            execution_log.clone(),
+        )));
+
+    let options = RunOptions {
+        resume: false,
+        dry_run: false,
+    };
+
+    let results = runner.run(&options).await.expect("Pipeline should succeed");
+    assert_eq!(results.len(), 3);
+
+    // Verify strict sequential ordering
+    let log = execution_log.lock().unwrap();
+    let a = log.iter().find(|(s, _, _)| s == "stage-a").unwrap();
+    let b = log.iter().find(|(s, _, _)| s == "stage-b").unwrap();
+    let c = log.iter().find(|(s, _, _)| s == "stage-c").unwrap();
+
+    assert!(a.2 <= b.1, "A should finish before B starts");
+    assert!(b.2 <= c.1, "B should finish before C starts");
 }
 
 #[tokio::test]

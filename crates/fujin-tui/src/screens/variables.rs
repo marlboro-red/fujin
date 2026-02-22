@@ -99,7 +99,7 @@ impl VariableInputState {
                 // Enter edit mode for the selected variable
                 if !self.keys.is_empty() {
                     self.editing = true;
-                    self.cursor = self.values[self.selected].len();
+                    self.cursor = self.values[self.selected].chars().count();
                 }
                 VariableInputAction::None
             }
@@ -109,6 +109,16 @@ impl VariableInputState {
             }
             _ => VariableInputAction::None,
         }
+    }
+
+    /// Convert a character-based cursor position to a byte offset in the string.
+    /// Returns the byte offset of the nth character, or the string length if
+    /// the cursor is at the end.
+    fn cursor_to_byte_offset(s: &str, char_pos: usize) -> usize {
+        s.char_indices()
+            .nth(char_pos)
+            .map(|(byte_idx, _)| byte_idx)
+            .unwrap_or(s.len())
     }
 
     /// Handle keys while editing a field value.
@@ -129,8 +139,8 @@ impl VariableInputState {
                 VariableInputAction::None
             }
             KeyCode::Right => {
-                let len = self.values[self.selected].len();
-                if self.cursor < len {
+                let char_len = self.values[self.selected].chars().count();
+                if self.cursor < char_len {
                     self.cursor += 1;
                 }
                 VariableInputAction::None
@@ -140,25 +150,37 @@ impl VariableInputState {
                 VariableInputAction::None
             }
             KeyCode::End => {
-                self.cursor = self.values[self.selected].len();
+                self.cursor = self.values[self.selected].chars().count();
                 VariableInputAction::None
             }
             KeyCode::Backspace => {
                 if self.cursor > 0 {
-                    self.values[self.selected].remove(self.cursor - 1);
+                    let byte_offset = Self::cursor_to_byte_offset(
+                        &self.values[self.selected],
+                        self.cursor - 1,
+                    );
+                    self.values[self.selected].remove(byte_offset);
                     self.cursor -= 1;
                 }
                 VariableInputAction::None
             }
             KeyCode::Delete => {
-                let len = self.values[self.selected].len();
-                if self.cursor < len {
-                    self.values[self.selected].remove(self.cursor);
+                let char_len = self.values[self.selected].chars().count();
+                if self.cursor < char_len {
+                    let byte_offset = Self::cursor_to_byte_offset(
+                        &self.values[self.selected],
+                        self.cursor,
+                    );
+                    self.values[self.selected].remove(byte_offset);
                 }
                 VariableInputAction::None
             }
             KeyCode::Char(c) => {
-                self.values[self.selected].insert(self.cursor, c);
+                let byte_offset = Self::cursor_to_byte_offset(
+                    &self.values[self.selected],
+                    self.cursor,
+                );
+                self.values[self.selected].insert(byte_offset, c);
                 self.cursor += 1;
                 VariableInputAction::None
             }
@@ -257,8 +279,9 @@ impl VariableInputState {
 
             // Value line with edit indicator
             if is_selected && self.editing {
-                // Show value with cursor
-                let (before, after) = value.split_at(self.cursor.min(value.len()));
+                // Show value with cursor (use char-based offset for UTF-8 safety)
+                let byte_offset = Self::cursor_to_byte_offset(value, self.cursor);
+                let (before, after) = value.split_at(byte_offset);
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(before, Style::default().fg(theme::TEXT_PRIMARY)),
