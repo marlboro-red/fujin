@@ -232,4 +232,5 @@ fujin checkpoint clean       # Clear all checkpoints
 - **[Branching and Conditions](branching-and-conditions.md)** — Conditional execution with `when` and `branch`/`on_branch`
 - **[Exports and Dynamic Variables](exports-and-dynamic-variables.md)** — Letting agents set variables at runtime
 - **[Pipeline Patterns](pipeline-patterns.md)** — Ready-to-use patterns for common workflows
+- **[Best Practices](best-practices.md)** — Cost optimization, cleanup, prompt writing, and pipeline hygiene
 - **[Pipeline Authoring Reference](../pipeline-authoring.md)** — Complete field reference and validation rules

@@ -25,6 +25,9 @@ Automatic retry-on-failure with optional verification agents. Covers retry group
 ### [Pipeline Patterns](pipeline-patterns.md)
 Copy-pasteable pipeline recipes for common workflows: implement-test-fix loops, code review, spec-driven development, adaptive analysis, conditional testing, multi-model brainstorming, PR preparation, migrations, refactoring, and documentation generation.
 
+### [Best Practices](best-practices.md)
+Practical advice for writing efficient pipelines. Covers artifact cleanup, prompt engineering, cost optimization, tool restrictions, stage decomposition, checkpoint management, retry group scoping, and a pipeline hygiene checklist.
+
 ## Reference
 
 ### [Pipeline Authoring Reference](../pipeline-authoring.md)

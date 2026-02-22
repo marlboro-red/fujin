@@ -802,3 +802,5 @@ stages:
 **Use `--dry-run` liberally.** Validate your templates are rendering correctly before spending API credits.
 
 **Keep variable names consistent.** If `detect` exports `language`, don't have another stage export `lang`. Use the same name everywhere.
+
+**Clean up intermediate artifacts.** Pipelines that create spec documents, migration plans, or scratch files should include a cleanup stage at the end. See the **[Best Practices](best-practices.md)** guide for cleanup strategies.
