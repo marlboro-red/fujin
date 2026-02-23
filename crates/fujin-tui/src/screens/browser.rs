@@ -195,7 +195,7 @@ impl BrowserState {
                     p.config
                         .stages
                         .iter()
-                        .filter(|s| !s.model.is_empty() && s.model != "commands")
+                        .filter(|s| !s.is_command_stage() && !s.model.is_empty())
                         .filter(|s| seen.insert(s.model.clone()))
                         .map(|s| theme::shorten_model(&s.model))
                         .collect()
@@ -366,7 +366,7 @@ impl BrowserState {
                         ),
                     ]));
                 }
-                if !stage.allowed_tools.is_empty() {
+                if !stage.is_command_stage() && !stage.allowed_tools.is_empty() {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{:width$}  tools: ", ""),
