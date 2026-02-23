@@ -87,6 +87,16 @@ enum Commands {
     /// Set up the data directory and install built-in templates
     Setup,
 
+    /// Open a pipeline config in an editor (defaults to VS Code)
+    Edit {
+        /// Path or name of the pipeline YAML config to edit
+        config: String,
+
+        /// Editor command to use (defaults to "code")
+        #[arg(long, default_value = "code")]
+        editor: String,
+    },
+
     /// Manage checkpoints
     Checkpoint {
         #[command(subcommand)]
@@ -162,6 +172,8 @@ async fn main() -> Result<()> {
 
         Commands::Setup => cmd_setup(),
 
+        Commands::Edit { config, editor } => cmd_edit(config, editor),
+
         Commands::Checkpoint { action } => cmd_checkpoint(action),
     }
 }
@@ -179,6 +191,11 @@ fn resolve_config(value: &str) -> Result<PathBuf> {
     if value.contains('/') || value.contains('\\') || path.extension().is_some() {
         if path.exists() {
             return Ok(path.to_path_buf());
+        }
+        // Also check the global configs directory
+        let global = paths::configs_dir().join(value);
+        if global.exists() {
+            return Ok(global);
         }
         anyhow::bail!("Config file not found: {value}");
     }
@@ -950,6 +967,24 @@ fn cmd_setup() -> Result<()> {
     println!("{} fujin data directory set up:", style("✓").green().bold());
     println!("  Templates: {} ({installed} installed)", style(templates_dir.display()).cyan());
     println!("  Configs:   {}", style(paths::configs_dir().display()).cyan());
+
+    Ok(())
+}
+
+fn cmd_edit(config: String, editor: String) -> Result<()> {
+    let path = resolve_config(&config)?;
+
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg(&editor);
+        c
+    } else {
+        std::process::Command::new(&editor)
+    };
+    cmd.arg(&path);
+
+    cmd.status()
+        .with_context(|| format!("Failed to launch editor '{editor}'"))?;
 
     Ok(())
 }
