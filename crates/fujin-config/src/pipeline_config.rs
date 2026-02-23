@@ -28,6 +28,10 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub retry_groups: HashMap<String, RetryGroupConfig>,
 
+    /// MCP server definitions. Stages reference servers by name.
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, McpServerConfig>,
+
     /// Included pipelines whose stages are merged into this pipeline.
     #[serde(default)]
     pub includes: Vec<IncludeConfig>,
@@ -82,6 +86,35 @@ impl Default for SummarizerConfig {
             max_tokens: default_summarizer_max_tokens(),
         }
     }
+}
+
+/// Configuration for an MCP (Model Context Protocol) server.
+///
+/// MCP servers provide external tools (databases, APIs, docs) to agent runtimes.
+/// Two transports are supported: **stdio** (`command` + optional `args`/`env`)
+/// and **HTTP/SSE** (`url` + optional `headers`). These are mutually exclusive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Command to run for stdio transport.
+    #[serde(default)]
+    pub command: Option<String>,
+
+    /// Arguments for the stdio command.
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// Environment variables for the stdio command.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+
+    /// URL for HTTP/SSE transport.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// HTTP headers for HTTP/SSE transport (e.g., Authorization).
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 /// Configuration for a retry group.
@@ -229,6 +262,14 @@ pub struct StageConfig {
     /// re-executed as a unit when any stage in the group fails.
     #[serde(default)]
     pub retry_group: Option<String>,
+
+    /// MCP server names this stage should have access to.
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+
+    /// Resolved MCP server configs (populated by the pipeline runner, not from YAML).
+    #[serde(skip)]
+    pub resolved_mcp_servers: HashMap<String, McpServerConfig>,
 
     /// Condition for skipping this stage based on a prior stage's output.
     #[serde(default)]
@@ -862,5 +903,93 @@ stages:
         assert_eq!(config.name, "warn-pipeline");
         assert!(!warnings.is_empty());
         assert!(warnings.iter().any(|w| w.contains("Unknown pipeline runtime")));
+    }
+
+    #[test]
+    fn test_mcp_servers_stdio_parsing() {
+        let yaml = r#"
+name: mcp-test
+mcp_servers:
+  database:
+    command: npx
+    args: [-y, "@modelcontextprotocol/server-postgres"]
+    env:
+      DATABASE_URL: postgresql://localhost/mydb
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+    mcp_servers: [database]
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        let db = config.mcp_servers.get("database").unwrap();
+        assert_eq!(db.command, Some("npx".to_string()));
+        assert_eq!(db.args, vec!["-y", "@modelcontextprotocol/server-postgres"]);
+        assert_eq!(db.env.get("DATABASE_URL").unwrap(), "postgresql://localhost/mydb");
+        assert!(db.url.is_none());
+        assert_eq!(config.stages[0].mcp_servers, vec!["database"]);
+    }
+
+    #[test]
+    fn test_mcp_servers_url_parsing() {
+        let yaml = r#"
+name: mcp-test
+mcp_servers:
+  api-docs:
+    url: https://api-docs.example.com/mcp
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+    mcp_servers: [api-docs]
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        let api = config.mcp_servers.get("api-docs").unwrap();
+        assert_eq!(api.url, Some("https://api-docs.example.com/mcp".to_string()));
+        assert!(api.command.is_none());
+        assert!(api.args.is_empty());
+        assert!(api.env.is_empty());
+        assert!(api.headers.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_servers_url_with_headers_parsing() {
+        let yaml = r#"
+name: mcp-test
+mcp_servers:
+  authed-api:
+    url: https://api.example.com/mcp
+    headers:
+      Authorization: "Bearer sk-test-123"
+      X-Custom: "value"
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+    mcp_servers: [authed-api]
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        let api = config.mcp_servers.get("authed-api").unwrap();
+        assert_eq!(api.url, Some("https://api.example.com/mcp".to_string()));
+        assert_eq!(api.headers.get("Authorization").unwrap(), "Bearer sk-test-123");
+        assert_eq!(api.headers.get("X-Custom").unwrap(), "value");
+    }
+
+    #[test]
+    fn test_mcp_servers_default_empty() {
+        let yaml = r#"
+name: no-mcp
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert!(config.mcp_servers.is_empty());
+        assert!(config.stages[0].mcp_servers.is_empty());
     }
 }

@@ -3,6 +3,8 @@ use crate::error::{CoreError, CoreResult};
 use crate::stage::TokenUsage;
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-use fujin_config::StageConfig;
+use fujin_config::{McpServerConfig, StageConfig};
 
 /// Maximum response size (50 MB) to prevent unbounded memory growth.
 const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
@@ -120,6 +122,56 @@ impl ClaudeCodeRuntime {
         }
 
         prompt
+    }
+
+    /// Build the MCP config JSON for `--mcp-config`.
+    ///
+    /// Generates a JSON object with `mcpServers` key containing stdio or SSE
+    /// server configs suitable for Claude Code's `--mcp-config` flag.
+    fn build_mcp_config_json(servers: &HashMap<String, McpServerConfig>) -> String {
+        let mut mcp_servers = serde_json::Map::new();
+
+        for (name, config) in servers {
+            let mut server = serde_json::Map::new();
+
+            if let Some(ref command) = config.command {
+                // Stdio transport
+                server.insert("command".to_string(), serde_json::Value::String(command.clone()));
+                if !config.args.is_empty() {
+                    server.insert(
+                        "args".to_string(),
+                        serde_json::Value::Array(
+                            config.args.iter().map(|a| serde_json::Value::String(a.clone())).collect(),
+                        ),
+                    );
+                }
+                if !config.env.is_empty() {
+                    let env_obj: serde_json::Map<String, serde_json::Value> = config
+                        .env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                        .collect();
+                    server.insert("env".to_string(), serde_json::Value::Object(env_obj));
+                }
+            } else if let Some(ref url) = config.url {
+                // HTTP/SSE transport
+                server.insert("type".to_string(), serde_json::Value::String("sse".to_string()));
+                server.insert("url".to_string(), serde_json::Value::String(url.clone()));
+                if !config.headers.is_empty() {
+                    let headers_obj: serde_json::Map<String, serde_json::Value> = config
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                        .collect();
+                    server.insert("headers".to_string(), serde_json::Value::Object(headers_obj));
+                }
+            }
+
+            mcp_servers.insert(name.clone(), serde_json::Value::Object(server));
+        }
+
+        let root = serde_json::json!({ "mcpServers": mcp_servers });
+        serde_json::to_string(&root).unwrap_or_else(|_| "{}".to_string())
     }
 
     /// Build allowed tools flag for Claude CLI.
@@ -324,6 +376,26 @@ impl AgentRuntime for ClaudeCodeRuntime {
         for arg in &tools_args {
             cmd.arg(arg);
         }
+
+        // Add MCP server config if any servers are attached to this stage
+        let _mcp_tempfile = if !config.resolved_mcp_servers.is_empty() {
+            let json = Self::build_mcp_config_json(&config.resolved_mcp_servers);
+            let mut tmpfile = tempfile::NamedTempFile::new().map_err(|e| CoreError::AgentError {
+                message: format!("Failed to create MCP config tempfile: {e}"),
+            })?;
+            tmpfile.write_all(json.as_bytes()).map_err(|e| CoreError::AgentError {
+                message: format!("Failed to write MCP config: {e}"),
+            })?;
+            cmd.arg("--mcp-config").arg(tmpfile.path());
+            debug!(
+                mcp_servers = ?config.resolved_mcp_servers.keys().collect::<Vec<_>>(),
+                path = %tmpfile.path().display(),
+                "Attached MCP config"
+            );
+            Some(tmpfile)
+        } else {
+            None
+        };
 
         cmd.current_dir(workspace_root)
             .stdin(Stdio::piped())
@@ -952,5 +1024,122 @@ mod tests {
         let prompt = ClaudeCodeRuntime::build_prompt(&context);
         // Should NOT prepend since it's already in the prompt
         assert!(!prompt.contains("Context from previous stage:"));
+    }
+
+    // --- MCP config JSON tests ---
+
+    #[test]
+    fn test_build_mcp_config_json_stdio() {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "database".to_string(),
+            McpServerConfig {
+                command: Some("npx".to_string()),
+                args: vec!["-y".to_string(), "@modelcontextprotocol/server-postgres".to_string()],
+                env: {
+                    let mut m = HashMap::new();
+                    m.insert("DATABASE_URL".to_string(), "postgresql://localhost/mydb".to_string());
+                    m
+                },
+                url: None,
+                headers: HashMap::new(),
+            },
+        );
+
+        let json = ClaudeCodeRuntime::build_mcp_config_json(&servers);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let db = &parsed["mcpServers"]["database"];
+        assert_eq!(db["command"], "npx");
+        assert_eq!(db["args"][0], "-y");
+        assert_eq!(db["args"][1], "@modelcontextprotocol/server-postgres");
+        assert_eq!(db["env"]["DATABASE_URL"], "postgresql://localhost/mydb");
+        assert!(db.get("type").is_none());
+        assert!(db.get("url").is_none());
+    }
+
+    #[test]
+    fn test_build_mcp_config_json_sse() {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "api-docs".to_string(),
+            McpServerConfig {
+                command: None,
+                args: vec![],
+                env: HashMap::new(),
+                url: Some("https://api-docs.example.com/mcp".to_string()),
+                headers: HashMap::new(),
+            },
+        );
+
+        let json = ClaudeCodeRuntime::build_mcp_config_json(&servers);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let api = &parsed["mcpServers"]["api-docs"];
+        assert_eq!(api["type"], "sse");
+        assert_eq!(api["url"], "https://api-docs.example.com/mcp");
+        assert!(api.get("command").is_none());
+        assert!(api.get("headers").is_none());
+    }
+
+    #[test]
+    fn test_build_mcp_config_json_sse_with_headers() {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "authed-api".to_string(),
+            McpServerConfig {
+                command: None,
+                args: vec![],
+                env: HashMap::new(),
+                url: Some("https://api.example.com/mcp".to_string()),
+                headers: {
+                    let mut h = HashMap::new();
+                    h.insert("Authorization".to_string(), "Bearer sk-test-123".to_string());
+                    h.insert("X-Custom".to_string(), "value".to_string());
+                    h
+                },
+            },
+        );
+
+        let json = ClaudeCodeRuntime::build_mcp_config_json(&servers);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let api = &parsed["mcpServers"]["authed-api"];
+        assert_eq!(api["type"], "sse");
+        assert_eq!(api["url"], "https://api.example.com/mcp");
+        assert_eq!(api["headers"]["Authorization"], "Bearer sk-test-123");
+        assert_eq!(api["headers"]["X-Custom"], "value");
+    }
+
+    #[test]
+    fn test_build_mcp_config_json_empty() {
+        let servers = HashMap::new();
+        let json = ClaudeCodeRuntime::build_mcp_config_json(&servers);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["mcpServers"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_build_mcp_config_json_stdio_minimal() {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "simple".to_string(),
+            McpServerConfig {
+                command: Some("my-server".to_string()),
+                args: vec![],
+                env: HashMap::new(),
+                url: None,
+                headers: HashMap::new(),
+            },
+        );
+
+        let json = ClaudeCodeRuntime::build_mcp_config_json(&servers);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let s = &parsed["mcpServers"]["simple"];
+        assert_eq!(s["command"], "my-server");
+        // No args or env keys should be present
+        assert!(s.get("args").is_none());
+        assert!(s.get("env").is_none());
     }
 }

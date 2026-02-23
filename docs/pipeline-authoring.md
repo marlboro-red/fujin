@@ -45,6 +45,12 @@ retry_groups:                      # optional, default: {}
   group_name:
     max_retries: 5
     verify: ...
+mcp_servers:                       # optional, default: {}
+  server_name:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-postgres"]
+    env:
+      DATABASE_URL: "postgresql://localhost/mydb"
 includes:                          # optional, default: []
   - source: backend.yaml
     as: be
@@ -99,6 +105,44 @@ The summarizer calls Claude to condense the previous stage's full output into a 
 
 Defines named retry groups for automatic retry-on-failure. See [Retry groups](#retry_group-optional-string) in stage fields for usage.
 
+#### `mcp_servers` (optional, map)
+
+Defines named [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) servers that stages can attach. MCP servers provide external tools — databases, APIs, documentation indexes — that the agent runtime spins up automatically.
+
+Each server uses exactly one transport:
+
+- **Stdio** — runs a local command as a subprocess (`command` + optional `args`/`env`)
+- **HTTP/SSE** — connects to a remote server (`url` + optional `headers`)
+
+```yaml
+mcp_servers:
+  database:
+    command: npx
+    args: [-y, "@modelcontextprotocol/server-postgres"]
+    env:
+      DATABASE_URL: postgresql://localhost/mydb
+  api-docs:
+    url: https://api-docs.example.com/mcp
+    headers:
+      Authorization: "Bearer {{api_token}}"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `command` | string | — | Command for stdio transport. Mutually exclusive with `url`. |
+| `args` | list | `[]` | Arguments for the stdio command |
+| `env` | map | `{}` | Environment variables for the stdio command |
+| `url` | string | — | URL for HTTP/SSE transport. Mutually exclusive with `command`. |
+| `headers` | map | `{}` | HTTP headers for the HTTP/SSE transport (e.g., `Authorization`) |
+
+Stages reference servers by name in their `mcp_servers` list (see [mcp_servers (stage)](#mcp_servers-optional-list)). The runtime generates a config file and passes it via `--mcp-config`.
+
+**Runtime support:** MCP is supported by **Claude Code** only. Using `mcp_servers` with `copilot-cli` produces a validation warning — the servers are ignored at runtime.
+
+When using [includes](#includes-optional-list), child pipeline MCP servers are merged into the parent with the alias prefix (e.g., `be.database`), and stage-level references are updated automatically.
+
+See the **[MCP Servers Guide](guides/mcp-servers.md)** for detailed usage, authentication patterns, and examples.
+
 #### `includes` (optional, list)
 
 Import stages from other pipeline files. Each include loads a pipeline YAML, prefixes its stage IDs with the `as` alias, and merges them into the current pipeline. Includes are resolved before validation — the result is a flat pipeline config.
@@ -147,6 +191,7 @@ stages:
       - "read"
       - "write"
       - "bash"
+    mcp_servers: [database, api-docs]      # optional — refs to pipeline-level MCP servers
 ```
 
 #### `id` (required, string)
@@ -347,6 +392,29 @@ stages:
 | `timeout_secs` | integer | — | Optional timeout |
 
 See the **[Retry Groups Guide](guides/retry-groups.md)** for detailed usage, verify agent patterns, `{{verify_feedback}}`, and realistic examples.
+
+#### `mcp_servers` (optional, list)
+
+Lists the names of pipeline-level MCP servers this stage should have access to. Each name must reference a server defined in the top-level [`mcp_servers`](#mcp_servers-optional-map) map.
+
+```yaml
+mcp_servers:
+  database:
+    command: npx
+    args: [-y, "@modelcontextprotocol/server-postgres"]
+    env:
+      DATABASE_URL: postgresql://localhost/mydb
+
+stages:
+  - id: analyze
+    mcp_servers: [database]
+    system_prompt: "You are a database analyst."
+    user_prompt: "Examine the schema and suggest improvements."
+```
+
+At runtime, the pipeline runner resolves each name to the full server config and generates a temporary MCP config file passed to the agent via `--mcp-config`. The temp file is cleaned up automatically after the stage completes.
+
+See the **[MCP Servers Guide](guides/mcp-servers.md)** for detailed usage and examples.
 
 ---
 
@@ -1078,6 +1146,9 @@ Fujin validates your pipeline config before execution. The following rules are e
 - `branch.default` (if set) must be one of the defined routes
 - `on_branch` values must match a route defined in an earlier stage's `branch`
 - A stage cannot have both `branch` and `on_branch`
+- `mcp_servers` entries on a stage must reference servers defined in the top-level `mcp_servers`
+- Each MCP server must have exactly one of `command` or `url` (not both, not neither)
+- `command` and `url` must not be empty strings
 - `retry_group` must reference a group defined in `retry_groups`
 - Retry group stages must be consecutive in the stages list
 - A retry group must have at least 2 stages (or use a `verify` agent)
@@ -1098,6 +1169,11 @@ Fujin validates your pipeline config before execution. The following rules are e
 - `exports.keys` lists a key not found in the exports JSON file at runtime
 - Exports JSON file is missing or malformed at runtime
 - Unused retry group (defined but not referenced by any stage)
+- Unused MCP server (defined but not referenced by any stage)
+- `mcp_servers` on a command stage (MCP servers are only used by agent runtimes)
+- `mcp_servers` with `copilot-cli` runtime (MCP is not supported by Copilot CLI)
+- `args` or `env` on an HTTP/SSE MCP server (ignored — these are stdio-only fields)
+- `headers` on a stdio MCP server (ignored — this is an HTTP/SSE-only field)
 - Command stage in a retry group with verify agent (`{{verify_feedback}}` not available in command stages)
 
 Validate without running:

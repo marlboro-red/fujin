@@ -97,7 +97,7 @@ impl PipelineRunner {
     ///
     /// `event_tx` is required — all progress is communicated via events.
     pub fn new(
-        config: PipelineConfig,
+        mut config: PipelineConfig,
         config_yaml: String,
         workspace_root: PathBuf,
         event_tx: mpsc::UnboundedSender<PipelineEvent>,
@@ -131,6 +131,18 @@ impl PipelineRunner {
                                 "Unknown stage runtime override, will use pipeline default"
                             );
                         }
+                    }
+                }
+            }
+        }
+
+        // Resolve MCP server names to full configs on each stage
+        {
+            let mcp_servers = config.mcp_servers.clone();
+            for stage in &mut config.stages {
+                for server_name in &stage.mcp_servers {
+                    if let Some(server_config) = mcp_servers.get(server_name) {
+                        stage.resolved_mcp_servers.insert(server_name.clone(), server_config.clone());
                     }
                 }
             }
@@ -1803,6 +1815,8 @@ impl PipelineRunner {
             allowed_tools: verify_cfg.allowed_tools.clone(),
             commands: None,
             retry_group: None,
+            mcp_servers: Vec::new(),
+            resolved_mcp_servers: HashMap::new(),
             when: None,
             branch: None,
             on_branch: None,
@@ -1894,6 +1908,8 @@ impl PipelineRunner {
             allowed_tools: Vec::new(),
             commands: None,
             retry_group: None,
+            mcp_servers: Vec::new(),
+            resolved_mcp_servers: HashMap::new(),
             when: None,
             branch: None,
             on_branch: None,

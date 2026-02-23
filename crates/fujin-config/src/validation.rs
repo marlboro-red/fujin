@@ -196,6 +196,103 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
         }
     }
 
+    // Validate MCP server definitions
+    for (name, server) in &config.mcp_servers {
+        let has_command = server.command.as_ref().is_some_and(|c| !c.is_empty());
+        let has_url = server.url.as_ref().is_some_and(|u| !u.is_empty());
+
+        if !has_command && !has_url {
+            result.errors.push(format!(
+                "MCP server '{}': must specify either 'command' (stdio) or 'url' (HTTP/SSE)",
+                name
+            ));
+        } else if has_command && has_url {
+            result.errors.push(format!(
+                "MCP server '{}': cannot specify both 'command' and 'url' (pick one transport)",
+                name
+            ));
+        }
+
+        // Empty string checks (non-None but empty)
+        if server.command.as_ref().is_some_and(|c| c.trim().is_empty()) {
+            result.errors.push(format!(
+                "MCP server '{}': 'command' must not be empty",
+                name
+            ));
+        }
+        if server.url.as_ref().is_some_and(|u| u.trim().is_empty()) {
+            result.errors.push(format!(
+                "MCP server '{}': 'url' must not be empty",
+                name
+            ));
+        }
+
+        // Warn if args/env are set with url transport
+        if has_url && !has_command {
+            if !server.args.is_empty() {
+                result.warnings.push(format!(
+                    "MCP server '{}': 'args' is ignored for HTTP/SSE transport",
+                    name
+                ));
+            }
+            if !server.env.is_empty() {
+                result.warnings.push(format!(
+                    "MCP server '{}': 'env' is ignored for HTTP/SSE transport",
+                    name
+                ));
+            }
+        }
+
+        // Warn if headers are set with stdio transport
+        if has_command && !has_url && !server.headers.is_empty() {
+            result.warnings.push(format!(
+                "MCP server '{}': 'headers' is ignored for stdio transport",
+                name
+            ));
+        }
+    }
+
+    // Validate per-stage MCP server references
+    let mut referenced_mcp_servers = HashSet::new();
+    for (i, stage) in config.stages.iter().enumerate() {
+        let prefix = format!("Stage {} ('{}')", i, stage.id);
+
+        for server_name in &stage.mcp_servers {
+            referenced_mcp_servers.insert(server_name.as_str());
+            if !config.mcp_servers.contains_key(server_name) {
+                result.errors.push(format!(
+                    "{prefix}: mcp_servers references undefined server '{server_name}'"
+                ));
+            }
+        }
+
+        if !stage.mcp_servers.is_empty() {
+            if stage.is_command_stage() {
+                result.warnings.push(format!(
+                    "{prefix}: mcp_servers on a command stage (MCP servers are only used by agent runtimes)"
+                ));
+            }
+
+            // Check if using copilot-cli runtime
+            let effective_runtime = stage.runtime.as_deref().unwrap_or(&config.runtime);
+            if effective_runtime == "copilot-cli" {
+                result.warnings.push(format!(
+                    "{prefix}: mcp_servers with copilot-cli runtime (MCP is not supported by copilot-cli)"
+                ));
+            }
+        }
+    }
+
+    // Warn about defined but unreferenced MCP servers
+    for server_name in config.mcp_servers.keys() {
+        if !referenced_mcp_servers.contains(server_name.as_str()) {
+            result.warnings.push(format!(
+                "MCP server '{}' is defined but not referenced by any stage",
+                server_name
+            ));
+        }
+    }
+
     // Warn about command stages in retry groups with verify agents
     for (i, stage) in config.stages.iter().enumerate() {
         if let Some(ref group) = stage.retry_group {
@@ -1672,5 +1769,254 @@ stages:
         .unwrap();
         let result = validate_includes(&config);
         assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
+
+    // --- MCP server validation tests ---
+
+    #[test]
+    fn test_mcp_server_missing_transport() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+mcp_servers:
+  broken:
+    args: ["-y"]
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    mcp_servers: [broken]
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("must specify either 'command'")));
+    }
+
+    #[test]
+    fn test_mcp_server_both_transports() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+mcp_servers:
+  broken:
+    command: npx
+    url: https://example.com/mcp
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    mcp_servers: [broken]
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("cannot specify both")));
+    }
+
+    #[test]
+    fn test_mcp_server_undefined_reference() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    mcp_servers: [nonexistent]
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("undefined server 'nonexistent'")));
+    }
+
+    #[test]
+    fn test_mcp_server_valid() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+mcp_servers:
+  database:
+    command: npx
+    args: [-y, "@modelcontextprotocol/server-postgres"]
+    env:
+      DATABASE_URL: postgresql://localhost/mydb
+  api-docs:
+    url: https://api-docs.example.com/mcp
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    mcp_servers: [database, api-docs]
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_mcp_server_on_command_stage_warns() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+mcp_servers:
+  db:
+    command: npx
+stages:
+  - id: "s1"
+    name: "S1"
+    commands:
+      - "echo hi"
+    mcp_servers: [db]
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid());
+        assert!(result.warnings.iter().any(|w| w.contains("mcp_servers on a command stage")));
+    }
+
+    #[test]
+    fn test_mcp_server_on_copilot_warns() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+mcp_servers:
+  db:
+    command: npx
+stages:
+  - id: "s1"
+    name: "S1"
+    runtime: copilot-cli
+    system_prompt: "x"
+    user_prompt: "y"
+    mcp_servers: [db]
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid());
+        assert!(result.warnings.iter().any(|w| w.contains("copilot-cli")));
+    }
+
+    #[test]
+    fn test_mcp_server_unreferenced_warns() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+mcp_servers:
+  unused_db:
+    command: npx
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid());
+        assert!(result.warnings.iter().any(|w| w.contains("not referenced by any stage")));
+    }
+
+    #[test]
+    fn test_mcp_server_url_with_args_warns() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+mcp_servers:
+  api:
+    url: https://example.com/mcp
+    args: ["-y"]
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    mcp_servers: [api]
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid());
+        assert!(result.warnings.iter().any(|w| w.contains("'args' is ignored")));
+    }
+
+    #[test]
+    fn test_mcp_server_headers_on_stdio_warns() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+mcp_servers:
+  db:
+    command: npx
+    headers:
+      Authorization: "Bearer token"
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    mcp_servers: [db]
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(result.is_valid());
+        assert!(result.warnings.iter().any(|w| w.contains("'headers' is ignored")));
+    }
+
+    #[test]
+    fn test_mcp_server_empty_command_string() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+mcp_servers:
+  bad:
+    command: ""
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    mcp_servers: [bad]
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("'command' must not be empty")));
+    }
+
+    #[test]
+    fn test_mcp_server_empty_url_string() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+mcp_servers:
+  bad:
+    url: ""
+stages:
+  - id: "s1"
+    name: "S1"
+    system_prompt: "x"
+    user_prompt: "y"
+    mcp_servers: [bad]
+"#,
+        )
+        .unwrap();
+        let result = validate(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("'url' must not be empty")));
     }
 }

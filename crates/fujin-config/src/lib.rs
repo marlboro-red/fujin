@@ -3,7 +3,7 @@ mod pipeline_config;
 mod validation;
 
 pub use includes::resolve_includes;
-pub use pipeline_config::{BranchConfig, ExportsConfig, IncludeConfig, PipelineConfig, RetryGroupConfig, StageConfig, SummarizerConfig, VerifyConfig, WhenCondition, KNOWN_RUNTIMES};
+pub use pipeline_config::{BranchConfig, ExportsConfig, IncludeConfig, McpServerConfig, PipelineConfig, RetryGroupConfig, StageConfig, SummarizerConfig, VerifyConfig, WhenCondition, KNOWN_RUNTIMES};
 pub use validation::{validate, validate_includes, ValidationResult};
 
 #[derive(Debug, thiserror::Error)]

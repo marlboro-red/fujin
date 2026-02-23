@@ -22,6 +22,9 @@ Compose pipelines from reusable building blocks with `includes`. Covers importin
 ### [Exports and Dynamic Variables](exports-and-dynamic-variables.md)
 Let agents discover information at runtime and pass it to downstream stages. Covers the exports feature, prompt patterns, fallback defaults, and adaptive pipeline design.
 
+### [MCP Servers](mcp-servers.md)
+Attach external tool servers (databases, APIs, documentation) to agent stages via the Model Context Protocol. Covers stdio and HTTP/SSE transports, authentication, per-stage server selection, interaction with includes, and practical examples.
+
 ### [Retry Groups](retry-groups.md)
 Automatic retry-on-failure with optional verification agents. Covers retry group configuration, verify agents, `{{verify_feedback}}`, and self-correcting pipeline patterns.
 

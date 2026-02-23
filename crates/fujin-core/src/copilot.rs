@@ -148,6 +148,14 @@ impl AgentRuntime for CopilotCliRuntime {
         progress_tx: Option<mpsc::UnboundedSender<String>>,
         cancel_flag: Option<Arc<AtomicBool>>,
     ) -> CoreResult<AgentOutput> {
+        if !config.resolved_mcp_servers.is_empty() {
+            warn!(
+                stage_id = %config.id,
+                mcp_servers = ?config.resolved_mcp_servers.keys().collect::<Vec<_>>(),
+                "MCP servers are not supported by copilot-cli runtime; ignoring"
+            );
+        }
+
         let prompt = Self::build_prompt(config, context);
 
         info!(
@@ -359,6 +367,8 @@ mod tests {
             on_branch: None,
             exports: None,
             depends_on: None,
+            mcp_servers: Vec::new(),
+            resolved_mcp_servers: std::collections::HashMap::new(),
         };
         let context = StageContext {
             rendered_prompt: "Write hello world".to_string(),
@@ -392,6 +402,8 @@ mod tests {
             on_branch: None,
             exports: None,
             depends_on: None,
+            mcp_servers: Vec::new(),
+            resolved_mcp_servers: std::collections::HashMap::new(),
         };
         let context = StageContext {
             rendered_prompt: "Write hello world".to_string(),
@@ -423,6 +435,8 @@ mod tests {
             on_branch: None,
             exports: None,
             depends_on: None,
+            mcp_servers: Vec::new(),
+            resolved_mcp_servers: std::collections::HashMap::new(),
         };
         let context = StageContext {
             rendered_prompt: "Continue the work".to_string(),
@@ -455,6 +469,8 @@ mod tests {
             on_branch: None,
             exports: None,
             depends_on: None,
+            mcp_servers: Vec::new(),
+            resolved_mcp_servers: std::collections::HashMap::new(),
         };
         // If prior_summary is already embedded in the rendered prompt, it should not be duplicated
         let context = StageContext {
@@ -486,6 +502,8 @@ mod tests {
             on_branch: None,
             exports: None,
             depends_on: None,
+            mcp_servers: Vec::new(),
+            resolved_mcp_servers: std::collections::HashMap::new(),
         };
         let context = StageContext {
             rendered_prompt: "Fix the issues".to_string(),
@@ -518,6 +536,8 @@ mod tests {
             on_branch: None,
             exports: None,
             depends_on: None,
+            mcp_servers: Vec::new(),
+            resolved_mcp_servers: std::collections::HashMap::new(),
         };
         let context = StageContext {
             rendered_prompt: "Review the files".to_string(),
@@ -553,6 +573,8 @@ mod tests {
             on_branch: None,
             exports: None,
             depends_on: None,
+            mcp_servers: Vec::new(),
+            resolved_mcp_servers: std::collections::HashMap::new(),
         };
         let context = StageContext {
             rendered_prompt: "Do the work".to_string(),

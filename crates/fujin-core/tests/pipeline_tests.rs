@@ -2680,3 +2680,81 @@ stages:
         content
     );
 }
+
+// ---------------------------------------------------------------------------
+// MCP server resolution tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_mcp_servers_resolved_on_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = r#"
+name: mcp-resolve-test
+mcp_servers:
+  database:
+    command: npx
+    args: [-y, "@modelcontextprotocol/server-postgres"]
+    env:
+      DATABASE_URL: postgresql://localhost/mydb
+  api-docs:
+    url: https://api-docs.example.com/mcp
+stages:
+  - id: analyze
+    name: Analyze
+    model: mock-model
+    system_prompt: "sp"
+    user_prompt: "up"
+    mcp_servers: [database, api-docs]
+  - id: implement
+    name: Implement
+    model: mock-model
+    system_prompt: "sp"
+    user_prompt: "up"
+    mcp_servers: [database]
+"#
+    .to_string();
+    let config = parse_config(&yaml);
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("done")));
+
+    // Inspect the resolved config
+    let cfg = runner.config();
+
+    // Stage 0 (analyze): should have both servers resolved
+    let analyze = &cfg.stages[0];
+    assert_eq!(analyze.resolved_mcp_servers.len(), 2);
+    assert!(analyze.resolved_mcp_servers.contains_key("database"));
+    assert!(analyze.resolved_mcp_servers.contains_key("api-docs"));
+
+    let db = analyze.resolved_mcp_servers.get("database").unwrap();
+    assert_eq!(db.command, Some("npx".to_string()));
+    assert_eq!(db.args, vec!["-y", "@modelcontextprotocol/server-postgres"]);
+    assert_eq!(db.env.get("DATABASE_URL").unwrap(), "postgresql://localhost/mydb");
+
+    let api = analyze.resolved_mcp_servers.get("api-docs").unwrap();
+    assert_eq!(api.url, Some("https://api-docs.example.com/mcp".to_string()));
+    assert!(api.command.is_none());
+
+    // Stage 1 (implement): should have only database resolved
+    let implement = &cfg.stages[1];
+    assert_eq!(implement.resolved_mcp_servers.len(), 1);
+    assert!(implement.resolved_mcp_servers.contains_key("database"));
+    assert!(!implement.resolved_mcp_servers.contains_key("api-docs"));
+}
+
+#[tokio::test]
+async fn test_mcp_servers_empty_when_not_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = single_stage_yaml();
+    let config = parse_config(&yaml);
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let runner = PipelineRunner::new(config, yaml, dir.path().to_path_buf(), tx)
+        .with_runtime(Box::new(MockRuntime::new("done")));
+
+    let cfg = runner.config();
+    assert!(cfg.stages[0].resolved_mcp_servers.is_empty());
+    assert!(cfg.stages[0].mcp_servers.is_empty());
+}

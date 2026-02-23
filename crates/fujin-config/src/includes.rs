@@ -33,6 +33,7 @@ fn resolve_recursive(
     let includes = std::mem::take(&mut config.includes);
     let mut all_included_stages = Vec::new();
     let mut merged_retry_groups = config.retry_groups.clone();
+    let mut merged_mcp_servers = config.mcp_servers.clone();
 
     for include in &includes {
         // 1. Resolve source path
@@ -85,6 +86,11 @@ fn resolve_recursive(
             );
         }
 
+        // Merge MCP servers (prefixed)
+        for (name, cfg) in &child_config.mcp_servers {
+            merged_mcp_servers.insert(format!("{}.{name}", include.alias), cfg.clone());
+        }
+
         all_included_stages.extend(processed);
     }
 
@@ -94,6 +100,7 @@ fn resolve_recursive(
 
     config.stages = final_stages;
     config.retry_groups = merged_retry_groups;
+    config.mcp_servers = merged_mcp_servers;
 
     Ok(config)
 }
@@ -169,6 +176,15 @@ fn process_include(
         if let Some(ref group) = stage.retry_group {
             stage.retry_group = Some(format!("{alias}.{group}"));
         }
+
+        // Prefix mcp_servers references that match child server names
+        stage.mcp_servers = stage.mcp_servers.iter().map(|name| {
+            if child_config.mcp_servers.contains_key(name.as_str()) {
+                format!("{alias}.{name}")
+            } else {
+                name.clone()
+            }
+        }).collect();
 
         // Prefix when.stage (if it references a child stage)
         if let Some(ref mut when) = stage.when {
@@ -1086,5 +1102,171 @@ stages: []
             deploy.commands.as_ref().unwrap()[0],
             "deploy --env=production"
         );
+    }
+
+    #[test]
+    fn test_mcp_server_prefixing() {
+        let dir = setup_temp_dir();
+
+        fs::write(
+            dir.path().join("child.yaml"),
+            r#"
+name: child
+mcp_servers:
+  database:
+    command: npx
+    args: [-y, "@modelcontextprotocol/server-postgres"]
+    env:
+      DATABASE_URL: postgresql://localhost/mydb
+stages:
+  - id: build
+    name: Build
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+    mcp_servers: [database]
+"#,
+        )
+        .unwrap();
+
+        let parent_yaml = r#"
+name: parent
+mcp_servers:
+  api-docs:
+    url: https://api-docs.example.com/mcp
+includes:
+  - source: child.yaml
+    as: ch
+stages:
+  - id: s1
+    name: S1
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+    mcp_servers: [api-docs]
+"#;
+
+        let config = PipelineConfig::from_yaml(parent_yaml).unwrap();
+        let resolved = resolve_includes(config, dir.path()).unwrap();
+
+        // Parent-level MCP servers: api-docs (original) + ch.database (prefixed from child)
+        assert!(resolved.mcp_servers.contains_key("api-docs"));
+        assert!(resolved.mcp_servers.contains_key("ch.database"));
+        assert!(!resolved.mcp_servers.contains_key("database"));
+
+        // Parent stage keeps its original reference
+        assert_eq!(resolved.stages[0].mcp_servers, vec!["api-docs"]);
+
+        // Child stage reference is prefixed
+        let build = resolved.stages.iter().find(|s| s.id == "ch.build").unwrap();
+        assert_eq!(build.mcp_servers, vec!["ch.database"]);
+
+        // Verify the prefixed server config is correct
+        let db = resolved.mcp_servers.get("ch.database").unwrap();
+        assert_eq!(db.command, Some("npx".to_string()));
+        assert_eq!(db.args, vec!["-y", "@modelcontextprotocol/server-postgres"]);
+        assert_eq!(db.env.get("DATABASE_URL").unwrap(), "postgresql://localhost/mydb");
+    }
+
+    #[test]
+    fn test_mcp_server_nested_prefixing() {
+        let dir = setup_temp_dir();
+
+        fs::write(
+            dir.path().join("leaf.yaml"),
+            r#"
+name: leaf
+mcp_servers:
+  db:
+    command: npx
+stages:
+  - id: work
+    name: Work
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+    mcp_servers: [db]
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            dir.path().join("mid.yaml"),
+            r#"
+name: mid
+includes:
+  - source: leaf.yaml
+    as: leaf
+stages:
+  - id: setup
+    name: Setup
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+"#,
+        )
+        .unwrap();
+
+        let parent_yaml = r#"
+name: parent
+includes:
+  - source: mid.yaml
+    as: mid
+stages:
+  - id: root
+    name: Root
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+
+        let config = PipelineConfig::from_yaml(parent_yaml).unwrap();
+        let resolved = resolve_includes(config, dir.path()).unwrap();
+
+        // Nested MCP server should be double-prefixed
+        assert!(resolved.mcp_servers.contains_key("mid.leaf.db"));
+
+        let work = resolved.stages.iter().find(|s| s.id == "mid.leaf.work").unwrap();
+        assert_eq!(work.mcp_servers, vec!["mid.leaf.db"]);
+    }
+
+    #[test]
+    fn test_mcp_server_external_reference_not_prefixed() {
+        let dir = setup_temp_dir();
+
+        // Child references a server that is NOT defined in the child pipeline
+        // (it's expected to be defined in the parent). The reference should not be prefixed.
+        fs::write(
+            dir.path().join("child.yaml"),
+            r#"
+name: child
+stages:
+  - id: build
+    name: Build
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+    mcp_servers: [parent_db]
+"#,
+        )
+        .unwrap();
+
+        let parent_yaml = r#"
+name: parent
+mcp_servers:
+  parent_db:
+    command: npx
+includes:
+  - source: child.yaml
+    as: ch
+stages: []
+"#;
+
+        let config = PipelineConfig::from_yaml(parent_yaml).unwrap();
+        let resolved = resolve_includes(config, dir.path()).unwrap();
+
+        // parent_db is NOT in child's mcp_servers, so it should NOT be prefixed
+        let build = resolved.stages.iter().find(|s| s.id == "ch.build").unwrap();
+        assert_eq!(build.mcp_servers, vec!["parent_db"]);
     }
 }
