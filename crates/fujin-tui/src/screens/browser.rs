@@ -1,6 +1,9 @@
 use crate::discovery::DiscoveredPipeline;
 use crate::theme;
+use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent};
+use fujin_core::checkpoint::{hash_config, CheckpointManager};
+use fujin_core::paths::exports_dir;
 use fujin_core::util::truncate_chars;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -9,6 +12,18 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
+
+/// Cached exports data for the currently selected pipeline.
+struct CachedExports {
+    /// Index of the pipeline these exports belong to.
+    pipeline_index: usize,
+    /// Run ID the exports were loaded from.
+    run_id: String,
+    /// Timestamp of the run.
+    updated_at: DateTime<Utc>,
+    /// Exported variables grouped by stage: (stage_name, Vec<(key, value)>).
+    stages: Vec<(String, Vec<(String, String)>)>,
+}
 
 /// State for the pipeline browser screen.
 pub struct BrowserState {
@@ -20,6 +35,8 @@ pub struct BrowserState {
     pub detail_scroll: u16,
     /// Total content height of the details panel.
     detail_content_height: usize,
+    /// Cached exports for the currently selected pipeline.
+    cached_exports: Option<CachedExports>,
 }
 
 /// Actions the browser can request from the app.
@@ -43,17 +60,21 @@ impl BrowserState {
         if !pipelines.is_empty() {
             list_state.select(Some(0));
         }
-        Self {
+        let mut state = Self {
             pipelines,
             list_state,
             detail_scroll: 0,
             detail_content_height: 0,
-        }
+            cached_exports: None,
+        };
+        state.load_exports_for_selected();
+        state
     }
 
     /// Replace the pipeline list (e.g., after refresh).
     pub fn set_pipelines(&mut self, pipelines: Vec<DiscoveredPipeline>) {
         self.pipelines = pipelines;
+        self.cached_exports = None;
         if self.pipelines.is_empty() {
             self.list_state.select(None);
         } else {
@@ -61,6 +82,7 @@ impl BrowserState {
             self.list_state
                 .select(Some(idx.min(self.pipelines.len() - 1)));
         }
+        self.load_exports_for_selected();
     }
 
     /// Handle a key event. Returns the resulting action.
@@ -72,11 +94,13 @@ impl BrowserState {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(-1);
                 self.detail_scroll = 0;
+                self.load_exports_for_selected();
                 BrowserAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_selection(1);
                 self.detail_scroll = 0;
+                self.load_exports_for_selected();
                 BrowserAction::None
             }
             KeyCode::Char('G') => {
@@ -84,6 +108,7 @@ impl BrowserState {
                 if !self.pipelines.is_empty() {
                     self.list_state.select(Some(self.pipelines.len() - 1));
                     self.detail_scroll = 0;
+                    self.load_exports_for_selected();
                 }
                 BrowserAction::None
             }
@@ -91,6 +116,7 @@ impl BrowserState {
                 // Jump to first (gg emulation: single g goes to top)
                 self.list_state.select(Some(0));
                 self.detail_scroll = 0;
+                self.load_exports_for_selected();
                 BrowserAction::None
             }
             KeyCode::PageUp => {
@@ -130,20 +156,130 @@ impl BrowserState {
             .and_then(|i| self.pipelines.get(i))
     }
 
+    /// Load exports for the currently selected pipeline from disk.
+    fn load_exports_for_selected(&mut self) {
+        let Some(idx) = self.list_state.selected() else {
+            self.cached_exports = None;
+            return;
+        };
+
+        // Bail if we already have exports cached for this pipeline
+        if self
+            .cached_exports
+            .as_ref()
+            .is_some_and(|c| c.pipeline_index == idx)
+        {
+            return;
+        }
+
+        self.cached_exports = None;
+
+        let Some(pipeline) = self.pipelines.get(idx) else {
+            return;
+        };
+
+        // Check if any stage has exports configured
+        let has_exports = pipeline.config.stages.iter().any(|s| s.exports.is_some());
+        if !has_exports {
+            return;
+        }
+
+        let config_hash = hash_config(&pipeline.raw_yaml);
+        let Ok(cwd) = std::env::current_dir() else {
+            return;
+        };
+
+        let manager = CheckpointManager::new(&cwd);
+        let Ok(summaries) = manager.list() else {
+            return;
+        };
+
+        // Find the most recent checkpoint with a matching config hash
+        for summary in &summaries {
+            let Ok(Some(cp)) = manager.load(&summary.run_id) else {
+                continue;
+            };
+            if cp.config_hash != config_hash {
+                continue;
+            }
+
+            // Found a matching checkpoint — read exports
+            let exports_base = exports_dir(&cwd).join(&cp.run_id);
+            let mut stages = Vec::new();
+
+            for stage in &pipeline.config.stages {
+                if stage.exports.is_none() {
+                    continue;
+                }
+                let export_path = exports_base.join(format!("{}.json", stage.id));
+                let Ok(json_str) = std::fs::read_to_string(&export_path) else {
+                    continue;
+                };
+                let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                    &json_str,
+                ) else {
+                    continue;
+                };
+
+                let pairs: Vec<(String, String)> = map
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let val = match &v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        (k, val)
+                    })
+                    .collect();
+
+                if !pairs.is_empty() {
+                    stages.push((stage.name.clone(), pairs));
+                }
+            }
+
+            self.cached_exports = Some(CachedExports {
+                pipeline_index: idx,
+                run_id: cp.run_id,
+                updated_at: cp.updated_at,
+                stages,
+            });
+            return;
+        }
+    }
+
     /// Render the browser screen.
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2), // header
-                Constraint::Min(0),    // main content
-                Constraint::Length(2), // footer
-            ])
-            .split(area);
+        let exports_height = self.exports_panel_height();
+
+        let chunks = if exports_height > 0 {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2),              // header
+                    Constraint::Min(0),                 // main content
+                    Constraint::Length(exports_height),  // exports panel
+                    Constraint::Length(2),              // footer
+                ])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2), // header
+                    Constraint::Min(0),    // main content
+                    Constraint::Length(2), // footer
+                ])
+                .split(area)
+        };
 
         self.render_header(frame, chunks[0]);
         self.render_body(frame, chunks[1]);
-        self.render_footer(frame, chunks[2]);
+        if exports_height > 0 {
+            self.render_exports(frame, chunks[2]);
+            self.render_footer(frame, chunks[3]);
+        } else {
+            self.render_footer(frame, chunks[2]);
+        }
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -426,6 +562,73 @@ impl BrowserState {
                 &mut scrollbar_state,
             );
         }
+    }
+
+    /// Compute the height for the exports panel (0 if hidden).
+    fn exports_panel_height(&self) -> u16 {
+        let Some(ref cached) = self.cached_exports else {
+            return 0;
+        };
+        if cached.stages.is_empty() {
+            return 0;
+        }
+        // 2 for block border, 1 per stage label, 1 per key-value pair
+        let content_lines: usize = cached
+            .stages
+            .iter()
+            .map(|(_, pairs)| 1 + pairs.len())
+            .sum();
+        // +2 for top/bottom border
+        let total = (content_lines + 2) as u16;
+        total.min(10) // cap at 10 lines
+    }
+
+    fn render_exports(&self, frame: &mut Frame, area: Rect) {
+        let Some(ref cached) = self.cached_exports else {
+            return;
+        };
+
+        let subtitle = format!(
+            " {} \u{2502} {} ",
+            &cached.run_id[..8.min(cached.run_id.len())],
+            cached.updated_at.format("%Y-%m-%d %H:%M"),
+        );
+
+        let block = Block::default()
+            .title(" Exports ")
+            .title_bottom(Line::from(subtitle).right_aligned())
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(theme::BORDER));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (stage_name, pairs) in &cached.stages {
+            lines.push(Line::from(Span::styled(
+                stage_name.clone(),
+                Style::default()
+                    .fg(theme::TEXT_MUTED)
+                    .add_modifier(Modifier::DIM),
+            )));
+            for (key, value) in pairs {
+                let display_val = truncate_chars(value, 60);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {key}"),
+                        Style::default().fg(theme::TEXT_SECONDARY),
+                    ),
+                    Span::styled(" = ", Style::default().fg(theme::TEXT_MUTED)),
+                    Span::styled(
+                        format!("\"{display_val}\""),
+                        Style::default().fg(theme::TEXT_PRIMARY),
+                    ),
+                ]));
+            }
+        }
+
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, inner);
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {

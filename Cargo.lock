@@ -539,10 +539,12 @@ name = "fujin-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crossterm",
  "fujin-config",
  "fujin-core",
  "ratatui",
+ "serde_json",
  "serde_yml",
  "tokio",
 ]

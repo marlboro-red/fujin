@@ -263,7 +263,7 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 /// Hash a config string for change detection.
-fn hash_config(config_yaml: &str) -> String {
+pub fn hash_config(config_yaml: &str) -> String {
     format!("{:x}", Sha256::digest(config_yaml.as_bytes()))
 }
 

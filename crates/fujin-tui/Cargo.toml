@@ -8,6 +8,8 @@ fujin-core = { workspace = true }
 fujin-config = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 anyhow = { workspace = true }
+chrono = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+serde_json = { workspace = true }
 serde_yml = { workspace = true }
