@@ -53,7 +53,7 @@ fujin setup
 fujin init --template code-and-docs -o pipeline.yaml
 
 # Edit the config to describe your project
-$EDITOR pipeline.yaml
+fujin edit pipeline.yaml
 
 # Validate it
 fujin validate -c pipeline.yaml
@@ -505,6 +505,16 @@ Options:
 ```
 
 Templates are loaded from the data directory first (user-customizable), then from built-in defaults. Run `fujin setup` to install built-in templates locally.
+
+### `fujin edit`
+
+Open a pipeline config in VS Code.
+
+```
+fujin edit <NAME|PATH>
+```
+
+Accepts a config name (`fujin edit simple.yaml`) or a path. When given a filename, it searches the current directory first, then the global configs directory.
 
 ### `fujin setup`
 

@@ -17,7 +17,7 @@ Fujin discovers pipeline configs from two locations:
 | Current directory | `./*.yaml` |
 | Global configs dir | macOS: `~/Library/Application Support/fujin/configs/`<br>Linux: `~/.local/share/fujin/configs/`<br>Windows: `%LOCALAPPDATA%/fujin/configs/` |
 
-Pipelines in the global configs directory appear in the TUI browser automatically. Use `fujin init` to scaffold a new config there, or `fujin init --local` to write it to the current directory.
+Pipelines in the global configs directory appear in the TUI browser automatically. Use `fujin init` to scaffold a new config there, or `fujin init --local` to write it to the current directory. Use `fujin edit <name>` to open a config in VS Code.
 
 You can also run any pipeline by path:
 
