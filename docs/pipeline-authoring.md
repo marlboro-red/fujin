@@ -4,7 +4,7 @@ This document covers everything you need to know to create fujin pipeline config
 
 ## Overview
 
-A fujin pipeline is a YAML file that defines a set of **stages**. Each stage invokes an agent with a specific prompt, model, and set of tools. By default, stages execute sequentially — each stage implicitly depends on the one before it. With `depends_on`, you can declare explicit dependencies so that independent stages run in parallel. The output of upstream stages feeds into downstream stages through automatic summarization and file change tracking. Agents always run in the directory where `fujin` was invoked.
+A fujin pipeline is a YAML file that defines a set of **stages**. Each stage invokes an agent with a specific prompt, model, and set of tools. By default, stages execute sequentially — each stage implicitly depends on the one before it. With `dependencies`, you can declare explicit dependencies so that independent stages run in parallel. The output of upstream stages feeds into downstream stages through automatic summarization and file change tracking. Agents always run in the directory where `fujin` was invoked.
 
 Fujin supports multiple agent runtimes — Claude Code (default) and GitHub Copilot CLI — which can be configured per-pipeline or per-stage.
 
@@ -48,7 +48,7 @@ retry_groups:                      # optional, default: {}
 includes:                          # optional, default: []
   - source: backend.yaml
     as: be
-    depends_on: [analyze]
+    dependencies: [analyze]
     vars:
       db_url: "{{db_url}}"
 stages:                            # REQUIRED — at least one stage
@@ -107,7 +107,7 @@ Import stages from other pipeline files. Each include loads a pipeline YAML, pre
 includes:
   - source: backend.yaml           # path relative to this file
     as: be                          # prefix for included stage IDs
-    depends_on: [analyze]           # wires included root stages to parent
+    dependencies: [analyze]           # wires included root stages to parent
     vars:                           # variables passed into the include
       db_url: "prod-db.example.com"
 ```
@@ -116,7 +116,7 @@ includes:
 |-------|------|---------|-------------|
 | `source` | string | *required* | Path to the pipeline YAML file (relative to the parent file) |
 | `as` | string | *required* | Prefix alias for stage IDs. Must be alphanumeric, underscore, or hyphen. Must be unique. |
-| `depends_on` | list | `[]` | Parent stages that included root stages depend on |
+| `dependencies` | list | `[]` | Parent stages that included root stages depend on |
 | `vars` | map | `{}` | Variables passed into the included pipeline (override its defaults) |
 
 Included pipelines can themselves contain `includes` (nested includes). Prefixes stack: if `backend.yaml` includes `database.yaml` as `db`, and you include `backend.yaml` as `be`, the database stages get prefixed as `be.db.migrate`.
@@ -127,7 +127,7 @@ See the **[Pipeline Includes Guide](guides/pipeline-includes.md)** for detailed 
 
 #### `stages` (required, list)
 
-An ordered list of stage configurations. By default stages execute top-to-bottom, but stages with `depends_on` can run in parallel when their dependencies are satisfied. The pipeline must have at least one stage.
+An ordered list of stage configurations. By default stages execute top-to-bottom, but stages with `dependencies` can run in parallel when their dependencies are satisfied. The pipeline must have at least one stage.
 
 ---
 
@@ -290,14 +290,14 @@ Export files are stored in the platform data directory (not the workspace), so t
 
 If the file doesn't exist or is malformed, a warning is emitted but the pipeline continues — missing variables render as empty strings, matching the existing behavior for undefined template variables.
 
-#### `depends_on` (optional, list of strings)
+#### `dependencies` (optional, list of strings)
 
 Declares explicit stage dependencies. This stage waits for all listed stages to complete before starting. When multiple stages share the same dependency and don't depend on each other, they can run in parallel.
 
 ```yaml
-depends_on: [analyze]                  # waits for "analyze" to complete
-depends_on: [frontend, backend]        # waits for both to complete
-depends_on: []                         # no dependencies — can start immediately
+dependencies: [analyze]                  # waits for "analyze" to complete
+dependencies: [frontend, backend]        # waits for both to complete
+dependencies: []                         # no dependencies — can start immediately
 ```
 
 | Value | Behavior |
@@ -306,7 +306,7 @@ depends_on: []                         # no dependencies — can start immediate
 | `[stage_a, stage_b]` | Waits for all listed stages to complete |
 | `[]` (empty list) | No dependencies — stage can start immediately, in parallel with the first stage |
 
-When `depends_on` creates a non-linear dependency graph, the pipeline runner uses DAG-based scheduling to execute independent stages concurrently. Pipelines without any `depends_on` are fully backward-compatible and execute sequentially as before.
+When `dependencies` creates a non-linear dependency graph, the pipeline runner uses DAG-based scheduling to execute independent stages concurrently. Pipelines without any `dependencies` are fully backward-compatible and execute sequentially as before.
 
 See the **[Parallel Stages Guide](guides/parallel-stages.md)** for detailed usage, topology patterns, and context passing behavior.
 
@@ -377,7 +377,7 @@ These are automatically injected by fujin and don't need to be defined in `varia
 
 | Variable | Available in | Description |
 |----------|-------------|-------------|
-| `{{prior_summary}}` | Stage 2+ | Summarized output from parent stages. In sequential pipelines, this is the previous stage. In DAG pipelines, it combines summaries from all direct `depends_on` parents. |
+| `{{prior_summary}}` | Stage 2+ | Summarized output from parent stages. In sequential pipelines, this is the previous stage. In DAG pipelines, it combines summaries from all direct `dependencies` parents. |
 | `{{artifact_list}}` | Stage 2+ | Newline-separated list of file paths changed by parent stages (union of all parents in DAG pipelines) |
 | `{{all_artifacts}}` | Stage 2+ | Full content of files changed by parent stages, formatted as `=== path ===\n<content>` blocks |
 | `{{stages.<id>.summary}}` | After stage `<id>` completes | Summary of a specific completed stage, referenced by its `id` |
@@ -450,7 +450,7 @@ When a pipeline has multiple stages, fujin automatically passes context from ups
 
 After each stage completes, its full text output is summarized using the configured `summarizer` model. The summary is available as `{{prior_summary}}` in downstream stages.
 
-In a **sequential pipeline**, `{{prior_summary}}` contains the summary of the immediately preceding stage. In a **DAG pipeline** (using `depends_on`), it contains the combined summaries of all direct parent stages, joined with `---` separators. For DAG pipelines, prefer `{{stages.<id>.summary}}` for unambiguous references.
+In a **sequential pipeline**, `{{prior_summary}}` contains the summary of the immediately preceding stage. In a **DAG pipeline** (using `dependencies`), it contains the combined summaries of all direct parent stages, joined with `---` separators. For DAG pipelines, prefer `{{stages.<id>.summary}}` for unambiguous references.
 
 ### 2. Shared directory
 
@@ -864,7 +864,7 @@ stages:
       - "npm test"
 ```
 
-### Parallel stages with `depends_on`
+### Parallel stages with `dependencies`
 
 A pipeline where frontend and backend work happens in parallel:
 
@@ -886,7 +886,7 @@ stages:
 
   - id: frontend
     name: Build Frontend
-    depends_on: [plan]
+    dependencies: [plan]
     system_prompt: "You are a React developer."
     user_prompt: |
       Plan: {{stages.plan.summary}}
@@ -895,7 +895,7 @@ stages:
 
   - id: backend
     name: Build Backend
-    depends_on: [plan]
+    dependencies: [plan]
     system_prompt: "You are a backend developer."
     user_prompt: |
       Plan: {{stages.plan.summary}}
@@ -904,13 +904,13 @@ stages:
 
   - id: integrate
     name: Integration Tests
-    depends_on: [frontend, backend]
+    dependencies: [frontend, backend]
     commands:
       - "npm test 2>&1"
 
   - id: review
     name: Code Review
-    depends_on: [integrate]
+    dependencies: [integrate]
     model: "claude-opus-4-6"
     system_prompt: "You are a code reviewer."
     user_prompt: |
@@ -1067,7 +1067,7 @@ Fujin validates your pipeline config before execution. The following rules are e
 - Include `source` must not be empty
 - Include `as` alias must not be empty and must be a valid identifier (alphanumeric, underscore, hyphen)
 - Include aliases must be unique
-- Include `depends_on` must reference stages defined in the parent's `stages`
+- Include `dependencies` must reference stages defined in the parent's `stages`
 - Include source file must exist and be a valid pipeline config
 - Circular includes are not allowed
 - All stage `id` values must be unique
@@ -1083,11 +1083,11 @@ Fujin validates your pipeline config before execution. The following rules are e
 - A retry group must have at least 2 stages (or use a `verify` agent)
 - `verify.system_prompt` and `verify.user_prompt` must not be empty
 - `timeout_secs` must be greater than 0 (if set)
-- `depends_on` must reference defined stage IDs (no self-references)
-- `depends_on` must not create circular dependencies
+- `dependencies` must reference defined stage IDs (no self-references)
+- `dependencies` must not create circular dependencies
 - `when.stage` must be a direct or transitive dependency of the current stage
 - `on_branch` stage references must be transitive dependencies of the current stage
-- Non-first stages in a retry group cannot `depends_on` stages outside the group
+- Non-first stages in a retry group cannot `dependencies` stages outside the group
 
 **Warnings** (reported but don't prevent execution):
 - Unknown tool names in `allowed_tools` (valid: `read`, `write`, `bash`, `edit`, `glob`, `grep`, `notebook`)

@@ -235,7 +235,7 @@ When a stage has `commands`, the agent-specific fields (`system_prompt`, `user_p
 
 ### Parallel Stages
 
-By default, stages execute sequentially — each stage implicitly depends on the previous one. The `depends_on` field lets you declare explicit dependencies so that independent stages can run in parallel:
+By default, stages execute sequentially — each stage implicitly depends on the previous one. The `dependencies` field lets you declare explicit dependencies so that independent stages can run in parallel:
 
 ```yaml
 stages:
@@ -247,21 +247,21 @@ stages:
 
   - id: frontend
     name: Build Frontend
-    depends_on: [analyze]
+    dependencies: [analyze]
     system_prompt: "You are a frontend developer."
     user_prompt: "Plan: {{stages.analyze.summary}}. Build the UI."
     allowed_tools: ["read", "write", "bash"]
 
   - id: backend
     name: Build Backend
-    depends_on: [analyze]
+    dependencies: [analyze]
     system_prompt: "You are a backend developer."
     user_prompt: "Plan: {{stages.analyze.summary}}. Build the API."
     allowed_tools: ["read", "write", "bash"]
 
   - id: integrate
     name: Integration Tests
-    depends_on: [frontend, backend]
+    dependencies: [frontend, backend]
     commands:
       - "npm test 2>&1"
 ```
@@ -270,11 +270,11 @@ This creates a diamond dependency graph — `frontend` and `backend` run in para
 
 | Config | Behavior |
 |--------|----------|
-| `depends_on` absent | Implicitly depends on the previous stage (sequential) |
-| `depends_on: [a, b]` | Waits for all listed stages to complete |
-| `depends_on: []` | No dependencies — starts immediately |
+| `dependencies` absent | Implicitly depends on the previous stage (sequential) |
+| `dependencies: [a, b]` | Waits for all listed stages to complete |
+| `dependencies: []` | No dependencies — starts immediately |
 
-Existing pipelines without `depends_on` work exactly as before. See the **[Parallel Stages Guide](docs/guides/parallel-stages.md)** for fan-out/fan-in topologies, context passing in DAG pipelines, and interaction with retry groups and branching.
+Existing pipelines without `dependencies` work exactly as before. See the **[Parallel Stages Guide](docs/guides/parallel-stages.md)** for fan-out/fan-in topologies, context passing in DAG pipelines, and interaction with retry groups and branching.
 
 ### Conditional Execution
 
@@ -408,7 +408,7 @@ See the [Pipeline Authoring Guide](docs/pipeline-authoring.md) for the full fiel
 | `name` | string | *required* | Human-readable name |
 | `timeout_secs` | integer | — | Stage timeout in seconds (no limit if unset) |
 | `commands` | list | — | Shell commands to run (makes this a command stage) |
-| `depends_on` | list | — | Explicit dependencies (see [Parallel Stages](#parallel-stages)). Absent = depends on previous stage; `[]` = no dependencies |
+| `dependencies` | list | — | Explicit dependencies (see [Parallel Stages](#parallel-stages)). Absent = depends on previous stage; `[]` = no dependencies |
 
 **Agent stage fields** (ignored when `commands` is set):
 
@@ -535,7 +535,7 @@ Checkpoint commands operate on `.fujin/checkpoints/` in the current directory.
 
 - **[Getting Started](docs/guides/getting-started.md)** — Create your first pipeline from scratch
 - **[Multi-Stage Pipelines](docs/guides/multi-stage-pipelines.md)** — Context passing, model selection, and stage composition
-- **[Parallel Stages](docs/guides/parallel-stages.md)** — Run independent stages concurrently with `depends_on`
+- **[Parallel Stages](docs/guides/parallel-stages.md)** — Run independent stages concurrently with `dependencies`
 - **[Branching and Conditions](docs/guides/branching-and-conditions.md)** — Conditional execution with `when` and `branch`/`on_branch`
 - **[Exports and Dynamic Variables](docs/guides/exports-and-dynamic-variables.md)** — Let agents set variables at runtime
 - **[Retry Groups](docs/guides/retry-groups.md)** — Automatic retry-on-failure with verification agents

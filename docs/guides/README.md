@@ -14,7 +14,7 @@ Design effective stage sequences. Covers context passing (`{{prior_summary}}`, a
 Make stages conditional. Covers `when` (regex gating), `branch`/`on_branch` (AI-driven routing), convergence points, and combining both mechanisms.
 
 ### [Parallel Stages](parallel-stages.md)
-Run independent stages concurrently with `depends_on`. Covers DAG-based scheduling, dependency topologies (fan-out, fan-in, diamond), context passing from multiple parents, and interaction with retry groups, branching, and checkpoints.
+Run independent stages concurrently with `dependencies`. Covers DAG-based scheduling, dependency topologies (fan-out, fan-in, diamond), context passing from multiple parents, and interaction with retry groups, branching, and checkpoints.
 
 ### [Pipeline Includes](pipeline-includes.md)
 Compose pipelines from reusable building blocks with `includes`. Covers importing stages from other files, auto-prefixing IDs, wiring dependencies, passing variables, nested includes, runtime propagation, and retry group prefixing.
