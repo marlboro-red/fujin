@@ -70,6 +70,8 @@ pub struct StageInfo {
     pub verifying: bool,
     /// Retry group this stage belongs to (if any).
     pub retry_group: Option<String>,
+    /// Parallel group this stage belongs to (if any).
+    pub parallel_group: Option<usize>,
     /// Branch selection info (if this stage ran a branch classifier).
     pub branch_info: Option<(String, Vec<String>)>,
     /// Whether the stage is running in an isolated git worktree.
@@ -141,12 +143,12 @@ impl ExecutionState {
         pipeline_name: String,
         run_id: String,
         total_stages: usize,
-        stage_names: Vec<(String, String, String, Option<String>)>,
+        stage_names: Vec<(String, String, String, Option<String>, Option<usize>)>,
     ) -> Self {
         let stages = stage_names
             .into_iter()
             .enumerate()
-            .map(|(i, (id, name, model, retry_group))| StageInfo {
+            .map(|(i, (id, name, model, retry_group, parallel_group))| StageInfo {
                 index: i,
                 id,
                 name,
@@ -158,6 +160,7 @@ impl ExecutionState {
                 prior_summary: None,
                 verifying: false,
                 retry_group,
+                parallel_group,
                 branch_info: None,
                 isolated: false,
                 exported_vars: Vec::new(),
@@ -284,6 +287,7 @@ impl ExecutionState {
                         prior_summary: None,
                         verifying: false,
                         retry_group: None,
+                        parallel_group: None,
                         branch_info: None,
                         isolated: false,
                         exported_vars: Vec::new(),
@@ -836,11 +840,11 @@ impl ExecutionState {
         frame.render_widget(block, area);
 
         // Pre-compute retry group ranges: group_name -> (first_idx, last_idx)
-        let mut group_ranges: std::collections::HashMap<&str, (usize, usize)> =
+        let mut retry_group_ranges: std::collections::HashMap<&str, (usize, usize)> =
             std::collections::HashMap::new();
         for (i, stage) in self.stages.iter().enumerate() {
             if let Some(ref g) = stage.retry_group {
-                group_ranges
+                retry_group_ranges
                     .entry(g.as_str())
                     .and_modify(|(first, last)| {
                         if i < *first { *first = i; }
@@ -850,41 +854,74 @@ impl ExecutionState {
             }
         }
 
+        // Pre-compute parallel group ranges: group_id -> (first_idx, last_idx)
+        let mut parallel_group_ranges: std::collections::HashMap<usize, (usize, usize)> =
+            std::collections::HashMap::new();
+        for (i, stage) in self.stages.iter().enumerate() {
+            if let Some(g) = stage.parallel_group {
+                parallel_group_ranges
+                    .entry(g)
+                    .and_modify(|(first, last)| {
+                        if i < *first { *first = i; }
+                        if i > *last { *last = i; }
+                    })
+                    .or_insert((i, i));
+            }
+        }
+
+        // Determine the visual group for each stage: retry takes precedence
+        // VisualGroup: None, Some(("retry", group_name)) or Some(("parallel", group_id_str))
+        let visual_groups: Vec<Option<(&str, String)>> = self.stages.iter().map(|s| {
+            if s.retry_group.is_some() {
+                Some(("retry", s.retry_group.as_ref().unwrap().clone()))
+            } else if let Some(pg) = s.parallel_group {
+                Some(("parallel", pg.to_string()))
+            } else {
+                None
+            }
+        }).collect();
+
         // Compute the width needed for stage numbers
         let num_width = self.total_stages.to_string().len();
 
         let mut lines: Vec<Line> = Vec::new();
-        let mut prev_group: Option<&str> = None;
+        let mut prev_visual: Option<(&str, &str)> = None;
 
         for (i, stage) in self.stages.iter().enumerate() {
-            let cur_group = stage.retry_group.as_deref();
+            let cur_visual = visual_groups[i].as_ref().map(|(kind, id)| (*kind, id.as_str()));
 
-            // Emit group header when entering a new retry group
-            if let Some(gname) = cur_group {
-                if cur_group != prev_group {
-                    // Close previous group if transitioning between different groups
-                    if prev_group.is_some() {
-                        lines.push(Line::from(Span::styled(
-                            "  \u{2570}\u{2500}",
-                            Style::default().fg(theme::TEXT_MUTED),
-                        )));
-                    }
-                    let attempt_str = if let Some(&(attempt, max)) = self.retry_attempts.get(gname) {
-                        format!(" (attempt {}/{})", attempt + 1, max)
+            // Emit group header on visual group transitions
+            if cur_visual != prev_visual {
+                // Open new visual group
+                if let Some((kind, id)) = cur_visual {
+                    if kind == "retry" {
+                        let gname = id;
+                        let attempt_str = if let Some(&(attempt, max)) = self.retry_attempts.get(gname) {
+                            format!(" (attempt {}/{})", attempt + 1, max)
+                        } else {
+                            String::new()
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled("  \u{256d}\u{2500} ", Style::default().fg(theme::TEXT_MUTED)),
+                            Span::styled(
+                                format!("{gname}{attempt_str}"),
+                                Style::default().fg(theme::TEXT_MUTED),
+                            ),
+                        ]));
                     } else {
-                        String::new()
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled("  \u{256d}\u{2500} ", Style::default().fg(theme::TEXT_MUTED)),
-                        Span::styled(
-                            format!("{gname}{attempt_str}"),
-                            Style::default().fg(theme::TEXT_MUTED),
-                        ),
-                    ]));
+                        // parallel
+                        lines.push(Line::from(vec![
+                            Span::styled("  \u{256d}\u{2500} ", Style::default().fg(theme::TEXT_MUTED)),
+                            Span::styled(
+                                "parallel",
+                                Style::default().fg(theme::TEXT_MUTED),
+                            ),
+                        ]));
+                    }
                 }
             }
 
-            let in_group = cur_group.is_some();
+            let in_group = cur_visual.is_some();
             let gutter = if in_group { "  \u{2502} " } else { "  " };
 
             let (icon, icon_color, detail) = match &stage.status {
@@ -978,10 +1015,10 @@ impl ExecutionState {
                 Span::styled(model_short, Style::default().fg(model_short_color)),
             ]));
 
-            // Emit verify step + group footer after the last stage in a group
-            if let Some(gname) = cur_group {
-                let is_last_in_group = group_ranges
-                    .get(gname)
+            // Emit verify step + group footer after the last stage in a retry group
+            if let Some(ref gname) = stage.retry_group {
+                let is_last_in_group = retry_group_ranges
+                    .get(gname.as_str())
                     .is_some_and(|&(_, last)| i == last);
                 if is_last_in_group {
                     // Render verify entry for this group
@@ -989,7 +1026,7 @@ impl ExecutionState {
                     let v_bg = if v_selected { theme::SURFACE_HIGHLIGHT } else { ratatui::style::Color::Reset };
                     let v_select_indicator = if v_selected { "\u{25b8}" } else { " " };
 
-                    let (v_icon, v_color, v_detail) = if let Some(vs) = self.verify_states.get(gname) {
+                    let (v_icon, v_color, v_detail) = if let Some(vs) = self.verify_states.get(gname.as_str()) {
                         match vs {
                             VerifyStatus::Pending => ("\u{00b7}", theme::TEXT_MUTED, "pending".to_string()),
                             VerifyStatus::Running { activity_log } => {
@@ -1038,7 +1075,23 @@ impl ExecutionState {
                 }
             }
 
-            prev_group = cur_group;
+            // Emit parallel group footer after the last stage in a parallel group
+            // (only if not in a retry group, since retry takes visual precedence)
+            if stage.retry_group.is_none() {
+                if let Some(pg) = stage.parallel_group {
+                    let is_last_in_group = parallel_group_ranges
+                        .get(&pg)
+                        .is_some_and(|&(_, last)| i == last);
+                    if is_last_in_group {
+                        lines.push(Line::from(Span::styled(
+                            "  \u{2570}\u{2500}",
+                            Style::default().fg(theme::TEXT_MUTED),
+                        )));
+                    }
+                }
+            }
+
+            prev_visual = cur_visual;
         }
 
         let paragraph = Paragraph::new(lines);
@@ -1757,9 +1810,9 @@ mod tests {
             String::new(),
             3,
             vec![
-                ("s0".into(), "Stage 0".into(), String::new(), None),
-                ("s1".into(), "Stage 1".into(), String::new(), None),
-                ("s2".into(), "Stage 2".into(), String::new(), None),
+                ("s0".into(), "Stage 0".into(), String::new(), None, None),
+                ("s1".into(), "Stage 1".into(), String::new(), None, None),
+                ("s2".into(), "Stage 2".into(), String::new(), None, None),
             ],
         )
     }

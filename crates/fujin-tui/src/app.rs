@@ -239,11 +239,61 @@ impl App {
         let workspace_root = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
+        // Compute parallel groups from depends_on
+        let parallel_groups = {
+            use std::collections::HashMap;
+            // Compute effective deps for each stage
+            let effective_deps: Vec<Vec<String>> = config
+                .stages
+                .iter()
+                .enumerate()
+                .map(|(i, s)| match &s.depends_on {
+                    None => {
+                        // Implicit: depends on previous stage
+                        if i > 0 {
+                            vec![config.stages[i - 1].id.clone()]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    Some(deps) => {
+                        let mut sorted = deps.clone();
+                        sorted.sort();
+                        sorted
+                    }
+                })
+                .collect();
+
+            // Group stages by identical effective dependency sets
+            let mut dep_groups: HashMap<Vec<String>, Vec<usize>> = HashMap::new();
+            for (i, deps) in effective_deps.iter().enumerate() {
+                dep_groups.entry(deps.clone()).or_default().push(i);
+            }
+
+            // Assign group indices only to groups with 2+ stages
+            let mut stage_parallel_group: Vec<Option<usize>> = vec![None; config.stages.len()];
+            let mut group_idx = 0usize;
+            // Sort group keys for deterministic ordering
+            let mut keys: Vec<_> = dep_groups.keys().cloned().collect();
+            keys.sort();
+            for key in keys {
+                let members = &dep_groups[&key];
+                if members.len() >= 2 {
+                    for &stage_i in members {
+                        stage_parallel_group[stage_i] = Some(group_idx);
+                    }
+                    group_idx += 1;
+                }
+            }
+            stage_parallel_group
+        };
+
         // Create execution screen — pass model from config so it's visible immediately
-        let stage_names: Vec<(String, String, String, Option<String>)> = config
+        let stage_names: Vec<(String, String, String, Option<String>, Option<usize>)> = config
             .stages
             .iter()
-            .map(|s| (s.id.clone(), s.name.clone(), s.model.clone(), s.retry_group.clone()))
+            .enumerate()
+            .map(|(i, s)| (s.id.clone(), s.name.clone(), s.model.clone(), s.retry_group.clone(), parallel_groups[i]))
             .collect();
         let exec_state = ExecutionState::new(
             config.name.clone(),
