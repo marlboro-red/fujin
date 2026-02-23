@@ -165,8 +165,8 @@ impl ContextBuilder {
     /// - `claude-code`: uses `claude --print --model <model>`
     /// - `copilot-cli`: uses `copilot -p /dev/stdin --model <model>`
     async fn summarize(&self, config: &SummarizerConfig, text: &str) -> CoreResult<String> {
-        if text.trim().is_empty() {
-            return Ok(String::new());
+        if text.trim().is_empty() || config.model.is_empty() {
+            return Ok(text.to_string());
         }
 
         info!(

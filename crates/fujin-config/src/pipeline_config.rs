@@ -32,6 +32,12 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub includes: Vec<IncludeConfig>,
 
+    /// Enable git-worktree isolation for parallel agent stages.
+    /// When `true`, each parallel agent stage runs in its own worktree so
+    /// concurrent file edits don't conflict.  Defaults to `false`.
+    #[serde(default)]
+    pub worktrees: bool,
+
     /// Ordered list of pipeline stages.
     pub stages: Vec<StageConfig>,
 }

@@ -477,6 +477,10 @@ impl PipelineRunner {
 
         // Accumulate variables exported by stages via their `exports` config
         let mut exported_vars: HashMap<String, String> = HashMap::new();
+        // Track which export keys originated from agent (non-command) stages.
+        // Only these are shell-escaped during command template rendering.
+        let mut agent_export_keys: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // Use sequential execution for linear DAGs (backward compat) or DAG scheduler for parallel
         if dag.is_linear() {
@@ -487,6 +491,7 @@ impl PipelineRunner {
                 &mut retry_counts,
                 &mut verify_feedback,
                 &mut exported_vars,
+                &mut agent_export_keys,
                 &mut checkpoint,
             )
             .await?;
@@ -497,6 +502,7 @@ impl PipelineRunner {
                 &mut retry_counts,
                 &mut verify_feedback,
                 &mut exported_vars,
+                &mut agent_export_keys,
                 &mut checkpoint,
             )
             .await?;
@@ -539,6 +545,7 @@ impl PipelineRunner {
         retry_counts: &mut HashMap<String, u32>,
         verify_feedback: &mut HashMap<String, String>,
         exported_vars: &mut HashMap<String, String>,
+        agent_export_keys: &mut std::collections::HashSet<String>,
         checkpoint: &mut crate::checkpoint::Checkpoint,
     ) -> CoreResult<()> {
         let total_stages = self.config.stages.len();
@@ -634,6 +641,7 @@ impl PipelineRunner {
                 retry_counts,
                 verify_feedback,
                 exported_vars,
+                agent_export_keys,
                 checkpoint,
             )
             .await?;
@@ -670,6 +678,7 @@ impl PipelineRunner {
         retry_counts: &mut HashMap<String, u32>,
         verify_feedback: &mut HashMap<String, String>,
         exported_vars: &mut HashMap<String, String>,
+        agent_export_keys: &mut std::collections::HashSet<String>,
         checkpoint: &mut crate::checkpoint::Checkpoint,
     ) -> CoreResult<()> {
         let mut completed: HashSet<String> = checkpoint.completed_ids();
@@ -680,8 +689,9 @@ impl PipelineRunner {
         // to ensure they run sequentially within the group.
         let mut retry_group_in_flight: HashSet<String> = HashSet::new();
 
-        // Worktree isolation for parallel stages
-        let use_worktrees = crate::worktree::is_git_repo(self.workspace.root());
+        // Worktree isolation for parallel stages (opt-in via config)
+        let use_worktrees =
+            self.config.worktrees && crate::worktree::is_git_repo(self.workspace.root());
         let original_head = if use_worktrees {
             Some(crate::worktree::get_head(self.workspace.root())?)
         } else {
@@ -874,7 +884,7 @@ impl PipelineRunner {
 
                 // Snapshot pipeline variables + exported vars for command template rendering
                 let export_keys: std::collections::HashSet<String> =
-                    exported_vars.keys().cloned().collect();
+                    agent_export_keys.clone();
                 let merged_vars = {
                     let mut vars = self.config.variables.clone();
                     for (k, v) in exported_vars.iter() {
@@ -981,6 +991,7 @@ impl PipelineRunner {
                             retry_counts,
                             verify_feedback,
                             exported_vars,
+                            agent_export_keys,
                             checkpoint,
                             pre_artifacts,
                         )
@@ -1168,6 +1179,7 @@ impl PipelineRunner {
         retry_counts: &mut HashMap<String, u32>,
         verify_feedback: &mut HashMap<String, String>,
         exported_vars: &mut HashMap<String, String>,
+        agent_export_keys: &mut std::collections::HashSet<String>,
         checkpoint: &mut crate::checkpoint::Checkpoint,
     ) -> CoreResult<()> {
         let stage_config = &self.config.stages[stage_idx];
@@ -1210,7 +1222,7 @@ impl PipelineRunner {
 
         // Execute stage (command or agent)
         let stage_exec_result = if stage_config.is_command_stage() {
-            self.run_command_stage(stage_idx, stage_config, &stage_start, exported_vars)
+            self.run_command_stage(stage_idx, stage_config, &stage_start, exported_vars, agent_export_keys)
                 .await
         } else {
             let feedback = stage_config
@@ -1244,6 +1256,7 @@ impl PipelineRunner {
                     retry_counts,
                     verify_feedback,
                     exported_vars,
+                    agent_export_keys,
                     checkpoint,
                     None,
                 )
@@ -1285,6 +1298,7 @@ impl PipelineRunner {
         retry_counts: &mut HashMap<String, u32>,
         verify_feedback: &mut HashMap<String, String>,
         exported_vars: &mut HashMap<String, String>,
+        agent_export_keys: &mut std::collections::HashSet<String>,
         checkpoint: &mut crate::checkpoint::Checkpoint,
         pre_artifacts: Option<crate::artifact::ArtifactSet>,
     ) -> CoreResult<()> {
@@ -1368,9 +1382,13 @@ impl PipelineRunner {
 
                             // Only insert keys declared in exports.keys
                             let mut loaded: Vec<(String, String)> = Vec::new();
+                            let is_agent_stage = !stage_config.is_command_stage();
                             for key in &exports.keys {
                                 if let Some(v) = vars.get(key) {
                                     exported_vars.insert(key.clone(), v.clone());
+                                    if is_agent_stage {
+                                        agent_export_keys.insert(key.clone());
+                                    }
                                     loaded.push((key.clone(), v.clone()));
                                 }
                             }
@@ -1673,6 +1691,7 @@ impl PipelineRunner {
         stage_config: &StageConfig,
         stage_start: &Instant,
         exported_vars: &HashMap<String, String>,
+        agent_export_keys: &std::collections::HashSet<String>,
     ) -> CoreResult<(String, Option<crate::stage::TokenUsage>)> {
         let commands = stage_config.commands.as_ref().unwrap();
         let total_commands = commands.len();
@@ -1699,7 +1718,7 @@ impl PipelineRunner {
 
         // Render command templates with pipeline variables + exported variables
         let export_keys: std::collections::HashSet<String> =
-            exported_vars.keys().cloned().collect();
+            agent_export_keys.clone();
         let mut vars = self.config.variables.clone();
         for (k, v) in exported_vars {
             vars.insert(k.clone(), v.clone());
