@@ -1510,4 +1510,167 @@ stages:
         let result = validate(&config);
         assert!(result.is_valid(), "Errors: {:?}", result.errors);
     }
+
+    // --- validate_includes tests ---
+
+    #[test]
+    fn test_validate_includes_empty_source() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+includes:
+  - source: ""
+    as: be
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate_includes(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("source must not be empty")));
+    }
+
+    #[test]
+    fn test_validate_includes_empty_alias() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+includes:
+  - source: backend.yaml
+    as: ""
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate_includes(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("alias must not be empty")));
+    }
+
+    #[test]
+    fn test_validate_includes_invalid_alias_chars() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+includes:
+  - source: backend.yaml
+    as: "be.end"
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate_includes(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("must contain only alphanumeric")));
+    }
+
+    #[test]
+    fn test_validate_includes_duplicate_alias() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+includes:
+  - source: a.yaml
+    as: be
+  - source: b.yaml
+    as: be
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate_includes(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("duplicate alias")));
+    }
+
+    #[test]
+    fn test_validate_includes_depends_on_undefined_parent_stage() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+includes:
+  - source: backend.yaml
+    as: be
+    depends_on: [nonexistent]
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate_includes(&config);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.contains("undefined parent stage 'nonexistent'")));
+    }
+
+    #[test]
+    fn test_validate_includes_valid() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+includes:
+  - source: backend.yaml
+    as: be
+    depends_on: [s1]
+    vars:
+      db_url: "localhost"
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate_includes(&config);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_validate_includes_no_includes() {
+        let config = minimal_config();
+        let result = validate_includes(&config);
+        assert!(result.is_valid());
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_validate_includes_hyphen_and_underscore_alias() {
+        let config = PipelineConfig::from_yaml(
+            r#"
+name: "Test"
+includes:
+  - source: a.yaml
+    as: my-backend
+  - source: b.yaml
+    as: my_frontend
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "x"
+    user_prompt: "y"
+"#,
+        )
+        .unwrap();
+        let result = validate_includes(&config);
+        assert!(result.is_valid(), "Errors: {:?}", result.errors);
+    }
 }

@@ -61,6 +61,9 @@ struct StageExecutionInput {
     /// Pipeline variables merged with currently exported variables.
     /// Used by command stages for template rendering.
     exported_vars: HashMap<String, String>,
+    /// Keys in `exported_vars` that originated from agent exports (LLM output).
+    /// Only these keys are shell-escaped during command template rendering.
+    export_keys: std::collections::HashSet<String>,
     stage_start: Instant,
 
     // --- Context-building data (used by agent stages, built inside spawned task) ---
@@ -867,6 +870,8 @@ impl PipelineRunner {
                 let all_completed = checkpoint.completed_stages.clone();
 
                 // Snapshot pipeline variables + exported vars for command template rendering
+                let export_keys: std::collections::HashSet<String> =
+                    exported_vars.keys().cloned().collect();
                 let merged_vars = {
                     let mut vars = self.config.variables.clone();
                     for (k, v) in exported_vars.iter() {
@@ -884,6 +889,7 @@ impl PipelineRunner {
                     event_tx: self.event_tx.clone(),
                     cancel_flag: self.cancel_flag.clone(),
                     exported_vars: merged_vars,
+                    export_keys,
                     stage_start,
                     context_builder_runtime: self.context_builder.runtime_name.clone(),
                     pipeline_config: self.config.clone(),
@@ -1689,6 +1695,8 @@ impl PipelineRunner {
         });
 
         // Render command templates with pipeline variables + exported variables
+        let export_keys: std::collections::HashSet<String> =
+            exported_vars.keys().cloned().collect();
         let mut vars = self.config.variables.clone();
         for (k, v) in exported_vars {
             vars.insert(k.clone(), v.clone());
@@ -1710,7 +1718,7 @@ impl PipelineRunner {
                 }
 
                 // Render template variables in the command
-                let cmd = render_command_template(cmd_template, &vars)?;
+                let cmd = render_command_template(cmd_template, &vars, &export_keys)?;
 
                 self.emit(PipelineEvent::CommandRunning {
                     stage_index: stage_idx,
@@ -2164,7 +2172,7 @@ async fn execute_command_stage_spawned(
                 }
             }
 
-            let cmd = render_command_template(cmd_template, &vars)?;
+            let cmd = render_command_template(cmd_template, &vars, &input.export_keys)?;
 
             let _ = input.event_tx.send(PipelineEvent::CommandRunning {
                 stage_index: input.stage_idx,
@@ -2316,23 +2324,30 @@ fn shell_escape(s: &str) -> String {
 
 /// Render `{{variable}}` placeholders in a command string.
 ///
-/// Variable values are shell-escaped before interpolation to prevent
-/// command injection (e.g., from agent-exported variables).
+/// Only agent-exported variable values are shell-escaped (to prevent command
+/// injection from LLM-generated content). User-defined pipeline variables
+/// are interpolated as-is so they behave exactly as users expect.
 fn render_command_template(
     template: &str,
     vars: &std::collections::HashMap<String, String>,
+    escape_keys: &std::collections::HashSet<String>,
 ) -> CoreResult<String> {
-    // Shell-escape all variable values to prevent command injection
-    let escaped_vars: std::collections::HashMap<String, String> = vars
+    let merged: std::collections::HashMap<String, String> = vars
         .iter()
-        .map(|(k, v)| (k.clone(), shell_escape(v)))
+        .map(|(k, v)| {
+            if escape_keys.contains(k) {
+                (k.clone(), shell_escape(v))
+            } else {
+                (k.clone(), v.clone())
+            }
+        })
         .collect();
 
     let mut hbs = handlebars::Handlebars::new();
     hbs.register_escape_fn(handlebars::no_escape);
     hbs.register_template_string("cmd", template)
         .map_err(|e| CoreError::TemplateError(format!("Invalid command template: {e}")))?;
-    hbs.render("cmd", &escaped_vars)
+    hbs.render("cmd", &merged)
         .map_err(|e| CoreError::TemplateError(format!("Command template rendering failed: {e}")))
 }
 

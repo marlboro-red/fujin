@@ -755,6 +755,300 @@ stages: []
     }
 
     #[test]
+    fn test_explicit_deps_mixed_internal_external() {
+        let dir = setup_temp_dir();
+
+        fs::write(
+            dir.path().join("child.yaml"),
+            r#"
+name: child
+stages:
+  - id: a
+    name: A
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+  - id: b
+    name: B
+    depends_on: [a, external_stage]
+    system_prompt: "sp"
+    user_prompt: "up"
+"#,
+        )
+        .unwrap();
+
+        let parent_yaml = r#"
+name: parent
+includes:
+  - source: child.yaml
+    as: ch
+stages:
+  - id: external_stage
+    name: External
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+
+        let config = PipelineConfig::from_yaml(parent_yaml).unwrap();
+        let resolved = resolve_includes(config, dir.path()).unwrap();
+
+        let b = resolved.stages.iter().find(|s| s.id == "ch.b").unwrap();
+        let deps = b.depends_on.as_ref().unwrap();
+        // "a" is internal → prefixed to "ch.a", "external_stage" is external → kept as-is
+        assert!(deps.contains(&"ch.a".to_string()));
+        assert!(deps.contains(&"external_stage".to_string()));
+        assert_eq!(deps.len(), 2);
+    }
+
+    #[test]
+    fn test_include_no_depends_on() {
+        let dir = setup_temp_dir();
+
+        fs::write(
+            dir.path().join("child.yaml"),
+            r#"
+name: child
+stages:
+  - id: build
+    name: Build
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+"#,
+        )
+        .unwrap();
+
+        // No depends_on on the include → root stages get empty deps
+        let parent_yaml = r#"
+name: parent
+includes:
+  - source: child.yaml
+    as: ch
+stages:
+  - id: s1
+    name: S1
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+
+        let config = PipelineConfig::from_yaml(parent_yaml).unwrap();
+        let resolved = resolve_includes(config, dir.path()).unwrap();
+
+        let build = resolved.stages.iter().find(|s| s.id == "ch.build").unwrap();
+        // No include-level depends_on → root stage gets empty deps (can start immediately)
+        assert_eq!(build.depends_on, Some(vec![]));
+    }
+
+    #[test]
+    fn test_same_runtime_not_propagated() {
+        let dir = setup_temp_dir();
+
+        fs::write(
+            dir.path().join("child.yaml"),
+            r#"
+name: child
+runtime: claude-code
+stages:
+  - id: build
+    name: Build
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+"#,
+        )
+        .unwrap();
+
+        // Parent also uses claude-code (default)
+        let parent_yaml = r#"
+name: parent
+runtime: claude-code
+includes:
+  - source: child.yaml
+    as: ch
+stages: []
+"#;
+
+        let config = PipelineConfig::from_yaml(parent_yaml).unwrap();
+        let resolved = resolve_includes(config, dir.path()).unwrap();
+
+        // Same runtime → stage.runtime should stay None (inherits from pipeline default)
+        assert_eq!(resolved.stages[0].runtime, None);
+    }
+
+    #[test]
+    fn test_include_config_serde_as_rename() {
+        // Verify that the YAML `as:` field maps to `alias` in IncludeConfig
+        let yaml = r#"
+name: test
+includes:
+  - source: child.yaml
+    as: my_alias
+    depends_on: [s1]
+    vars:
+      key: "value"
+stages:
+  - id: s1
+    name: S1
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+        let config = PipelineConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.includes.len(), 1);
+        assert_eq!(config.includes[0].source, "child.yaml");
+        assert_eq!(config.includes[0].alias, "my_alias");
+        assert_eq!(config.includes[0].depends_on, vec!["s1".to_string()]);
+        assert_eq!(config.includes[0].vars.get("key").unwrap(), "value");
+    }
+
+    #[test]
+    fn test_parent_vars_not_leaked_to_child() {
+        let dir = setup_temp_dir();
+
+        fs::write(
+            dir.path().join("child.yaml"),
+            r#"
+name: child
+stages:
+  - id: build
+    name: Build
+    depends_on: []
+    system_prompt: "parent_secret={{parent_secret}}"
+    user_prompt: "up"
+"#,
+        )
+        .unwrap();
+
+        let parent_yaml = r#"
+name: parent
+variables:
+  parent_secret: "top-secret"
+includes:
+  - source: child.yaml
+    as: ch
+stages: []
+"#;
+
+        let config = PipelineConfig::from_yaml(parent_yaml).unwrap();
+        let resolved = resolve_includes(config, dir.path()).unwrap();
+
+        // Parent variable should NOT be substituted in child prompts
+        // (child doesn't know about parent_secret unless passed via vars)
+        assert_eq!(
+            resolved.stages[0].system_prompt,
+            "parent_secret={{parent_secret}}"
+        );
+    }
+
+    #[test]
+    fn test_include_child_with_no_stages() {
+        let dir = setup_temp_dir();
+
+        fs::write(
+            dir.path().join("empty.yaml"),
+            r#"
+name: empty
+stages: []
+"#,
+        )
+        .unwrap();
+
+        let parent_yaml = r#"
+name: parent
+includes:
+  - source: empty.yaml
+    as: emp
+stages:
+  - id: s1
+    name: S1
+    depends_on: []
+    system_prompt: "sp"
+    user_prompt: "up"
+"#;
+
+        let config = PipelineConfig::from_yaml(parent_yaml).unwrap();
+        let resolved = resolve_includes(config, dir.path()).unwrap();
+
+        // Should just have the parent stage
+        assert_eq!(resolved.stages.len(), 1);
+        assert_eq!(resolved.stages[0].id, "s1");
+    }
+
+    #[test]
+    fn test_include_invalid_child_yaml() {
+        let dir = setup_temp_dir();
+
+        fs::write(
+            dir.path().join("bad.yaml"),
+            "{{{{not valid yaml at all!!!!",
+        )
+        .unwrap();
+
+        let parent_yaml = r#"
+name: parent
+includes:
+  - source: bad.yaml
+    as: bad
+stages: []
+"#;
+
+        let config = PipelineConfig::from_yaml(parent_yaml).unwrap();
+        let result = resolve_includes(config, dir.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("bad.yaml"), "Got: {err}");
+        assert!(err.contains("Failed to parse"), "Got: {err}");
+    }
+
+    #[test]
+    fn test_include_same_file_twice_different_aliases() {
+        let dir = setup_temp_dir();
+
+        fs::write(
+            dir.path().join("service.yaml"),
+            r#"
+name: service
+variables:
+  port: "3000"
+stages:
+  - id: start
+    name: Start
+    depends_on: []
+    system_prompt: "Start on port {{port}}"
+    user_prompt: "up"
+"#,
+        )
+        .unwrap();
+
+        let parent_yaml = r#"
+name: parent
+includes:
+  - source: service.yaml
+    as: api
+    vars:
+      port: "8080"
+  - source: service.yaml
+    as: auth
+    vars:
+      port: "9090"
+stages: []
+"#;
+
+        let config = PipelineConfig::from_yaml(parent_yaml).unwrap();
+        // Note: same file included twice should work since they have different aliases.
+        // The circular detection currently prevents this since the same canonical path
+        // is inserted twice. This test documents the current behavior.
+        let result = resolve_includes(config, dir.path());
+
+        // Current implementation: second include of same file hits circular detection.
+        // This is a known limitation — the same file can't be included twice.
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Circular include") || err.contains("already included"), "Got: {err}");
+    }
+
+    #[test]
     fn test_variable_substitution_in_commands() {
         let dir = setup_temp_dir();
 
