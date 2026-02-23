@@ -87,10 +87,14 @@ enum Commands {
     /// Set up the data directory and install built-in templates
     Setup,
 
-    /// Open a pipeline config in VS Code
+    /// Open a pipeline config in an editor (defaults to VS Code)
     Edit {
         /// Path or name of the pipeline YAML config to edit
         config: String,
+
+        /// Editor command to use (defaults to "code")
+        #[arg(long, default_value = "code")]
+        editor: String,
     },
 
     /// Manage checkpoints
@@ -168,7 +172,7 @@ async fn main() -> Result<()> {
 
         Commands::Setup => cmd_setup(),
 
-        Commands::Edit { config } => cmd_edit(config),
+        Commands::Edit { config, editor } => cmd_edit(config, editor),
 
         Commands::Checkpoint { action } => cmd_checkpoint(action),
     }
@@ -967,20 +971,20 @@ fn cmd_setup() -> Result<()> {
     Ok(())
 }
 
-fn cmd_edit(config: String) -> Result<()> {
+fn cmd_edit(config: String, editor: String) -> Result<()> {
     let path = resolve_config(&config)?;
 
     let mut cmd = if cfg!(windows) {
         let mut c = std::process::Command::new("cmd");
-        c.arg("/C").arg("code");
+        c.arg("/C").arg(&editor);
         c
     } else {
-        std::process::Command::new("code")
+        std::process::Command::new(&editor)
     };
     cmd.arg(&path);
 
     cmd.status()
-        .with_context(|| "Failed to launch VS Code. Is 'code' on your PATH?")?;
+        .with_context(|| format!("Failed to launch editor '{editor}'"))?;
 
     Ok(())
 }

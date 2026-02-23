@@ -508,10 +508,13 @@ Templates are loaded from the data directory first (user-customizable), then fro
 
 ### `fujin edit`
 
-Open a pipeline config in VS Code.
+Open a pipeline config in an editor (defaults to VS Code).
 
 ```
-fujin edit <NAME|PATH>
+fujin edit [OPTIONS] <NAME|PATH>
+
+Options:
+  --editor <COMMAND>  Editor command to use (default: "code")
 ```
 
 Accepts a config name (`fujin edit simple.yaml`) or a path. When given a filename, it searches the current directory first, then the global configs directory.
