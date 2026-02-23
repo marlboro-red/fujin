@@ -347,15 +347,15 @@ When stages don't depend on each other, run them concurrently:
 
 ```yaml
   - id: "lint"
-    depends_on: []
+    dependencies: []
     commands: ["cargo clippy 2>&1"]
 
   - id: "test"
-    depends_on: []
+    dependencies: []
     commands: ["cargo test 2>&1"]
 
   - id: "fix"
-    depends_on: [lint, test]
+    dependencies: [lint, test]
     user_prompt: "Fix all issues from lint and test results..."
 ```
 
@@ -367,7 +367,7 @@ When multiple stages converge, `{{prior_summary}}` merges summaries from all par
 
 ```yaml
   - id: "integrate"
-    depends_on: [frontend, backend]
+    dependencies: [frontend, backend]
     user_prompt: |
       Frontend changes: {{stages.frontend.summary}}
       Backend changes: {{stages.backend.summary}}

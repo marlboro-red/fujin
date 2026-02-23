@@ -1,10 +1,10 @@
-# Parallel Stages with `depends_on`
+# Parallel Stages with `dependencies`
 
 This guide covers how to declare stage dependencies explicitly so that independent stages can run in parallel, reducing total pipeline execution time.
 
 ## Overview
 
-By default, fujin pipelines execute stages sequentially from top to bottom — each stage implicitly depends on the one before it. The `depends_on` field lets you override this behavior, declaring exactly which stages a given stage needs to wait for. When two stages share no dependency relationship, the DAG scheduler can run them concurrently.
+By default, fujin pipelines execute stages sequentially from top to bottom — each stage implicitly depends on the one before it. The `dependencies` field lets you override this behavior, declaring exactly which stages a given stage needs to wait for. When two stages share no dependency relationship, the DAG scheduler can run them concurrently.
 
 ## Quick example
 
@@ -19,7 +19,7 @@ stages:
 
   - id: frontend
     name: Build Frontend
-    depends_on: [analyze]
+    dependencies: [analyze]
     system_prompt: "You are a frontend developer."
     user_prompt: |
       Plan: {{stages.analyze.summary}}
@@ -28,7 +28,7 @@ stages:
 
   - id: backend
     name: Build Backend
-    depends_on: [analyze]
+    dependencies: [analyze]
     system_prompt: "You are a backend developer."
     user_prompt: |
       Plan: {{stages.analyze.summary}}
@@ -37,7 +37,7 @@ stages:
 
   - id: integrate
     name: Integration Tests
-    depends_on: [frontend, backend]
+    dependencies: [frontend, backend]
     commands:
       - "npm test 2>&1"
 ```
@@ -54,19 +54,19 @@ frontend  backend
 
 `frontend` and `backend` both depend on `analyze`, but not on each other — they can run in parallel. `integrate` waits for both to finish.
 
-## How `depends_on` works
+## How `dependencies` works
 
 ### The three cases
 
 | Config | Behavior |
 |--------|----------|
-| `depends_on` absent (default) | Stage implicitly depends on the previous stage in YAML order. This preserves the original sequential behavior. |
-| `depends_on: [stage_a, stage_b]` | Stage waits for all listed stages to complete before starting. |
-| `depends_on: []` | Stage has **no** dependencies and can start immediately (in parallel with the first stage). |
+| `dependencies` absent (default) | Stage implicitly depends on the previous stage in YAML order. This preserves the original sequential behavior. |
+| `dependencies: [stage_a, stage_b]` | Stage waits for all listed stages to complete before starting. |
+| `dependencies: []` | Stage has **no** dependencies and can start immediately (in parallel with the first stage). |
 
 ### Backward compatibility
 
-Pipelines without any `depends_on` fields work exactly as before. The implicit rule — each stage depends on the one above it — produces a linear dependency chain that the runner executes sequentially. No changes are needed to existing configs.
+Pipelines without any `dependencies` fields work exactly as before. The implicit rule — each stage depends on the one above it — produces a linear dependency chain that the runner executes sequentially. No changes are needed to existing configs.
 
 ### DAG construction
 
@@ -90,7 +90,7 @@ stages:
 design → implement → test
 ```
 
-No `depends_on` needed. Each stage implicitly depends on the previous one.
+No `dependencies` needed. Each stage implicitly depends on the previous one.
 
 ### Fan-out
 
@@ -101,13 +101,13 @@ stages:
   - id: analyze
     ...
   - id: frontend
-    depends_on: [analyze]
+    dependencies: [analyze]
     ...
   - id: backend
-    depends_on: [analyze]
+    dependencies: [analyze]
     ...
   - id: docs
-    depends_on: [analyze]
+    dependencies: [analyze]
     ...
 ```
 
@@ -126,13 +126,13 @@ A stage waits for multiple upstream stages to converge:
 ```yaml
 stages:
   - id: a
-    depends_on: []
+    dependencies: []
     ...
   - id: b
-    depends_on: []
+    dependencies: []
     ...
   - id: merge
-    depends_on: [a, b]
+    dependencies: [a, b]
     ...
 ```
 
@@ -153,13 +153,13 @@ stages:
   - id: plan
     ...
   - id: frontend
-    depends_on: [plan]
+    dependencies: [plan]
     ...
   - id: backend
-    depends_on: [plan]
+    dependencies: [plan]
     ...
   - id: review
-    depends_on: [frontend, backend]
+    dependencies: [frontend, backend]
     ...
 ```
 
@@ -173,24 +173,24 @@ frontend backend
 
 ### Fully parallel (independent stages)
 
-Use `depends_on: []` to declare stages with no dependencies at all:
+Use `dependencies: []` to declare stages with no dependencies at all:
 
 ```yaml
 stages:
   - id: lint
-    depends_on: []
+    dependencies: []
     commands: ["cargo clippy 2>&1"]
 
   - id: format-check
-    depends_on: []
+    dependencies: []
     commands: ["cargo fmt --check 2>&1"]
 
   - id: test
-    depends_on: []
+    dependencies: []
     commands: ["cargo test 2>&1"]
 
   - id: report
-    depends_on: [lint, format-check, test]
+    dependencies: [lint, format-check, test]
     system_prompt: "You are a CI reporter."
     user_prompt: |
       Summarize the results from all checks.
@@ -207,7 +207,7 @@ All three check stages start immediately and run concurrently.
 
 ## Context passing with DAG dependencies
 
-In a sequential pipeline, `{{prior_summary}}` always refers to the immediately preceding stage. In a DAG pipeline, context passing is based on **direct parents** (the stages listed in `depends_on`):
+In a sequential pipeline, `{{prior_summary}}` always refers to the immediately preceding stage. In a DAG pipeline, context passing is based on **direct parents** (the stages listed in `dependencies`):
 
 ### What changes
 
@@ -237,20 +237,20 @@ When a stage has exactly one dependency, the behavior is identical to the sequen
 
 ## Validation rules
 
-Fujin validates `depends_on` before execution:
+Fujin validates `dependencies` before execution:
 
 **Errors (prevent execution):**
-- `depends_on` references an undefined stage ID
-- `depends_on` contains a self-reference
+- `dependencies` references an undefined stage ID
+- `dependencies` contains a self-reference
 - Circular dependencies detected (e.g., A depends on B, B depends on A)
 - `when.stage` references a stage that is not a dependency (direct or transitive) of the current stage
 - `on_branch` references a branch defined by a stage that is not a dependency (direct or transitive)
-- Non-first stages in a retry group have `depends_on` pointing outside the group
+- Non-first stages in a retry group have `dependencies` pointing outside the group
 
 **Allowed:**
-- `depends_on: []` (empty list) — stage has no dependencies
-- Mixing `depends_on` with implicit dependencies — stages without `depends_on` still implicitly depend on the previous stage
-- A stage with `depends_on` can reference any stage, not just earlier ones in YAML order (as long as there are no cycles)
+- `dependencies: []` (empty list) — stage has no dependencies
+- Mixing `dependencies` with implicit dependencies — stages without `dependencies` still implicitly depend on the previous stage
+- A stage with `dependencies` can reference any stage, not just earlier ones in YAML order (as long as there are no cycles)
 
 ## Interaction with other features
 
@@ -271,23 +271,23 @@ stages:
     ...
 
   - id: implement
-    depends_on: [analyze]
+    dependencies: [analyze]
     retry_group: build
     ...
 
   - id: test
-    depends_on: [implement]
+    dependencies: [implement]
     retry_group: build
     commands: ["cargo test 2>&1"]
 
   - id: docs
-    depends_on: [analyze]
+    dependencies: [analyze]
     ...
 ```
 
 Here `implement` and `test` form a retry group that runs sequentially. Meanwhile, `docs` can run in parallel since it only depends on `analyze`.
 
-Non-first stages in a retry group cannot have `depends_on` pointing outside the group — the retry mechanism needs to re-run the group as a contiguous unit.
+Non-first stages in a retry group cannot have `dependencies` pointing outside the group — the retry mechanism needs to re-run the group as a contiguous unit.
 
 ### Branching (`branch`/`on_branch`)
 
@@ -302,12 +302,12 @@ stages:
     ...
 
   - id: frontend-impl
-    depends_on: [analyze]
+    dependencies: [analyze]
     on_branch: frontend
     ...
 
   - id: backend-impl
-    depends_on: [analyze]
+    dependencies: [analyze]
     on_branch: backend
     ...
 ```
@@ -322,7 +322,7 @@ stages:
     ...
 
   - id: fix
-    depends_on: [check]
+    dependencies: [check]
     when:
       stage: check
       output_matches: "FAIL"
@@ -358,7 +358,7 @@ stages:
 
   - id: backend
     name: Implement Backend
-    depends_on: [plan]
+    dependencies: [plan]
     model: "claude-sonnet-4-6"
     system_prompt: |
       You are a backend developer. Implement the server-side
@@ -371,7 +371,7 @@ stages:
 
   - id: frontend
     name: Implement Frontend
-    depends_on: [plan]
+    dependencies: [plan]
     model: "claude-sonnet-4-6"
     system_prompt: |
       You are a frontend developer. Implement the client-side
@@ -384,13 +384,13 @@ stages:
 
   - id: integration
     name: Integration Tests
-    depends_on: [frontend, backend]
+    dependencies: [frontend, backend]
     commands:
       - "npm run test:integration 2>&1"
 
   - id: review
     name: Code Review
-    depends_on: [integration]
+    dependencies: [integration]
     model: "claude-opus-4-6"
     system_prompt: |
       You are a senior engineer reviewing the full feature

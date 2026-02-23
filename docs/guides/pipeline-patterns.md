@@ -572,7 +572,7 @@ stages:
 
 ## Pattern: Parallel CI checks
 
-Run multiple independent checks concurrently, then summarize the results. Uses `depends_on: []` so all checks start immediately.
+Run multiple independent checks concurrently, then summarize the results. Uses `dependencies: []` so all checks start immediately.
 
 ```yaml
 name: "Parallel CI Pipeline"
@@ -580,31 +580,31 @@ name: "Parallel CI Pipeline"
 stages:
   - id: "lint"
     name: "Lint"
-    depends_on: []
+    dependencies: []
     commands:
       - "cargo clippy -- -D warnings 2>&1"
 
   - id: "test"
     name: "Test"
-    depends_on: []
+    dependencies: []
     commands:
       - "cargo test 2>&1"
 
   - id: "format"
     name: "Format Check"
-    depends_on: []
+    dependencies: []
     commands:
       - "cargo fmt --check 2>&1"
 
   - id: "security"
     name: "Security Audit"
-    depends_on: []
+    dependencies: []
     commands:
       - "cargo audit 2>&1"
 
   - id: "fix"
     name: "Fix Issues"
-    depends_on: [lint, test, format, security]
+    dependencies: [lint, test, format, security]
     model: "claude-sonnet-4-6"
     system_prompt: |
       You are a developer fixing CI failures. Read the output from
@@ -650,7 +650,7 @@ stages:
 
   - id: "backend"
     name: "Implement Backend"
-    depends_on: [plan]
+    dependencies: [plan]
     model: "claude-sonnet-4-6"
     system_prompt: |
       You are a backend developer. Implement the server-side
@@ -663,7 +663,7 @@ stages:
 
   - id: "frontend"
     name: "Implement Frontend"
-    depends_on: [plan]
+    dependencies: [plan]
     model: "claude-sonnet-4-6"
     system_prompt: |
       You are a frontend developer. Implement the client-side
@@ -676,13 +676,13 @@ stages:
 
   - id: "integrate"
     name: "Integration Tests"
-    depends_on: [frontend, backend]
+    dependencies: [frontend, backend]
     commands:
       - "npm run test:integration 2>&1"
 
   - id: "review"
     name: "Code Review"
-    depends_on: [integrate]
+    dependencies: [integrate]
     model: "claude-opus-4-6"
     system_prompt: |
       You are a principal engineer reviewing a full-stack feature.

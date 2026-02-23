@@ -313,26 +313,26 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
         }
     }
 
-    // Validate depends_on
+    // Validate dependencies
     {
         let stage_id_set: HashSet<&str> = config.stages.iter().map(|s| s.id.as_str()).collect();
 
         for (i, stage) in config.stages.iter().enumerate() {
             let prefix = format!("Stage {} ('{}')", i, stage.id);
 
-            if let Some(ref deps) = stage.depends_on {
+            if let Some(ref deps) = stage.dependencies {
                 for dep in deps {
-                    // Each depends_on must reference a defined stage
+                    // Each dependency must reference a defined stage
                     if !stage_id_set.contains(dep.as_str()) {
                         result.errors.push(format!(
-                            "{prefix}: depends_on references undefined stage '{dep}'"
+                            "{prefix}: dependencies references undefined stage '{dep}'"
                         ));
                     }
 
                     // No self-references
                     if dep == &stage.id {
                         result.errors.push(format!(
-                            "{prefix}: depends_on cannot reference itself"
+                            "{prefix}: dependencies cannot reference itself"
                         ));
                     }
                 }
@@ -345,7 +345,7 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
         let mut dependents: HashMap<&str, HashSet<&str>> = HashMap::new();
 
         for (i, stage) in config.stages.iter().enumerate() {
-            let deps: HashSet<&str> = match &stage.depends_on {
+            let deps: HashSet<&str> = match &stage.dependencies {
                 Some(deps) => deps.iter().map(|s| s.as_str()).collect(),
                 None => {
                     if i > 0 {
@@ -462,7 +462,7 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
             }
         }
 
-        // Stages in the same retry_group must not have depends_on pointing outside the group
+        // Stages in the same retry_group must not have dependencies pointing outside the group
         let mut group_members: HashMap<&str, Vec<&str>> = HashMap::new();
         for stage in &config.stages {
             if let Some(ref group) = stage.retry_group {
@@ -480,7 +480,7 @@ pub fn validate(config: &PipelineConfig) -> ValidationResult {
                         // UNLESS it's the first stage in the group (which needs an external trigger)
                         if !member_set.contains(dep) && member_id != members[0] {
                             result.errors.push(format!(
-                                "Stage '{}' in retry_group '{}': depends_on '{}' is outside the group (only the first stage in a retry group may depend on external stages)",
+                                "Stage '{}' in retry_group '{}': dependencies '{}' is outside the group (only the first stage in a retry group may depend on external stages)",
                                 member_id, group_name, dep
                             ));
                         }
@@ -565,11 +565,11 @@ pub fn validate_includes(config: &PipelineConfig) -> ValidationResult {
             ));
         }
 
-        // depends_on entries must reference stage IDs defined in the parent's stages
-        for dep in &include.depends_on {
+        // dependencies entries must reference stage IDs defined in the parent's stages
+        for dep in &include.dependencies {
             if !stage_ids.contains(dep.as_str()) {
                 result.errors.push(format!(
-                    "{prefix}: depends_on references undefined parent stage '{dep}'"
+                    "{prefix}: dependencies references undefined parent stage '{dep}'"
                 ));
             }
         }

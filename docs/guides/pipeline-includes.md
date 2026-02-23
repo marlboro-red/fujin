@@ -21,14 +21,14 @@ variables:
 stages:
   - id: build
     name: Build Backend
-    depends_on: []
+    dependencies: []
     system_prompt: "You are a backend developer."
     user_prompt: "Build the backend using {{db_url}}."
     allowed_tools: ["read", "write", "bash"]
 
   - id: deploy
     name: Deploy Backend
-    # depends_on absent → implicit dep on "build"
+    # dependencies absent → implicit dep on "build"
     system_prompt: "You are a deployment engineer."
     user_prompt: "Deploy the backend."
     allowed_tools: ["read", "bash"]
@@ -44,21 +44,21 @@ variables:
 includes:
   - source: backend.yaml
     as: be
-    depends_on: [analyze]
+    dependencies: [analyze]
     vars:
       db_url: "{{db_url}}"
 
 stages:
   - id: analyze
     name: Analysis
-    depends_on: []
+    dependencies: []
     system_prompt: "You are an architect."
     user_prompt: "Analyze the codebase."
     allowed_tools: ["read", "glob"]
 
   - id: integrate
     name: Integration
-    depends_on: [be.deploy]
+    dependencies: [be.deploy]
     system_prompt: "You are a QA engineer."
     user_prompt: "Run integration tests."
     allowed_tools: ["read", "bash"]
@@ -83,8 +83,8 @@ Includes are resolved at **config load time**, before validation and DAG constru
 1. Parses `includes` entries from the parent config
 2. Loads each included YAML file (recursively, if it also has includes)
 3. Prefixes all stage IDs with the `as` alias: `build` becomes `be.build`
-4. Prefixes all internal references (depends_on, retry_group, when.stage)
-5. Wires root stages of the included pipeline to the include-level `depends_on`
+4. Prefixes all internal references (dependencies, retry_group, when.stage)
+5. Wires root stages of the included pipeline to the include-level `dependencies`
 6. Substitutes variables from the `vars` block into prompts
 7. Propagates the included pipeline's runtime to its stages
 8. Merges everything into a flat stage list
@@ -97,7 +97,7 @@ After resolution, the rest of the system — validation, DAG scheduling, executi
 includes:
   - source: backend.yaml         # REQUIRED — path to included pipeline file
     as: be                        # REQUIRED — prefix alias for stage IDs
-    depends_on: [analyze]         # optional — wires included root stages to parent
+    dependencies: [analyze]         # optional — wires included root stages to parent
     vars:                         # optional — variables passed into the include
       db_url: "prod-db.example.com"
 ```
@@ -112,15 +112,15 @@ Prefix alias applied to all stage IDs from this include. Must contain only alpha
 
 Stage `build` with `as: be` becomes `be.build`. This prevents ID collisions when including multiple pipelines that happen to use the same stage IDs.
 
-### `depends_on` (optional, list of strings)
+### `dependencies` (optional, list of strings)
 
-Stages in the parent pipeline that the included pipeline's **root stages** depend on. Root stages are those with `depends_on: []` or no dependencies within the include.
+Stages in the parent pipeline that the included pipeline's **root stages** depend on. Root stages are those with `dependencies: []` or no dependencies within the include.
 
 ```yaml
 includes:
   - source: backend.yaml
     as: be
-    depends_on: [analyze]     # be.build (root) will depend on analyze
+    dependencies: [analyze]     # be.build (root) will depend on analyze
 ```
 
 If omitted, root stages of the include have no parent dependencies and can start immediately.
@@ -147,11 +147,11 @@ Any stage can reference an included stage by its prefixed ID:
 ```yaml
 stages:
   - id: integrate
-    depends_on: [be.deploy, fe.build]    # cross-reference via prefix
+    dependencies: [be.deploy, fe.build]    # cross-reference via prefix
     ...
 ```
 
-This works for `depends_on`, `when.stage`, and any other field that references stage IDs:
+This works for `dependencies`, `when.stage`, and any other field that references stage IDs:
 
 ```yaml
 stages:
@@ -159,7 +159,7 @@ stages:
     when:
       stage: be.build
       output_matches: "SUCCESS"
-    depends_on: [be.build]
+    dependencies: [be.build]
     ...
 ```
 
@@ -172,27 +172,27 @@ name: fullstack
 includes:
   - source: backend.yaml
     as: be
-    depends_on: [analyze]
+    dependencies: [analyze]
     vars:
       db_url: "{{db_url}}"
       api_port: "8080"
 
   - source: frontend.yaml
     as: fe
-    depends_on: [analyze]
+    dependencies: [analyze]
     vars:
       api_base: "http://localhost:8080"
 
 stages:
   - id: analyze
     name: Analysis
-    depends_on: []
+    dependencies: []
     system_prompt: "Analyze the project."
     user_prompt: "Go."
 
   - id: integrate
     name: Integration
-    depends_on: [be.deploy, fe.build]
+    dependencies: [be.deploy, fe.build]
     system_prompt: "Run integration tests."
     user_prompt: "Go."
 ```
@@ -219,7 +219,7 @@ name: database
 stages:
   - id: migrate
     name: Migrate DB
-    depends_on: []
+    dependencies: []
     system_prompt: "sp"
     user_prompt: "up"
 ```
@@ -230,11 +230,11 @@ name: backend
 includes:
   - source: database.yaml
     as: db
-    depends_on: [build]
+    dependencies: [build]
 stages:
   - id: build
     name: Build
-    depends_on: []
+    dependencies: []
     system_prompt: "sp"
     user_prompt: "up"
 ```
@@ -254,13 +254,13 @@ After resolution, `fullstack.yaml` contains stages: `start`, `be.build`, `be.db.
 
 ## Implicit dependencies
 
-When an included pipeline uses implicit sequential dependencies (stages without `depends_on`), they are converted to explicit dependencies during resolution:
+When an included pipeline uses implicit sequential dependencies (stages without `dependencies`), they are converted to explicit dependencies during resolution:
 
 **child.yaml:**
 ```yaml
 stages:
   - id: first
-    depends_on: []      # root stage
+    dependencies: []      # root stage
     ...
   - id: second          # implicit: depends on "first"
     ...
@@ -273,11 +273,11 @@ stages:
 includes:
   - source: child.yaml
     as: ch
-    depends_on: [setup]
+    dependencies: [setup]
 ```
 
 After resolution:
-- `ch.first` depends on `[setup]` (root stage gets include-level depends_on)
+- `ch.first` depends on `[setup]` (root stage gets include-level dependencies)
 - `ch.second` depends on `[ch.first]` (implicit converted to explicit)
 - `ch.third` depends on `[ch.second]` (implicit converted to explicit)
 
@@ -338,13 +338,13 @@ Includes are validated in two phases:
 - `as` alias must not be empty
 - `as` alias must be a valid identifier (alphanumeric, underscore, hyphen)
 - No duplicate aliases within the same parent
-- `depends_on` entries must reference stages defined in the parent's `stages`
+- `dependencies` entries must reference stages defined in the parent's `stages`
 
 ### After resolution (standard validation)
 
 Once includes are resolved into a flat config, all standard validation rules apply:
 - Unique stage IDs (including prefixed IDs)
-- Valid `depends_on` references
+- Valid `dependencies` references
 - No circular dependencies
 - Retry group constraints
 - All other existing validation checks
@@ -353,11 +353,11 @@ Once includes are resolved into a flat config, all standard validation rules app
 
 ### Parallel stages
 
-Includes work naturally with `depends_on`. Included stages form subgraphs within the larger DAG. The scheduler runs independent stages concurrently regardless of whether they came from includes or the parent.
+Includes work naturally with `dependencies`. Included stages form subgraphs within the larger DAG. The scheduler runs independent stages concurrently regardless of whether they came from includes or the parent.
 
 ### Branching
 
-`when` and `branch`/`on_branch` work across include boundaries. An included stage can reference a parent stage in its `when.stage`, and parent stages can reference included stages in their `depends_on`. Branch route names are not prefixed — they are just strings.
+`when` and `branch`/`on_branch` work across include boundaries. An included stage can reference a parent stage in its `when.stage`, and parent stages can reference included stages in their `dependencies`. Branch route names are not prefixed — they are just strings.
 
 ### Checkpoints
 
@@ -392,7 +392,7 @@ variables:
 stages:
   - id: provision
     name: Provision Infrastructure
-    depends_on: []
+    dependencies: []
     system_prompt: "You are a DevOps engineer."
     user_prompt: |
       Provision {{env}} infrastructure in {{region}}.
@@ -421,7 +421,7 @@ retry_groups:
 stages:
   - id: implement
     name: Implement Service
-    depends_on: []
+    dependencies: []
     retry_group: build
     system_prompt: "You are a backend developer."
     user_prompt: |
@@ -454,14 +454,14 @@ includes:
 
   - source: backend.yaml
     as: api
-    depends_on: [infra.validate]
+    dependencies: [infra.validate]
     vars:
       db_url: "{{db_url}}"
       service_name: "user-api"
 
   - source: backend.yaml
     as: auth
-    depends_on: [infra.validate]
+    dependencies: [infra.validate]
     vars:
       db_url: "{{db_url}}"
       service_name: "auth-service"
@@ -469,7 +469,7 @@ includes:
 stages:
   - id: smoke-test
     name: Smoke Tests
-    depends_on: [api.test, auth.test]
+    dependencies: [api.test, auth.test]
     commands:
       - "curl -f http://localhost:8080/health 2>&1"
       - "curl -f http://localhost:8081/health 2>&1"
@@ -497,7 +497,7 @@ fujin run -c deploy.yaml --var env=staging --var region=eu-west-1
 
 ## What to read next
 
-- **[Parallel Stages](parallel-stages.md)** — `depends_on` and DAG scheduling
+- **[Parallel Stages](parallel-stages.md)** — `dependencies` and DAG scheduling
 - **[Retry Groups](retry-groups.md)** — Automatic retry-on-failure with verification
 - **[Pipeline Patterns](pipeline-patterns.md)** — Copy-pasteable recipes for common workflows
 - **[Pipeline Authoring Reference](../pipeline-authoring.md)** — Complete field reference

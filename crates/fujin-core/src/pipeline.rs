@@ -535,7 +535,7 @@ impl PipelineRunner {
     /// Execute stages sequentially (linear DAG or backward-compatible mode).
     ///
     /// This preserves the original execution model for pipelines without
-    /// explicit `depends_on` or with a purely linear dependency chain.
+    /// explicit `dependencies` or with a purely linear dependency chain.
     #[allow(clippy::too_many_arguments)]
     async fn run_sequential(
         &self,
@@ -1807,7 +1807,7 @@ impl PipelineRunner {
             branch: None,
             on_branch: None,
             exports: None,
-            depends_on: None,
+            dependencies: None,
         };
 
         // Build context (includes prior stage results and changed files)
@@ -1898,7 +1898,7 @@ impl PipelineRunner {
             branch: None,
             on_branch: None,
             exports: None,
-            depends_on: None,
+            dependencies: None,
         };
 
         // Build a minimal context (no prior summary needed)

@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Directed Acyclic Graph representing stage dependencies.
 ///
-/// Built from a `PipelineConfig`. Stages without an explicit `depends_on`
+/// Built from a `PipelineConfig`. Stages without an explicit `dependencies`
 /// field implicitly depend on the previous stage in YAML order (preserving
-/// backward compatibility). An explicit `depends_on: []` means no dependencies.
+/// backward compatibility). An explicit `dependencies: []` means no dependencies.
 #[derive(Debug)]
 pub struct Dag {
     /// stage_id -> set of stage_ids it depends on (parents)
@@ -21,9 +21,9 @@ pub struct Dag {
 impl Dag {
     /// Build a DAG from a pipeline config.
     ///
-    /// Resolves implicit dependencies: when `depends_on` is `None`, the stage
+    /// Resolves implicit dependencies: when `dependencies` is `None`, the stage
     /// depends on the immediately preceding stage in YAML order. The first stage
-    /// (or a stage with `depends_on: []`) has no dependencies.
+    /// (or a stage with `dependencies: []`) has no dependencies.
     pub fn from_config(config: &PipelineConfig) -> Self {
         let mut dependencies: HashMap<String, HashSet<String>> = HashMap::new();
         let mut dependents: HashMap<String, HashSet<String>> = HashMap::new();
@@ -40,7 +40,7 @@ impl Dag {
         let known_ids: HashSet<&str> = config.stages.iter().map(|s| s.id.as_str()).collect();
 
         for (i, stage) in config.stages.iter().enumerate() {
-            let deps: Vec<String> = match &stage.depends_on {
+            let deps: Vec<String> = match &stage.dependencies {
                 Some(deps) => deps.clone(),
                 None => {
                     // Implicit: depend on previous stage in YAML order
