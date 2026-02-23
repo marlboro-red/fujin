@@ -75,7 +75,7 @@ fn resolve_recursive(
         let child_config = resolve_recursive(child_config, child_base, seen)?;
 
         // 5. Process the included pipeline
-        let processed = process_include(&config, &include.alias, &include.depends_on, &include.vars, &child_config)?;
+        let processed = process_include(&config, &include.alias, &include.dependencies, &include.vars, &child_config)?;
 
         // Merge retry groups (prefixed)
         for (group_name, group_config) in &child_config.retry_groups {
@@ -125,19 +125,19 @@ fn process_include(
         // Prefix stage ID
         stage.id = format!("{alias}.{}", stage.id);
 
-        // Handle depends_on
-        match &stage.depends_on {
+        // Handle dependencies
+        match &stage.dependencies {
             None => {
-                // Implicit dep: depends on previous stage in the include, or include-level depends_on for first
+                // Implicit dep: depends on previous stage in the include, or include-level dependencies for first
                 if i == 0 {
-                    stage.depends_on = Some(include_depends_on.to_vec());
+                    stage.dependencies = Some(include_depends_on.to_vec());
                 } else {
-                    stage.depends_on = Some(vec![format!("{alias}.{}", original_ids[i - 1])]);
+                    stage.dependencies = Some(vec![format!("{alias}.{}", original_ids[i - 1])]);
                 }
             }
             Some(deps) if deps.is_empty() => {
-                // Explicit root stage: wire include-level depends_on
-                stage.depends_on = Some(include_depends_on.to_vec());
+                // Explicit root stage: wire include-level dependencies
+                stage.dependencies = Some(include_depends_on.to_vec());
             }
             Some(deps) => {
                 let mut new_deps: Vec<String> = deps
@@ -161,7 +161,7 @@ fn process_include(
                     }
                 }
 
-                stage.depends_on = Some(new_deps);
+                stage.dependencies = Some(new_deps);
             }
         }
 
@@ -299,12 +299,12 @@ stages:
 
         // be.build should depend on [analyze] (from include-level depends_on)
         assert_eq!(
-            resolved.stages[2].depends_on,
+            resolved.stages[2].dependencies,
             Some(vec!["analyze".to_string()])
         );
         // be.deploy should depend on be.build (implicit→explicit)
         assert_eq!(
-            resolved.stages[3].depends_on,
+            resolved.stages[3].dependencies,
             Some(vec!["be.build".to_string()])
         );
     }
@@ -630,15 +630,15 @@ stages:
 
         // ch.first: root stage → gets include depends_on [setup]
         let first = resolved.stages.iter().find(|s| s.id == "ch.first").unwrap();
-        assert_eq!(first.depends_on, Some(vec!["setup".to_string()]));
+        assert_eq!(first.dependencies, Some(vec!["setup".to_string()]));
 
         // ch.second: implicit dep → ch.first
         let second = resolved.stages.iter().find(|s| s.id == "ch.second").unwrap();
-        assert_eq!(second.depends_on, Some(vec!["ch.first".to_string()]));
+        assert_eq!(second.dependencies, Some(vec!["ch.first".to_string()]));
 
         // ch.third: implicit dep → ch.second
         let third = resolved.stages.iter().find(|s| s.id == "ch.third").unwrap();
-        assert_eq!(third.depends_on, Some(vec!["ch.second".to_string()]));
+        assert_eq!(third.dependencies, Some(vec!["ch.second".to_string()]));
     }
 
     #[test]
@@ -794,7 +794,7 @@ stages:
         let resolved = resolve_includes(config, dir.path()).unwrap();
 
         let b = resolved.stages.iter().find(|s| s.id == "ch.b").unwrap();
-        let deps = b.depends_on.as_ref().unwrap();
+        let deps = b.dependencies.as_ref().unwrap();
         // "a" is internal → prefixed to "ch.a", "external_stage" is external → kept as-is
         assert!(deps.contains(&"ch.a".to_string()));
         assert!(deps.contains(&"external_stage".to_string()));
@@ -838,7 +838,7 @@ stages:
 
         let build = resolved.stages.iter().find(|s| s.id == "ch.build").unwrap();
         // No include-level depends_on → root stage gets empty deps (can start immediately)
-        assert_eq!(build.depends_on, Some(vec![]));
+        assert_eq!(build.dependencies, Some(vec![]));
     }
 
     #[test]
@@ -898,7 +898,7 @@ stages:
         assert_eq!(config.includes.len(), 1);
         assert_eq!(config.includes[0].source, "child.yaml");
         assert_eq!(config.includes[0].alias, "my_alias");
-        assert_eq!(config.includes[0].depends_on, vec!["s1".to_string()]);
+        assert_eq!(config.includes[0].dependencies, vec!["s1".to_string()]);
         assert_eq!(config.includes[0].vars.get("key").unwrap(), "value");
     }
 

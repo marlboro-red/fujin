@@ -54,8 +54,8 @@ pub struct IncludeConfig {
     pub alias: String,
 
     /// Stages in the parent DAG that the included pipeline's root stages depend on.
-    #[serde(default)]
-    pub depends_on: Vec<String>,
+    #[serde(default, alias = "depends_on")]
+    pub dependencies: Vec<String>,
 
     /// Variables to pass into the included pipeline.
     /// These override the included pipeline's own variable defaults.
@@ -252,9 +252,9 @@ pub struct StageConfig {
 
     /// Explicit stage dependencies. This stage waits for all listed stages to complete.
     /// When absent (`None`), the stage implicitly depends on the previous stage in YAML order.
-    /// Use `depends_on: []` to declare a stage with no dependencies (can start immediately).
-    #[serde(default)]
-    pub depends_on: Option<Vec<String>>,
+    /// Use `dependencies: []` to declare a stage with no dependencies (can start immediately).
+    #[serde(default, alias = "depends_on")]
+    pub dependencies: Option<Vec<String>>,
 }
 
 impl StageConfig {
@@ -759,17 +759,17 @@ stages:
     user_prompt: "up"
 "#;
         let config = PipelineConfig::from_yaml(yaml).unwrap();
-        assert!(config.stages[0].depends_on.is_none());
+        assert!(config.stages[0].dependencies.is_none());
         assert_eq!(
-            config.stages[1].depends_on,
+            config.stages[1].dependencies,
             Some(vec!["analyze".to_string()])
         );
         assert_eq!(
-            config.stages[2].depends_on,
+            config.stages[2].dependencies,
             Some(vec!["analyze".to_string()])
         );
         assert_eq!(
-            config.stages[3].depends_on,
+            config.stages[3].dependencies,
             Some(vec!["frontend".to_string(), "backend".to_string()])
         );
     }
@@ -786,7 +786,7 @@ stages:
     user_prompt: "up"
 "#;
         let config = PipelineConfig::from_yaml(yaml).unwrap();
-        assert_eq!(config.stages[0].depends_on, Some(vec![]));
+        assert_eq!(config.stages[0].dependencies, Some(vec![]));
     }
 
     #[test]
@@ -800,7 +800,7 @@ stages:
     user_prompt: "up"
 "#;
         let config = PipelineConfig::from_yaml(yaml).unwrap();
-        assert!(config.stages[0].depends_on.is_none());
+        assert!(config.stages[0].dependencies.is_none());
     }
 
     #[test]
