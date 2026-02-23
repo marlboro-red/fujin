@@ -728,7 +728,8 @@ impl PipelineRunner {
             }
 
             // Auto-commit pending changes before creating worktrees so they start fresh
-            if use_worktrees && !ready.is_empty() {
+            // (only needed when multiple stages run in parallel)
+            if use_worktrees && ready.len() > 1 {
                 let _ = crate::worktree::auto_commit(self.workspace.root(), "pre-parallel");
             }
 
@@ -793,8 +794,10 @@ impl PipelineRunner {
                 let stage_start = Instant::now();
                 let stage_runtime = self.runtime_for_stage(stage_config);
 
-                // Create worktree for isolated execution
-                let (effective_workspace, worktree_isolated) = if use_worktrees {
+                // Create worktree only when multiple stages run in parallel
+                // (sequential stages share the workspace directly)
+                let needs_worktree = use_worktrees && ready.len() > 1;
+                let (effective_workspace, worktree_isolated) = if needs_worktree {
                     match crate::worktree::create(
                         self.workspace.root(),
                         &checkpoint.run_id,
