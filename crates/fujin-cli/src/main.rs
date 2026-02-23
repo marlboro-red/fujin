@@ -937,19 +937,29 @@ fn cmd_setup() -> Result<()> {
     paths::ensure_dirs()?;
 
     let templates_dir = paths::templates_dir();
+    let configs_dir = paths::configs_dir();
 
-    // Copy built-in templates to templates directory
+    // Copy built-in templates to templates directory and configs directory.
+    // Templates are scaffolding starters for `fujin init`; configs are
+    // discoverable by the TUI so pipelines are visible immediately.
     let mut installed = 0;
     for (name, content) in BUILT_IN_TEMPLATES {
-        let dest = templates_dir.join(format!("{name}.yaml"));
-        std::fs::write(&dest, content)
-            .with_context(|| format!("Failed to write template: {}", dest.display()))?;
+        let template_dest = templates_dir.join(format!("{name}.yaml"));
+        std::fs::write(&template_dest, content)
+            .with_context(|| format!("Failed to write template: {}", template_dest.display()))?;
+
+        let config_dest = configs_dir.join(format!("{name}.yaml"));
+        if !config_dest.exists() {
+            std::fs::write(&config_dest, content)
+                .with_context(|| format!("Failed to write config: {}", config_dest.display()))?;
+        }
+
         installed += 1;
     }
 
     println!("{} fujin data directory set up:", style("✓").green().bold());
     println!("  Templates: {} ({installed} installed)", style(templates_dir.display()).cyan());
-    println!("  Configs:   {}", style(paths::configs_dir().display()).cyan());
+    println!("  Configs:   {}", style(configs_dir.display()).cyan());
 
     Ok(())
 }
