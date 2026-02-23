@@ -74,6 +74,8 @@ pub struct StageInfo {
     pub branch_info: Option<(String, Vec<String>)>,
     /// Whether the stage is running in an isolated git worktree.
     pub isolated: bool,
+    /// Exported variables from this stage (populated on ExportsLoaded).
+    pub exported_vars: Vec<(String, String)>,
 }
 
 /// State for the pipeline execution screen.
@@ -158,6 +160,7 @@ impl ExecutionState {
                 retry_group,
                 branch_info: None,
                 isolated: false,
+                exported_vars: Vec::new(),
             })
             .collect();
         Self {
@@ -283,6 +286,7 @@ impl ExecutionState {
                         retry_group: None,
                         branch_info: None,
                         isolated: false,
+                        exported_vars: Vec::new(),
                     });
                 }
                 let stage = &mut self.stages[stage_index];
@@ -583,6 +587,7 @@ impl ExecutionState {
                         let names: Vec<&str> = variables.iter().map(|(k, _)| k.as_str()).collect();
                         activity_log.push(format!("Exported variables: {}", names.join(", ")));
                     }
+                    stage.exported_vars = variables;
                 }
             }
 
@@ -1434,6 +1439,29 @@ impl ExecutionState {
                     Span::styled(
                         format!("{} out", format_number(usage.output_tokens)),
                         Style::default().fg(theme::TOKEN_LABEL),
+                    ),
+                ]));
+            }
+        }
+
+        // Exported variables
+        if !stage.exported_vars.is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "  Exports:",
+                Style::default().fg(theme::TEXT_MUTED),
+            )));
+            for (key, value) in &stage.exported_vars {
+                let display_val = truncate_chars(value, 60);
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {key}"),
+                        Style::default().fg(theme::TEXT_SECONDARY),
+                    ),
+                    Span::styled(" = ", Style::default().fg(theme::TEXT_MUTED)),
+                    Span::styled(
+                        format!("\"{display_val}\""),
+                        Style::default().fg(theme::TEXT_PRIMARY),
                     ),
                 ]));
             }
