@@ -496,6 +496,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
                         token_usage = Some(TokenUsage {
                             input_tokens: u.input_tokens,
                             output_tokens: u.output_tokens,
+                            premium_requests: None,
                         });
                     }
                 }
@@ -650,6 +651,7 @@ fn parse_claude_output(stdout: &str) -> (String, Option<TokenUsage>) {
         let usage = result.usage.map(|u| TokenUsage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
+            premium_requests: None,
         });
         return (text, usage);
     }
@@ -678,6 +680,7 @@ fn parse_claude_output(stdout: &str) -> (String, Option<TokenUsage>) {
                 token_usage = Some(TokenUsage {
                     input_tokens: u.input_tokens,
                     output_tokens: u.output_tokens,
+                    premium_requests: None,
                 });
             }
         }

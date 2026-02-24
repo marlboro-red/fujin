@@ -101,6 +101,8 @@ pub struct ExecutionState {
     /// Cumulative token usage.
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    /// Cumulative premium requests (copilot stages).
+    pub total_premium_requests: u32,
     /// Per-model token breakdown (populated on pipeline completion).
     pub token_usage_by_model: Vec<(String, TokenUsage)>,
     /// Whether the pipeline has finished (success or failure).
@@ -177,6 +179,7 @@ impl ExecutionState {
             final_elapsed: None,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_premium_requests: 0,
             token_usage_by_model: Vec::new(),
             finished: false,
             final_message: None,
@@ -420,6 +423,9 @@ impl ExecutionState {
                 if let Some(ref usage) = token_usage {
                     self.total_input_tokens += usage.input_tokens;
                     self.total_output_tokens += usage.output_tokens;
+                    if let Some(pr) = usage.premium_requests {
+                        self.total_premium_requests += pr;
+                    }
                 }
                 if let Some(stage) = self.stages.get_mut(stage_index) {
                     // Preserve activity log from running state
@@ -1482,6 +1488,15 @@ impl ExecutionState {
             }
             if let Some(usage) = token_usage {
                 detail_lines.push(Line::from(""));
+                if let Some(pr) = usage.premium_requests {
+                    detail_lines.push(Line::from(vec![
+                        Span::styled("  Premium requests: ", Style::default().fg(theme::TEXT_MUTED)),
+                        Span::styled(
+                            pr.to_string(),
+                            Style::default().fg(theme::TOKEN_LABEL),
+                        ),
+                    ]));
+                }
                 detail_lines.push(Line::from(vec![
                     Span::styled("  Tokens: ", Style::default().fg(theme::TEXT_MUTED)),
                     Span::styled(
@@ -1647,6 +1662,15 @@ impl ExecutionState {
 
         // Show inline total when not showing per-model breakdown
         if !self.finished || self.token_usage_by_model.len() <= 1 {
+            // Show premium requests if any were consumed
+            if self.total_premium_requests > 0 {
+                spans.push(Span::styled("Premium: ", Style::default().fg(theme::TEXT_MUTED)));
+                spans.push(Span::styled(
+                    format!("{}", self.total_premium_requests),
+                    Style::default().fg(theme::TOKEN_LABEL),
+                ));
+                spans.push(Span::raw("    "));
+            }
             spans.push(Span::styled("Tokens: ", Style::default().fg(theme::TEXT_MUTED)));
             if self.token_usage_by_model.len() == 1 {
                 let (model, usage) = &self.token_usage_by_model[0];
@@ -2003,6 +2027,7 @@ mod tests {
             token_usage: Some(TokenUsage {
                 input_tokens: 1000,
                 output_tokens: 500,
+                premium_requests: None,
             }),
         });
 

@@ -1,6 +1,7 @@
 use crate::agent::{AgentOutput, AgentRuntime};
 use crate::context::StageContext;
 use crate::error::{CoreError, CoreResult};
+use crate::stage::TokenUsage;
 use async_trait::async_trait;
 use fujin_config::StageConfig;
 use std::path::Path;
@@ -222,6 +223,73 @@ async fn cancel_poll(flag: &Arc<AtomicBool>) {
     }
 }
 
+/// Parse copilot CLI stderr for usage statistics.
+///
+/// Stderr format:
+/// ```text
+/// Total usage est:        2 Premium requests
+/// Breakdown by AI model:
+///  gpt-5.3-codex           15.0k in, 392 out, 0 cached (Est. 2 Premium requests)
+/// ```
+fn parse_copilot_usage(stderr: &str) -> Option<TokenUsage> {
+    if stderr.is_empty() {
+        return None;
+    }
+
+    let mut premium_requests: Option<u32> = None;
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+
+        // "Total usage est:        2 Premium requests"
+        if trimmed.starts_with("Total usage est:") {
+            if let Some(rest) = trimmed.strip_prefix("Total usage est:") {
+                let rest = rest.trim();
+                if let Some(num_str) = rest.split_whitespace().next() {
+                    premium_requests = num_str.parse().ok();
+                }
+            }
+        }
+
+        // " gpt-5.3-codex           15.0k in, 392 out, 0 cached (Est. 2 Premium requests)"
+        if trimmed.contains(" in,") && trimmed.contains(" out,") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            for (i, part) in parts.iter().enumerate() {
+                if *part == "in," && i > 0 {
+                    input_tokens += parse_token_count(parts[i - 1]);
+                }
+                if *part == "out," && i > 0 {
+                    output_tokens += parse_token_count(parts[i - 1]);
+                }
+            }
+        }
+    }
+
+    if premium_requests.is_some() || input_tokens > 0 || output_tokens > 0 {
+        Some(TokenUsage {
+            input_tokens,
+            output_tokens,
+            premium_requests,
+        })
+    } else {
+        None
+    }
+}
+
+/// Parse token count strings like "15.0k", "1.2M", "392".
+fn parse_token_count(s: &str) -> u64 {
+    let s = s.replace(',', "");
+    if let Some(num) = s.strip_suffix('k').or_else(|| s.strip_suffix('K')) {
+        num.parse::<f64>().map(|n| (n * 1_000.0) as u64).unwrap_or(0)
+    } else if let Some(num) = s.strip_suffix('M') {
+        num.parse::<f64>().map(|n| (n * 1_000_000.0) as u64).unwrap_or(0)
+    } else {
+        s.parse().unwrap_or(0)
+    }
+}
+
 #[async_trait]
 impl AgentRuntime for CopilotCliRuntime {
     fn name(&self) -> &str {
@@ -389,10 +457,12 @@ impl AgentRuntime for CopilotCliRuntime {
             response_text.truncate(MAX_RESPONSE_BYTES);
         }
 
-        // Copilot CLI programmatic mode does not provide token usage
+        // Parse usage stats from stderr (premium requests + tokens)
+        let token_usage = parse_copilot_usage(&stderr);
+
         Ok(AgentOutput {
             response_text,
-            token_usage: None,
+            token_usage,
         })
     }
 
@@ -716,7 +786,7 @@ mod tests {
     #[test]
     fn test_copilot_supports_streaming() {
         let runtime = CopilotCliRuntime::new();
-        assert!(!runtime.supports_streaming());
+        assert!(runtime.supports_streaming());
     }
 
     #[test]
@@ -729,5 +799,33 @@ mod tests {
     fn test_copilot_default() {
         let runtime = CopilotCliRuntime::default();
         assert_eq!(runtime.copilot_bin, "copilot");
+    }
+
+    #[test]
+    fn test_parse_copilot_usage() {
+        let stderr = "\
+Total usage est:        2 Premium requests
+API time spent:         5s
+Total session time:     11s
+Total code changes:     +0 -0
+Breakdown by AI model:
+ gpt-5.3-codex           15.0k in, 392 out, 0 cached (Est. 2 Premium requests)";
+
+        let usage = parse_copilot_usage(stderr).unwrap();
+        assert_eq!(usage.premium_requests, Some(2));
+        assert_eq!(usage.input_tokens, 15000);
+        assert_eq!(usage.output_tokens, 392);
+    }
+
+    #[test]
+    fn test_parse_copilot_usage_empty() {
+        assert!(parse_copilot_usage("").is_none());
+    }
+
+    #[test]
+    fn test_parse_token_count() {
+        assert_eq!(parse_token_count("392"), 392);
+        assert_eq!(parse_token_count("15.0k"), 15000);
+        assert_eq!(parse_token_count("1.2M"), 1200000);
     }
 }

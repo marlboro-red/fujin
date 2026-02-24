@@ -101,6 +101,7 @@ impl MockRuntime {
         self.token_usage = Some(TokenUsage {
             input_tokens: input,
             output_tokens: output,
+            premium_requests: None,
         });
         self
     }

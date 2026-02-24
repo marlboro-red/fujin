@@ -39,4 +39,7 @@ pub struct StageResult {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Premium requests consumed (Copilot CLI only).
+    #[serde(default)]
+    pub premium_requests: Option<u32>,
 }
