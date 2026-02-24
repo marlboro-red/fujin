@@ -289,11 +289,15 @@ impl App {
         };
 
         // Create execution screen — pass model from config so it's visible immediately
-        let stage_names: Vec<(String, String, String, Option<String>, Option<usize>)> = config
+        let stage_names: Vec<(String, String, String, String, Option<String>, Option<usize>)> = config
             .stages
             .iter()
             .enumerate()
-            .map(|(i, s)| (s.id.clone(), s.name.clone(), s.model.clone(), s.retry_group.clone(), parallel_groups[i]))
+            .map(|(i, s)| {
+                let runtime = s.runtime.clone().unwrap_or_else(|| config.runtime.clone());
+                let model = if s.is_command_stage() { "commands".to_string() } else { s.model.clone() };
+                (s.id.clone(), s.name.clone(), model, runtime, s.retry_group.clone(), parallel_groups[i])
+            })
             .collect();
         let exec_state = ExecutionState::new(
             config.name.clone(),

@@ -143,17 +143,17 @@ impl ExecutionState {
         pipeline_name: String,
         run_id: String,
         total_stages: usize,
-        stage_names: Vec<(String, String, String, Option<String>, Option<usize>)>,
+        stage_names: Vec<(String, String, String, String, Option<String>, Option<usize>)>,
     ) -> Self {
         let stages = stage_names
             .into_iter()
             .enumerate()
-            .map(|(i, (id, name, model, retry_group, parallel_group))| StageInfo {
+            .map(|(i, (id, name, model, runtime, retry_group, parallel_group))| StageInfo {
                 index: i,
                 id,
                 name,
                 model,
-                runtime: String::new(),
+                runtime,
                 allowed_tools: Vec::new(),
                 status: StageStatus::Pending,
                 rendered_prompt: None,
@@ -1810,9 +1810,9 @@ mod tests {
             String::new(),
             3,
             vec![
-                ("s0".into(), "Stage 0".into(), String::new(), None, None),
-                ("s1".into(), "Stage 1".into(), String::new(), None, None),
-                ("s2".into(), "Stage 2".into(), String::new(), None, None),
+                ("s0".into(), "Stage 0".into(), String::new(), String::new(), None, None),
+                ("s1".into(), "Stage 1".into(), String::new(), String::new(), None, None),
+                ("s2".into(), "Stage 2".into(), String::new(), String::new(), None, None),
             ],
         )
     }

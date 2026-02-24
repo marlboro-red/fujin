@@ -11,6 +11,13 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 use fujin_config::{PipelineConfig, StageConfig, SummarizerConfig};
 
+use crate::copilot::CopilotCliRuntime;
+
+/// Build a `Command` for invoking copilot, resolving .cmd shims on Windows.
+fn copilot_command() -> Command {
+    CopilotCliRuntime::new().into_command()
+}
+
 /// Context passed to a stage during execution.
 #[derive(Debug, Clone)]
 pub struct StageContext {
@@ -186,8 +193,11 @@ impl ContextBuilder {
 
         let mut child = match self.runtime_name.as_str() {
             "copilot-cli" => {
-                // Copilot CLI: -p takes prompt as a string arg, -s for clean output
-                Command::new("copilot")
+                // Copilot CLI: -p takes prompt as a string arg, -s for clean output.
+                // On Windows, resolve the npm .cmd shim to invoke node directly
+                // to avoid argument quoting issues with cmd.exe.
+                let mut cmd = copilot_command();
+                cmd
                     .arg("-p").arg(&summarize_prompt)
                     .arg("-s")
                     .arg("--no-ask-user")

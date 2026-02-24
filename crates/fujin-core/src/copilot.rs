@@ -27,6 +27,72 @@ pub struct CopilotCliRuntime {
     copilot_bin: String,
 }
 
+/// Resolved node + script path from an npm `.cmd` shim (Windows only).
+#[cfg(windows)]
+struct ResolvedShim {
+    node: String,
+    script: String,
+}
+
+/// Parse an npm `.cmd` shim to extract the node binary and JS entry point.
+///
+/// npm shims follow a predictable pattern: the last line invokes
+/// `"%_prog%" "%dp0%\node_modules\...\entry.js" %*`. We locate the
+/// `.cmd` file on PATH, read it, and extract the JS path.
+#[cfg(windows)]
+fn resolve_cmd_shim(bin_name: &str) -> Option<ResolvedShim> {
+    use std::fs;
+
+    let cmd_name = if bin_name.ends_with(".cmd") {
+        bin_name.to_string()
+    } else {
+        format!("{bin_name}.cmd")
+    };
+
+    let cmd_path = std::env::var("PATH").ok().and_then(|path| {
+        path.split(';').find_map(|dir| {
+            let candidate = std::path::PathBuf::from(dir).join(&cmd_name);
+            candidate.exists().then_some(candidate)
+        })
+    })?;
+
+    let contents = fs::read_to_string(&cmd_path).ok()?;
+    let dir = cmd_path.parent()?;
+
+    // Extract the JS entry point: "%dp0%\node_modules\...\something.js"
+    let js_path = contents
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let lower = line.to_lowercase();
+            if !lower.contains("%dp0%") || !lower.contains(".js") {
+                return None;
+            }
+            let start = line.find("%dp0%")?;
+            let after = &line[start + 5..]; // skip %dp0%
+            let after = after.strip_prefix('\\')?;
+            let end = after.find('"').or_else(|| after.find(' ')).unwrap_or(after.len());
+            Some(after[..end].to_string())
+        })?;
+
+    let script = dir.join(&js_path);
+    if !script.exists() {
+        return None;
+    }
+
+    let node_in_dir = dir.join("node.exe");
+    let node = if node_in_dir.exists() {
+        node_in_dir.to_string_lossy().to_string()
+    } else {
+        "node".to_string()
+    };
+
+    Some(ResolvedShim {
+        node,
+        script: script.to_string_lossy().to_string(),
+    })
+}
+
 impl CopilotCliRuntime {
     pub fn new() -> Self {
         Self {
@@ -36,6 +102,32 @@ impl CopilotCliRuntime {
 
     pub fn with_binary(copilot_bin: String) -> Self {
         Self { copilot_bin }
+    }
+
+    /// Consume self and return a `Command` for the copilot binary.
+    /// Used by the summarizer in `context.rs`.
+    pub fn into_command(self) -> Command {
+        self.command()
+    }
+
+    /// Build a `Command` that invokes the copilot binary.
+    ///
+    /// On Windows, npm-installed binaries are `.cmd` shims that cause
+    /// argument quoting issues when invoked via Rust's `Command` API.
+    /// We resolve the shim to invoke node directly with the JS entry point.
+    #[cfg(windows)]
+    fn command(&self) -> Command {
+        if let Some(resolved) = resolve_cmd_shim(&self.copilot_bin) {
+            let mut cmd = Command::new(&resolved.node);
+            cmd.arg(&resolved.script);
+            return cmd;
+        }
+        Command::new(&self.copilot_bin)
+    }
+
+    #[cfg(not(windows))]
+    fn command(&self) -> Command {
+        Command::new(&self.copilot_bin)
     }
 
     /// Build the rendered prompt combining system context and user prompt.
@@ -137,7 +229,7 @@ impl AgentRuntime for CopilotCliRuntime {
     }
 
     fn supports_streaming(&self) -> bool {
-        false
+        true
     }
 
     async fn execute(
@@ -165,13 +257,13 @@ impl AgentRuntime for CopilotCliRuntime {
         );
         debug!(prompt_length = prompt.len(), "Built prompt");
 
-        let mut cmd = Command::new(&self.copilot_bin);
+        let mut cmd = self.command();
 
         // Programmatic mode: -p takes the prompt as a string argument.
-        // -s (silent) outputs only the agent response without usage stats.
+        // --stream on enables streaming so we can capture live tool activity.
         // --no-ask-user prevents the agent from prompting interactively.
         cmd.arg("-p").arg(&prompt);
-        cmd.arg("-s");
+        cmd.arg("--stream").arg("on");
         cmd.arg("--no-ask-user");
 
         cmd.arg("--model").arg(&config.model);
@@ -196,24 +288,42 @@ impl AgentRuntime for CopilotCliRuntime {
             message: format!("Failed to spawn copilot process: {e}"),
         })?;
 
-        // Emit a generic activity message since Copilot CLI doesn't stream tool use
-        if let Some(ref tx) = progress_tx {
-            let _ = tx.send("Agent working...".to_string());
-        }
-
-        // Drain stdout/stderr via spawned tasks BEFORE waiting, to avoid pipe
-        // buffer deadlock. If the child produces more output than the OS pipe
-        // buffer (~64KB), it blocks writing. Calling wait() before draining
-        // the pipes would deadlock.
+        // Stream stdout line-by-line to extract tool activity for the TUI.
+        // Copilot CLI with --stream on emits lines like:
+        //   ✅ Read file src/main.rs
+        //   ⠋ Searching files...
+        // We forward these as progress messages and collect the full output.
         let stdout_handle = {
-            let mut out = child.stdout.take();
+            let stdout = child.stdout.take();
+            let tx = progress_tx.clone();
             tokio::spawn(async move {
-                let mut buf = String::new();
-                if let Some(ref mut stream) = out {
-                    use tokio::io::AsyncReadExt;
-                    let _ = stream.read_to_string(&mut buf).await;
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let mut full_output = String::new();
+                if let Some(stream) = stdout {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) => break, // EOF
+                            Ok(_) => {
+                                let trimmed = line.trim();
+                                if !trimmed.is_empty() {
+                                    // Forward tool activity lines to the TUI
+                                    if let Some(ref tx) = tx {
+                                        let _ = tx.send(trimmed.to_string());
+                                    }
+                                }
+                                full_output.push_str(&line);
+                                if full_output.len() > MAX_RESPONSE_BYTES {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
                 }
-                buf
+                full_output
             })
         };
         let stderr_handle = {
@@ -287,7 +397,7 @@ impl AgentRuntime for CopilotCliRuntime {
     }
 
     async fn health_check(&self) -> CoreResult<()> {
-        let output = Command::new(&self.copilot_bin)
+        let output = self.command()
             .arg("--version")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
