@@ -39,6 +39,8 @@ pub struct App {
     pipeline_rx: Option<mpsc::UnboundedReceiver<PipelineEvent>>,
     /// Flag to signal pipeline cancellation.
     cancel_flag: Option<Arc<AtomicBool>>,
+    /// Stored pipeline and overrides for retry/resume.
+    last_pipeline: Option<(DiscoveredPipeline, std::collections::HashMap<String, String>)>,
 }
 
 impl App {
@@ -51,6 +53,7 @@ impl App {
             should_quit: false,
             pipeline_rx: None,
             cancel_flag: None,
+            last_pipeline: None,
         }
     }
 
@@ -126,7 +129,7 @@ impl App {
                     }
                     Screen::Execution(state) => {
                         let action = state.handle_key(key);
-                        self.handle_execution_action(action);
+                        self.handle_execution_action(action)?;
                     }
                 }
             }
@@ -164,7 +167,7 @@ impl App {
                         let pipeline = pipeline.clone();
                         if pipeline.config.variables.is_empty() {
                             // No variables — run immediately
-                            self.start_pipeline(pipeline, std::collections::HashMap::new())?;
+                            self.start_pipeline(pipeline, std::collections::HashMap::new(), false)?;
                         } else {
                             // Show variable input screen
                             self.screen =
@@ -190,14 +193,14 @@ impl App {
                 if let Screen::VariableInput(state) = &self.screen {
                     let overrides = state.overrides();
                     let pipeline = state.pipeline.clone();
-                    self.start_pipeline(pipeline, overrides)?;
+                    self.start_pipeline(pipeline, overrides, false)?;
                 }
             }
         }
         Ok(())
     }
 
-    fn handle_execution_action(&mut self, action: ExecutionAction) {
+    fn handle_execution_action(&mut self, action: ExecutionAction) -> Result<()> {
         match action {
             ExecutionAction::None => {}
             ExecutionAction::Quit => self.should_quit = true,
@@ -213,7 +216,13 @@ impl App {
                     flag.store(true, Ordering::Relaxed);
                 }
             }
+            ExecutionAction::RetryPipeline => {
+                if let Some((pipeline, overrides)) = self.last_pipeline.clone() {
+                    self.start_pipeline(pipeline, overrides, true)?;
+                }
+            }
         }
+        Ok(())
     }
 
     /// Start executing a pipeline with optional variable overrides.
@@ -221,7 +230,11 @@ impl App {
         &mut self,
         pipeline: DiscoveredPipeline,
         overrides: std::collections::HashMap<String, String>,
+        resume: bool,
     ) -> Result<()> {
+        // Store for potential retry
+        self.last_pipeline = Some((pipeline.clone(), overrides.clone()));
+
         let mut config = pipeline.config.clone();
         config.apply_overrides(&overrides);
         let raw_yaml = pipeline.raw_yaml.clone();
@@ -313,7 +326,7 @@ impl App {
                 .with_cancel_flag(cancel_flag);
 
             let options = RunOptions {
-                resume: false,
+                resume,
                 dry_run: false,
             };
 

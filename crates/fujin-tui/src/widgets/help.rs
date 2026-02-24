@@ -60,6 +60,7 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect, mode: HelpMode) {
                 help_line("Home", "Scroll to top"),
                 help_line("End", "Resume auto-scroll"),
                 help_line("b", "Back to browser (when finished)"),
+                help_line("r", "Retry from checkpoint (on failure)"),
                 help_line("q", "Cancel (confirm required) / Quit"),
                 help_line("Ctrl+C", "Force stop pipeline"),
                 help_line("?", "Toggle this help"),

@@ -330,7 +330,29 @@ impl AgentRuntime for CopilotCliRuntime {
         // Programmatic mode: -p takes the prompt as a string argument.
         // --stream on enables streaming so we can capture live tool activity.
         // --no-ask-user prevents the agent from prompting interactively.
-        cmd.arg("-p").arg(&prompt);
+        //
+        // When the prompt is very long (>30 000 chars), passing it as a
+        // command-line argument can exceed the Windows CreateProcess limit
+        // (32 767 chars total). Write to a temp file and instruct copilot
+        // to read it instead.
+        const ARG_LIMIT: usize = 30_000;
+        let _prompt_tempfile: Option<std::path::PathBuf>;
+        if prompt.len() > ARG_LIMIT {
+            let prompt_file = std::env::temp_dir()
+                .join(format!("fujin-prompt-{}-{}.md", config.id, std::process::id()));
+            std::fs::write(&prompt_file, &prompt)
+                .map_err(|e| CoreError::AgentError {
+                    message: format!("Failed to write prompt file: {e}"),
+                })?;
+            cmd.arg("-p").arg(format!(
+                "Read the file {} and follow the instructions inside it exactly.",
+                prompt_file.display()
+            ));
+            _prompt_tempfile = Some(prompt_file);
+        } else {
+            cmd.arg("-p").arg(&prompt);
+            _prompt_tempfile = None;
+        }
         cmd.arg("--stream").arg("on");
         cmd.arg("--no-ask-user");
 
@@ -459,6 +481,11 @@ impl AgentRuntime for CopilotCliRuntime {
 
         // Parse usage stats from stderr (premium requests + tokens)
         let token_usage = parse_copilot_usage(&stderr);
+
+        // Clean up temp prompt file if used
+        if let Some(ref path) = _prompt_tempfile {
+            let _ = std::fs::remove_file(path);
+        }
 
         Ok(AgentOutput {
             response_text,

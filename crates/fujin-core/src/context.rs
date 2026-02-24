@@ -191,14 +191,39 @@ impl ContextBuilder {
             config.max_tokens, text
         );
 
+        let prompt_tempfile: Option<std::path::PathBuf>;
         let mut child = match self.runtime_name.as_str() {
             "copilot-cli" => {
                 // Copilot CLI: -p takes prompt as a string arg, -s for clean output.
                 // On Windows, resolve the npm .cmd shim to invoke node directly
                 // to avoid argument quoting issues with cmd.exe.
+                //
+                // When the prompt is very long (>30 000 chars), passing it as a
+                // command-line argument can exceed the Windows CreateProcess
+                // limit (32 767 chars total). Write to a temp file and instruct
+                // copilot to read it instead.
                 let mut cmd = copilot_command();
+
+                const ARG_LIMIT: usize = 30_000;
+                if summarize_prompt.len() > ARG_LIMIT {
+                    let pf = std::env::temp_dir()
+                        .join(format!("fujin-summarize-{}.md", std::process::id()));
+                    std::fs::write(&pf, &summarize_prompt)
+                        .map_err(|e| CoreError::ContextError {
+                            message: format!("Failed to write summarizer prompt file: {e}"),
+                        })?;
+                    cmd.arg("-p")
+                        .arg(format!(
+                            "Read the file {} and follow the instructions inside it exactly.",
+                            pf.display()
+                        ));
+                    prompt_tempfile = Some(pf);
+                } else {
+                    cmd.arg("-p").arg(&summarize_prompt);
+                    prompt_tempfile = None;
+                }
+
                 cmd
-                    .arg("-p").arg(&summarize_prompt)
                     .arg("-s")
                     .arg("--no-ask-user")
                     .arg("--model").arg(&config.model)
@@ -211,6 +236,7 @@ impl ContextBuilder {
             }
             _ => {
                 // Claude Code: --print reads prompt from stdin
+                prompt_tempfile = None;
                 Command::new("claude")
                     .arg("--print")
                     .arg("--model").arg(&config.model)
@@ -241,6 +267,9 @@ impl ContextBuilder {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             warn!(stderr = %stderr, "Summarizer failed, using truncated raw text");
+            if let Some(ref path) = prompt_tempfile {
+                let _ = std::fs::remove_file(path);
+            }
             // Fallback: truncate the raw text
             let truncated = truncate_chars(text, 2000);
             return Ok(truncated);
@@ -248,6 +277,12 @@ impl ContextBuilder {
 
         let summary = String::from_utf8_lossy(&output.stdout).trim().to_string();
         debug!(summary_len = summary.len(), "Generated summary");
+
+        // Clean up temp prompt file if used
+        if let Some(ref path) = prompt_tempfile {
+            let _ = std::fs::remove_file(path);
+        }
+
         Ok(summary)
     }
 

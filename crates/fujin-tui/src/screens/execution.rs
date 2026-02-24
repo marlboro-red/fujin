@@ -136,6 +136,7 @@ pub enum ExecutionAction {
     Quit,
     ToggleHelp,
     CancelPipeline,
+    RetryPipeline,
 }
 
 const SPINNER_FRAMES: &[&str] = &["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"];
@@ -193,6 +194,15 @@ impl ExecutionState {
             verify_states: std::collections::HashMap::new(),
             confirm_cancel: false,
         }
+    }
+
+    /// Whether the pipeline finished with a failure (not success or cancel).
+    pub fn is_failed(&self) -> bool {
+        self.finished
+            && self
+                .final_message
+                .as_ref()
+                .is_some_and(|m| m.contains("failed"))
     }
 
     /// Count how many stages are completed (including skipped).
@@ -651,6 +661,9 @@ impl ExecutionState {
             }
             KeyCode::Char('b') if self.finished && !self.detail_focused => {
                 ExecutionAction::BackToBrowser
+            }
+            KeyCode::Char('r') if self.is_failed() && !self.detail_focused => {
+                ExecutionAction::RetryPipeline
             }
             KeyCode::Char('?') => ExecutionAction::ToggleHelp,
             KeyCode::Char('f') | KeyCode::Enter => {
@@ -1716,6 +1729,10 @@ impl ExecutionState {
                 ));
             }
         } else if self.finished {
+            if self.is_failed() {
+                spans.push(Span::styled("[r]", Style::default().fg(theme::WARNING)));
+                spans.push(Span::styled(" Retry  ", Style::default().fg(theme::TEXT_SECONDARY)));
+            }
             spans.push(Span::styled("[b]", Style::default().fg(theme::ACCENT)));
             spans.push(Span::styled(" Back  ", Style::default().fg(theme::TEXT_SECONDARY)));
             spans.push(Span::styled("[j/k]", Style::default().fg(theme::ACCENT)));
